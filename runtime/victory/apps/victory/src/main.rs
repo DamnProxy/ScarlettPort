@@ -124,9 +124,15 @@ enum Command {
         /// Worker threads (default: half the logical cores).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Only the first N records.
+        /// Only the first N records (after --skip).
         #[arg(long)]
         limit: Option<usize>,
+        /// Leave out the first N records (of those chosen).
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        /// Only records with a mesh shader.
+        #[arg(long)]
+        mesh: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -216,7 +222,13 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, jobs)
         }
         Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
-        Command::PrecompileGraphics { archive, jobs, limit } => translate::precompile_graphics(archive, jobs, limit),
+        Command::PrecompileGraphics {
+            archive,
+            jobs,
+            limit,
+            skip,
+            mesh,
+        } => translate::precompile_graphics(archive, jobs, limit, skip, mesh),
         Command::Run {
             exe,
             unimplemented,

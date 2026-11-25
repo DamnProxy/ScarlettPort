@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject, WaitForSingleObjectEx};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -30,6 +30,12 @@ pub(crate) fn pc_state(state: u32) -> u32 {
 pub(crate) fn texture_state(state: u32) -> u32 {
     const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
     pc_state(state) & !BUFFER_ONLY
+}
+
+/// A DXGI description (nul-padded UTF-16) as text.
+fn adapter_name(description: &[u16]) -> String {
+    let end = description.iter().position(|&c| c == 0).unwrap_or(description.len());
+    String::from_utf16_lossy(&description[..end])
 }
 
 /// Render target views live only until their command is recorded, so a
@@ -614,7 +620,15 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // A laptop with switchable graphics reports its integrated GPU
+            // first, and `D3D12CreateDevice(None, ..)` takes that one, whose
+            // wave width and feature set are not the ones the translator is
+            // tuned for. Ask DXGI for the high-performance adapter instead,
+            // and fall back to the default when there is nothing to pick.
+            match discrete_adapter() {
+                Some(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -677,6 +691,20 @@ fn create() -> windows::core::Result<Host> {
             a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own).ok().map(|()| own.Budget)
         });
         crate::rebar::probe(&device, card_budget);
+        // Which card the device landed on. `D3D12CreateDevice(None, ..)` takes
+        // the system's default adapter; on a laptop with switchable graphics
+        // that can be the integrated one, whose wave width and feature set
+        // are not the ones the translator is tuned for.
+        if let Some(adapter) = adapter.as_ref()
+            && let Ok(desc) = adapter.GetDesc1()
+        {
+            tracing::info!(
+                name = adapter_name(&desc.Description),
+                vendor = format_args!("{:#x}", desc.VendorId),
+                vram_mb = desc.DedicatedVideoMemory >> 20,
+                "host adapter"
+            );
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -694,6 +722,28 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// The adapter DXGI calls high-performance: on a laptop with switchable
+/// graphics the discrete card, not the integrated one. `None` when DXGI is
+/// too old to be asked, has nothing to offer, or offers software.
+fn discrete_adapter() -> Option<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory
+            .EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            .ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            tracing::warn!(
+                vendor = format_args!("{:#x}", desc.VendorId),
+                "DXGI offers software as the high-performance adapter; taking the default instead"
+            );
+            return None;
+        }
+        Some(adapter)
     }
 }
 
@@ -757,6 +807,55 @@ mod tests {
     }
 
     use super::*;
+
+    /// Every adapter DXGI reports on this machine, and the one the host
+    /// device landed on. Run with `cargo test --release -p victory-gpu --
+    /// --ignored --nocapture adapters_on_this_machine`.
+    #[test]
+    #[ignore = "reports the machine's adapters"]
+    fn adapters_on_this_machine() {
+        // SAFETY: plain DXGI adapter queries.
+        unsafe {
+            let factory = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .expect("a DXGI factory");
+            let mut index = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(index) {
+                let desc = adapter.GetDesc1().expect("an adapter description");
+                println!(
+                    "adapter {index}: {} (vendor {:#x}, {} MiB dedicated, flags {:#x})",
+                    adapter_name(&desc.Description),
+                    desc.VendorId,
+                    desc.DedicatedVideoMemory >> 20,
+                    desc.Flags
+                );
+                index += 1;
+            }
+            match host().and_then(|host| host.adapter.as_ref()) {
+                Some(adapter) => {
+                    let desc = adapter.GetDesc1().expect("an adapter description");
+                    println!("the host device is on {}", adapter_name(&desc.Description));
+                }
+                None => println!("no host device was made on this machine"),
+            }
+        }
+    }
+
+    /// Whichever card DXGI calls high-performance, it is never the software
+    /// one: the translator's output is for a real card. Runs on any machine.
+    #[test]
+    fn the_high_performance_adapter_is_never_software() {
+        let Some(adapter) = discrete_adapter() else {
+            return; // DXGI has nothing to prefer here
+        };
+        // SAFETY: a plain DXGI adapter query.
+        let desc = unsafe { adapter.GetDesc1() }.expect("an adapter description");
+        assert_eq!(
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
+            0,
+            "{} was offered as the high-performance adapter",
+            adapter_name(&desc.Description)
+        );
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -1960,6 +2059,11 @@ pub(crate) fn wait_card(value: u64) -> bool {
 }
 
 /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+/// Whether submissions are sent ahead of their landing (any late stage).
+pub(crate) fn late_on() -> bool {
+    late_stage() > 0
+}
+
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -2576,6 +2680,23 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
 
+/// The host copies `runs` refresh that have shader writes pending
+/// ([`read_settle_precise`]).
+fn refreshed_copies(runs: &[&HostList]) -> Vec<std::sync::Arc<crate::shadow::Shadow>> {
+    let mut out: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, ..) = step
+                && shadow.writes_pending()
+                && !out.iter().any(|s| std::sync::Arc::ptr_eq(s, shadow))
+            {
+                out.push(shadow.clone());
+            }
+        }
+    }
+    out
+}
+
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
@@ -2612,6 +2733,12 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
             return false;
         }
         let mut unsure = touches(&line.written, address, address + bytes);
+        // A label the title writes only at the bottom of the pipe: declared
+        // shader writes over it are not what writes it.
+        if unsure && memwait_samequeue() && bytes == 8 && is_label(address) {
+            RE1_STATS[1].fetch_add(1, Ordering::Relaxed);
+            unsure = false;
+        }
         // (With the relay: first the writes of flights being landed.)
         let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
             Late::Write(at, what, n) => Some((at, what, n)),
@@ -2634,6 +2761,19 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
         if !unsure {
             return false;
         }
+    }
+    if read_settle_precise() {
+        // Until nothing in the air, nor a copy-back not done, writes its bytes.
+        let started = std::time::Instant::now();
+        let end = address + bytes;
+        relay_wait(WHY_VALUE, |line| {
+            !touches(&line.written, address, end)
+                && !line.in_hand.iter().any(|&(at, _, n)| at < end && address < at + n)
+                && !line.line.iter().any(|item| matches!(*item, Late::Write(at, _, n) if at < end && address < at + n))
+        });
+        RE1_STATS[2].fetch_add(1, Ordering::Relaxed);
+        RE1_STATS[3].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        return wait.met();
     }
     settle_now(WHY_VALUE);
     wait.met()
@@ -2699,9 +2839,340 @@ pub(crate) fn wait_fence_signal(fence: usize, value: u64, reached: impl Fn() -> 
     }
     let started = std::time::Instant::now();
     relay_wait(WHY_FENCE, |_| reached());
+    // A ring of one, read in the same frame, might have been taken for a
+    // ring of three ([`copy_back_async`]).
+    async_drain_all();
     FENCE_STATS[0].fetch_add(1, Ordering::Relaxed);
     FENCE_STATS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     true
+}
+
+
+/// `VICTORY_MEMWAIT_SAMEQUEUE=1` (off by default; with [`late`]): a queue's
+/// wait whose writer was already sent to the one in-order host queue is
+/// passed instead of held or settled for.
+///
+/// - A fence wait (`Wait`) whose fence a signal in the line will set to the
+///   value: the signal goes behind flights already sent, so what follows
+///   the wait, sent now, runs after them on the card anyway (FRAMELOOP
+///   §1.3: every title queue lands on one host queue in submission order).
+/// - A wait for a memory value at an address the title only ever writes
+///   with bottom-of-pipe writes (its cross-queue labels, slots 0x238/0x240):
+///   a flight's shaders said to write a range holding it (a whole heap
+///   declared) do not make the answer unsure. The flights' own
+///   bottom-of-pipe writes still answer as before.
+pub(crate) fn memwait_samequeue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = late() && std::env::var_os("VICTORY_MEMWAIT_SAMEQUEUE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("waits whose writer was sent ahead on the host queue are passed (VICTORY_MEMWAIT_SAMEQUEUE=1)");
+        }
+        on
+    })
+}
+
+/// Since the last frame-rate line: 0 fence waits passed behind a signal in
+/// the line, 1 memory-value waits not settled for (a label under declared
+/// shader writes), 2 waits settled only until their writers landed
+/// (`VICTORY_READ_SETTLE_PRECISE`), 3 microseconds of those, 4 refreshes
+/// under shader writes waited for their copies only, 5 microseconds of
+/// those, 6 copy-backs done beside the landing ([`copy_back_async`]), 7
+/// their bytes, 8 microseconds they took on their thread, 9 waits for them,
+/// 10 microseconds of those waits, 11 copy-backs not done yet at the line.
+pub(crate) static RE1_STATS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+/// Title memory written with bottom-of-pipe writes of a value
+/// ([`memwait_samequeue`]): the title's labels.
+static LABELS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// A list's bottom-of-pipe write of a value at `at` ([`memwait_samequeue`]).
+pub(crate) fn note_label(at: usize) {
+    if memwait_samequeue() {
+        LABELS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(at);
+    }
+}
+
+fn is_label(at: usize) -> bool {
+    LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|l| l.contains(&at))
+}
+
+/// Whether a signal in the line sets `fence` to `value` or more
+/// ([`memwait_samequeue`]): what waits for it may be sent behind it.
+pub(crate) fn late_signal_queued(fence: usize, value: u64) -> bool {
+    if !memwait_samequeue() {
+        return false;
+    }
+    let queued = line().line.iter().any(|item| matches!(item, Late::Signal(f, v) if *f == fence && *v >= value));
+    if queued {
+        RE1_STATS[0].fetch_add(1, Ordering::Relaxed);
+    }
+    queued
+}
+
+/// `VICTORY_READ_SETTLE_PRECISE=1` (off by default; with the relay): the
+/// settles `VICTORY_SYNC_PRECISE` and `VICTORY_RELAY=2` leave whole wait
+/// only for the flights that write what they look at.
+///
+/// - A wait for a memory value the flights may write in a way not known
+///   ([`late_met`]: shaders, another width) waits until no flight in the
+///   air (nor a copy-back not done) writes the value's bytes, then asks
+///   memory: before, everything in the air was settled (WHY_VALUE).
+/// - A submission refreshing title memory a flight's shaders may write
+///   while the title wrote it too (WHY_STALE) waits until the copies it
+///   refreshes have no shader writes pending, then looks again; before,
+///   everything in the air was settled.
+///
+/// Read settles of buffer copies, fills and textures are per flight already
+/// with `VICTORY_RELAY=2` or `VICTORY_SYNC_PRECISE=1` (with the relay); a
+/// step of ours run on the CPU (WHY_RUN) may touch anything and still
+/// settles everything.
+pub(crate) fn read_settle_precise() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = relay() && std::env::var_os("VICTORY_READ_SETTLE_PRECISE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("value and stale-copy settles wait only for the flights that write what they read (VICTORY_READ_SETTLE_PRECISE=1)");
+        }
+        on
+    })
+}
+
+/// Landings and copy-backs done so far ([`read_settle_precise`]'s waits
+/// look again at each).
+static LANDINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`read_settle_precise`] for WHY_STALE: waits until none of `copies` has
+/// shader writes pending, a landing at a time. False if it could not tell
+/// (nothing left in the air and still pending): the caller settles.
+fn wait_copies_landed(copies: &[std::sync::Arc<crate::shadow::Shadow>]) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if copies.iter().all(|c| !c.writes_pending()) {
+            break;
+        }
+        let seen = LANDINGS.load(Ordering::Acquire);
+        let empty = std::cell::Cell::new(false);
+        relay_wait(WHY_STALE, |line| {
+            empty.set(line.line.is_empty() && !line.settling && async_idle());
+            LANDINGS.load(Ordering::Acquire) != seen || empty.get()
+        });
+        if empty.get() && copies.iter().any(|c| c.writes_pending()) {
+            return false;
+        }
+    }
+    RE1_STATS[4].fetch_add(1, Ordering::Relaxed);
+    RE1_STATS[5].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    true
+}
+
+/// `VICTORY_COPY_BACK_ASYNC=1` with the relay ([`crate::readback::async_on`]).
+pub(crate) fn copy_back_async() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && crate::readback::async_on())
+}
+
+/// Presents before which the copy-backs of a flight are done
+/// (`VICTORY_COPY_BACK_ASYNC_LAG`, 1: a flight that landed before present
+/// N is copied back before present N + 1 goes out, so the title, reading
+/// the slot written two frames earlier, finds it there).
+fn async_lag() -> u64 {
+    static LAG: OnceLock<u64> = OnceLock::new();
+    *LAG.get_or_init(|| {
+        std::env::var("VICTORY_COPY_BACK_ASYNC_LAG").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1).min(2)
+    })
+}
+
+/// One copy-back left to [`async_worker`]: the copy, its declared ranges
+/// joined over the flights landed together, and each flight's ranges (for
+/// `copy_back_done`, flight by flight).
+#[derive(Default)]
+struct AsyncWork {
+    copy: Option<std::sync::Arc<crate::shadow::Shadow>>,
+    declared: Vec<(usize, usize)>,
+    flights: Vec<Vec<(usize, usize)>>,
+}
+
+static ASYNC: Mutex<victory_core::readring::Backs<AsyncWork>> = Mutex::new(victory_core::readring::Backs::new());
+/// Told when a copy-back is queued (the worker) or done (who waits).
+static ASYNC_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+static ASYNC_DONE: std::sync::Condvar = std::sync::Condvar::new();
+/// Presents made, for [`async_present`].
+static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn async_backs() -> std::sync::MutexGuard<'static, victory_core::readring::Backs<AsyncWork>> {
+    ASYNC.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn async_idle() -> bool {
+    !copy_back_async() || async_backs().idle()
+}
+
+/// Waits until copy-back `id` and all before it are done.
+fn async_wait(id: Option<u64>) {
+    let Some(id) = id else {
+        return;
+    };
+    let mut backs = async_backs();
+    if backs.is_done(id) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while !backs.is_done(id) {
+        backs = ASYNC_DONE.wait(backs).unwrap_or_else(|e| e.into_inner());
+    }
+    RE1_STATS[9].fetch_add(1, Ordering::Relaxed);
+    RE1_STATS[10].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Before memory `[from, to)` is let go: its copy-backs are done.
+pub(crate) fn async_drain_range(from: usize, to: usize) {
+    if copy_back_async() {
+        let due = async_backs().due_for_range(from, to);
+        async_wait(due);
+    }
+}
+
+/// Every copy-back is done (a blocking fence wait: a ring of one read in
+/// the same frame might have been taken for a ring of three).
+pub(crate) fn async_drain_all() {
+    if copy_back_async() {
+        let due = async_backs().due_all();
+        async_wait(due);
+    }
+}
+
+/// At a present ([`copy_back_async`]): the copy-backs of flights that
+/// landed [`async_lag`] presents ago or earlier are done first.
+pub(crate) fn async_present() {
+    let now = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if copy_back_async() {
+        let due = async_backs().due_before_present(now, async_lag());
+        async_wait(due);
+    }
+}
+
+/// Queues the copy-backs of `ring` (each copy's ranges joined, and per
+/// flight) for [`async_worker`]; under no lock of the line.
+fn async_queue(ring: Vec<AsyncWork>) {
+    static WORKER: std::sync::Once = std::sync::Once::new();
+    WORKER.call_once(|| {
+        if let Err(e) = std::thread::Builder::new().name("victory-copy-back".into()).spawn(async_worker) {
+            fail(format_args!("no thread for copy-backs beside landing (VICTORY_COPY_BACK_ASYNC): {e}"));
+        }
+    });
+    let present = PRESENTS.load(Ordering::Relaxed);
+    let mut backs = async_backs();
+    for work in ring {
+        let Some(copy) = &work.copy else {
+            continue;
+        };
+        let owner = std::sync::Arc::as_ptr(copy) as usize;
+        let ranges = work.declared.clone();
+        backs.push(present, owner, ranges, work);
+    }
+    drop(backs);
+    ASYNC_MOVED.notify_all();
+}
+
+/// The thread that copies back the read-back rings ([`copy_back_async`]):
+/// in the order queued, each as the landing would have (`relay_hand_back`,
+/// then the ranges let go flight by flight), then the line's written ranges
+/// are made again without it and waiters are told.
+fn async_worker() {
+    loop {
+        let back = {
+            let mut backs = async_backs();
+            loop {
+                if let Some(b) = backs.take() {
+                    break b;
+                }
+                backs = ASYNC_MOVED.wait(backs).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let started = std::time::Instant::now();
+        let before = COPY_BACK[1].load(Ordering::Relaxed);
+        if let Some(copy) = &back.work.copy {
+            relay_hand_back(&[(copy.clone(), back.work.declared.clone())]);
+            for ranges in &back.work.flights {
+                copy.copy_back_done(ranges);
+            }
+        }
+        RE1_STATS[6].fetch_add(1, Ordering::Relaxed);
+        RE1_STATS[7].fetch_add(COPY_BACK[1].load(Ordering::Relaxed).saturating_sub(before), Ordering::Relaxed);
+        RE1_STATS[8].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        async_backs().finish(back.id);
+        ASYNC_DONE.notify_all();
+        {
+            let mut line = line();
+            rewrite_written(&mut line);
+        }
+        LANDINGS.fetch_add(1, Ordering::Release);
+        LINE_MOVED.notify_all();
+        LINE_LANDED.notify_all();
+    }
+}
+
+/// The line's `written` and `by_copy` made again from the flights in the
+/// air, and the copy-backs not done yet ([`copy_back_async`]).
+fn rewrite_written(line: &mut Line) {
+    let Line { line: items, written, by_copy, lists, .. } = line;
+    written.clear();
+    by_copy.clear();
+    *lists = 0;
+    let mut ranges = Vec::new();
+    let mut copy_ranges = Vec::new();
+    for item in items.iter() {
+        if let Late::Run(flight) = item {
+            *lists += flight.order.len().max(1);
+            for (shadow, r) in &flight.back {
+                let owner = std::sync::Arc::as_ptr(shadow) as usize;
+                ranges.extend(r.iter().copied());
+                copy_ranges.extend(r.iter().map(|&(a, b)| (owner, a, b)));
+            }
+            ranges.extend(flight.backs.iter().copied());
+            copy_ranges.extend(flight.backs.iter().map(|&(a, b)| (0, a, b)));
+        }
+    }
+    if copy_back_async() {
+        for (owner, a, b) in async_backs().written() {
+            ranges.push((a, b));
+            copy_ranges.push((owner, a, b));
+        }
+    }
+    join_ranges(written, ranges);
+    join_copy_ranges(by_copy, copy_ranges);
+}
+
+/// The frame line of the switches above.
+fn re1_line(frames: f64) {
+    let s = RE1_STATS.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames);
+    if !(memwait_samequeue() || read_settle_precise() || copy_back_async()) {
+        return;
+    }
+    let left = if copy_back_async() { async_backs().len() } else { 0 };
+    tracing::info!(
+        "fewer settles per frame: fence waits passed behind a signal in the line {:.1}, value waits not settled for a \
+         label {:.1} (VICTORY_MEMWAIT_SAMEQUEUE={}); value waits settled for their writers only {:.1} in {:.2} ms, \
+         refreshes waiting for their copies only {:.1} in {:.2} ms (VICTORY_READ_SETTLE_PRECISE={}); read-back \
+         copy-backs beside the landing {:.1} of {:.2} MB, {:.2} ms on their thread, {:.1} waits for them {:.2} ms, \
+         {left} not done now (VICTORY_COPY_BACK_ASYNC={}, lag {} presents)",
+        s[0],
+        s[1],
+        u8::from(memwait_samequeue()),
+        s[2],
+        s[3] / 1e3,
+        s[4],
+        s[5] / 1e3,
+        u8::from(read_settle_precise()),
+        s[6],
+        s[7] / 1e6,
+        s[8] / 1e3,
+        s[9],
+        s[10] / 1e3,
+        u8::from(copy_back_async()),
+        async_lag(),
+    );
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -3248,6 +3719,11 @@ fn read_backs(list: &HostList) {
         // copy was recorded).
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
+                // Copies compared with title memory (`VICTORY_MEM2_GPU_ONLY_NOSNAP`)
+                // keep the bytes from before this write.
+                if *rows > 0 {
+                    crate::shadow::title_will_change(*at, (*rows - 1) * *pitch + *row);
+                }
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
@@ -3986,6 +4462,19 @@ impl Host {
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, fetch);
+                // A copy with a copy-back not done yet beside the landing:
+                // that one first, so they reach title memory in order.
+                if copy_back_async() {
+                    let due = {
+                        let backs = async_backs();
+                        flights
+                            .iter()
+                            .flat_map(|f| f.back.iter())
+                            .filter_map(|(shadow, _)| backs.due_for_owner(std::sync::Arc::as_ptr(shadow) as usize))
+                            .max()
+                    };
+                    async_wait(due);
+                }
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -4001,13 +4490,33 @@ impl Host {
                         }
                     }
                 }
+                // Read-back rings of three: copied back beside the landing
+                // ([`copy_back_async`]); the ranges stay written (closed to
+                // refreshes, waited for by readers) until then.
+                let lagged = |shadow: &crate::shadow::Shadow| {
+                    copy_back_async() && !shadow.carded() && {
+                        let (start, len) = shadow.span();
+                        crate::readback::lagged(start, len)
+                    }
+                };
+                let (ring, back): (Vec<Declared>, Vec<Declared>) = back.into_iter().partition(|(s, _)| lagged(s));
                 relay_hand_back(&back);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
+                let mut later: Vec<AsyncWork> = ring
+                    .into_iter()
+                    .map(|(copy, declared)| AsyncWork { copy: Some(copy), declared, flights: Vec::new() })
+                    .collect();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
-                        shadow.copy_back_done(ranges);
+                        match later.iter_mut().find(|w| w.copy.as_ref().is_some_and(|c| std::sync::Arc::ptr_eq(c, shadow))) {
+                            Some(w) => w.flights.push(ranges.clone()),
+                            None => shadow.copy_back_done(ranges),
+                        }
                     }
+                }
+                if !later.is_empty() {
+                    async_queue(later);
                 }
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -4054,31 +4563,16 @@ impl Host {
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
-            // What is still in the air, from the flights that are.
-            written.clear();
-            by_copy.clear();
-            *lists = 0;
-            let mut ranges = Vec::new();
-            let mut copy_ranges = Vec::new();
-            for item in items.iter() {
-                if let Late::Run(flight) = item {
-                    *lists += flight.order.len().max(1);
-                    for (shadow, r) in &flight.back {
-                        let owner = std::sync::Arc::as_ptr(shadow) as usize;
-                        ranges.extend(r.iter().copied());
-                        copy_ranges.extend(r.iter().map(|&(a, b)| (owner, a, b)));
-                    }
-                    ranges.extend(flight.backs.iter().copied());
-                    copy_ranges.extend(flight.backs.iter().map(|&(a, b)| (0, a, b)));
-                }
-            }
-            join_ranges(written, ranges);
-            join_copy_ranges(by_copy, copy_ranges);
+            let _ = (items, written, by_copy, lists);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
             *poke = true;
+            // What is still in the air, from the flights that are (and the
+            // copy-backs not done yet).
+            rewrite_written(&mut line);
         }
+        LANDINGS.fetch_add(1, Ordering::Release);
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
     }
@@ -4366,7 +4860,7 @@ impl Host {
             // nothing is being landed. Every point that settled before
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
-            relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            relay_wait(why, |line| line.line.is_empty() && !line.settling && async_idle());
             return;
         }
         let was_working = working(true);
@@ -4603,13 +5097,17 @@ impl Host {
             // title memory, which other copies of it must see.
             if behind && stale_under_flights(runs) {
                 let settling = std::time::Instant::now();
-                self.settle(&mut submitted, WHY_STALE);
+                if !(read_settle_precise() && wait_copies_landed(&refreshed_copies(runs))) {
+                    self.settle(&mut submitted, WHY_STALE);
+                }
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
+            if !(read_settle_precise() && wait_copies_landed(&refreshed_copies(runs)) && !stale_under_flights(runs)) {
+                self.settle(&mut submitted, WHY_STALE);
+            }
             settled += settling.elapsed();
         }
         for list in runs {
@@ -5914,6 +6412,16 @@ impl HostList {
                     if matches!(step, Step::Run(..)) {
                         batch.title_written();
                     }
+                    // Copies compared with title memory after their flight
+                    // (`VICTORY_MEM2_GPU_ONLY_NOSNAP`): a write whose place is
+                    // known keeps the bytes from before it; one whose place is
+                    // not gives every such copy its snapshot now, before any
+                    // shader ran.
+                    match step {
+                        &Step::Run(_, Some((dst, _, len))) => crate::shadow::title_will_change(dst, len),
+                        Step::Run(_, None) => crate::shadow::nosnap_unknown_write(),
+                        _ => {}
+                    }
                     work();
                     match step {
                         // Where it wrote is known: the journal learns it and
@@ -6317,8 +6825,18 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-            // SAFETY: this path is only used with a writable host destination.
-            unsafe { to.write_bytes(0, n) };
+            // Pages shown through the translation table read their bytes
+            // (`VICTORY_MEM2_GPU_ONLY_NOVIEW`); the rest are zeros.
+            if crate::translate::any(at as usize, n) {
+                crate::translate::read(at as usize, to, n, |_, d, k| {
+                    // SAFETY: inside the host destination.
+                    unsafe { d.write_bytes(0, k) };
+                    true
+                });
+            } else {
+                // SAFETY: this path is only used with a writable host destination.
+                unsafe { to.write_bytes(0, n) };
+            }
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
@@ -6355,6 +6873,17 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    // Pages shown through the translation table (`VICTORY_MEM2_GPU_ONLY_NOVIEW`)
+    // have no view for the kernel to read: their bytes come from their
+    // sections, the rest through the kernel.
+    if crate::translate::any(src as usize, len) {
+        return crate::translate::read(src as usize, dst, len, |at, d, n| read_os(at as *const u8, d, n));
+    }
+    read_os(src, dst, len)
+}
+
+/// [`read`] through the kernel.
+fn read_os(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -6392,6 +6921,17 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    // Pages shown through the translation table (`VICTORY_MEM2_GPU_ONLY_NOVIEW`):
+    // written in their sections, as a write through a view would.
+    if crate::translate::any(dst as usize, len) {
+        crate::translate::write(dst as usize, src, len, |at, from, n| write_mapped_os(at as *mut u8, from, n));
+        return;
+    }
+    write_mapped_os(dst, src, len);
+}
+
+/// [`write_mapped`] through the kernel.
+fn write_mapped_os(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
@@ -6555,6 +7095,211 @@ struct Presenter {
     sampler: Option<crate::splash::Sampler>,
     /// The splash picture as a texture (and the upload buffer it came from) while it shows.
     splash: Option<(ID3D12Resource, ID3D12Resource)>,
+    /// Pacing and latency ([`victory_core::pace`]).
+    pace: Pace,
+}
+
+/// The present side of [`victory_core::pace`]: the swap chain's latency
+/// object, the pacer and its timer, the statistics.
+struct Pace {
+    /// `VICTORY_PACE_LATENCY`: signalled when the swap chain takes another frame.
+    waitable: Option<HANDLE>,
+    /// The swap chain was made with tearing allowed (`VICTORY_PACE_TEARING`).
+    tearing: bool,
+    pacer: Option<victory_core::pace::Pacer>,
+    timer: Option<HANDLE>,
+    window: victory_core::pace::Window,
+    /// (present count, title token) of presents not yet seen on the display.
+    shown: std::collections::VecDeque<(u32, u64)>,
+    /// The last present count the display statistics answered for.
+    seen: u32,
+}
+
+// SAFETY: the handles are plain kernel handles, used under the presenter lock.
+unsafe impl Send for Pace {}
+
+/// Swap chain flags for the pacing switches.
+fn swap_flags(tearing: bool) -> DXGI_SWAP_CHAIN_FLAG {
+    let mut f = 0;
+    if victory_core::pace::switches().latency > 0 {
+        f |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0;
+    }
+    if tearing {
+        f |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0;
+    }
+    DXGI_SWAP_CHAIN_FLAG(f)
+}
+
+/// Whether the system can present with tearing (variable refresh).
+fn tearing_supported(factory: &IDXGIFactory2) -> bool {
+    let Ok(f5) = factory.cast::<IDXGIFactory5>() else { return false };
+    let mut allow = windows::core::BOOL(0);
+    // SAFETY: a BOOL-sized out value for this feature.
+    unsafe {
+        f5.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut allow).cast(),
+            size_of::<windows::core::BOOL>() as u32,
+        )
+    }
+    .is_ok()
+        && allow.as_bool()
+}
+
+/// Sleeps until [`victory_core::pace::now_ns`] reaches `until`: a
+/// high-resolution waitable timer for most of it, a short spin for the rest.
+fn sleep_until(timer: Option<HANDLE>, until: u64) {
+    use windows::Win32::System::Threading::SetWaitableTimer;
+    const SPIN: u64 = 400_000;
+    let now = victory_core::pace::now_ns();
+    if until <= now {
+        return;
+    }
+    let coarse = until - now;
+    if coarse > SPIN {
+        let sleep = coarse - SPIN;
+        match timer {
+            Some(t) => {
+                // Relative, in 100 ns units.
+                let due = -((sleep / 100) as i64);
+                // SAFETY: our timer handle.
+                unsafe {
+                    if SetWaitableTimer(t, &due, 0, None, None, false).is_ok() {
+                        WaitForSingleObject(t, (sleep / 1_000_000 + 50) as u32);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_nanos(sleep));
+                    }
+                }
+            }
+            None => std::thread::sleep(std::time::Duration::from_nanos(sleep)),
+        }
+    }
+    while victory_core::pace::now_ns() < until {
+        std::hint::spin_loop();
+        std::thread::yield_now();
+    }
+}
+
+impl Pace {
+    fn new(swap_chain: &IDXGISwapChain3, tearing: bool) -> Pace {
+        let s = victory_core::pace::switches();
+        let waitable = (s.latency > 0)
+            .then(|| {
+                let sc2 = swap_chain.cast::<IDXGISwapChain2>().ok()?;
+                // SAFETY: a swap chain made with the waitable flag.
+                unsafe {
+                    sc2.SetMaximumFrameLatency(s.latency).ok()?;
+                    let h = sc2.GetFrameLatencyWaitableObject();
+                    (!h.is_invalid()).then_some(h)
+                }
+            })
+            .flatten();
+        let timer = s.pace.then(|| {
+            use windows::Win32::System::Threading::{
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, TIMER_ALL_ACCESS,
+            };
+            // SAFETY: plain creation; falls back to an ordinary timer on older systems.
+            unsafe {
+                CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0)
+                    .or_else(|_| CreateWaitableTimerExW(None, None, 0, TIMER_ALL_ACCESS.0))
+                    .ok()
+            }
+        });
+        tracing::info!(
+            ?s,
+            waitable = waitable.is_some(),
+            tearing,
+            "pacing switches (VICTORY_PACE*)"
+        );
+        Pace {
+            waitable,
+            tearing,
+            pacer: None,
+            timer: timer.flatten(),
+            window: victory_core::pace::Window::default(),
+            shown: std::collections::VecDeque::new(),
+            seen: 0,
+        }
+    }
+
+    /// Before the frame takes a back buffer: wait until the swap chain has
+    /// room (at most `VICTORY_PACE_LATENCY` frames queued).
+    fn wait_for_room(&mut self) {
+        if let Some(h) = self.waitable {
+            let t0 = victory_core::pace::now_ns();
+            // SAFETY: the swap chain's latency object.
+            unsafe { WaitForSingleObjectEx(h, 100, true) };
+            self.window.latency_wait += victory_core::pace::now_ns() - t0;
+        }
+    }
+
+    /// Just before `Present`: hold the frame for an even cadence.
+    fn hold(&mut self) {
+        let s = victory_core::pace::switches();
+        if !s.pace || victory_core::fastboot::active() {
+            return;
+        }
+        let base = s.fps.map_or_else(
+            || crate::frame::interval().as_nanos() as u64,
+            victory_core::pace::period_of_fps,
+        );
+        let pacer = self.pacer.get_or_insert_with(|| victory_core::pace::Pacer::new(base));
+        pacer.set_base(base);
+        let ready = victory_core::pace::now_ns();
+        let release = pacer.release_at(ready);
+        sleep_until(self.timer, release);
+        self.window.pace_wait += release - ready;
+    }
+
+    /// `Present`'s sync interval and flags.
+    fn present_args(&self) -> (u32, DXGI_PRESENT) {
+        if self.tearing { (0, DXGI_PRESENT_ALLOW_TEARING) } else { (0, DXGI_PRESENT(0)) }
+    }
+
+    /// After `Present`: statistics, and what the display said about earlier presents.
+    fn presented(&mut self, swap_chain: &IDXGISwapChain3) {
+        let s = victory_core::pace::switches();
+        if s.feedback {
+            // SAFETY: plain queries of our swap chain.
+            unsafe {
+                if let Ok(count) = swap_chain.GetLastPresentCount() {
+                    self.shown.push_back((count, crate::frame::last_token()));
+                    while self.shown.len() > 16 {
+                        self.shown.pop_front();
+                    }
+                }
+                let mut st = DXGI_FRAME_STATISTICS::default();
+                if swap_chain.GetFrameStatistics(&mut st).is_ok() && st.PresentCount != self.seen {
+                    self.seen = st.PresentCount;
+                    if let Some(&(_, token)) = self.shown.iter().find(|(c, _)| *c == st.PresentCount) {
+                        crate::frame::displayed(token, st.SyncQPCTime);
+                    }
+                    self.shown.retain(|(c, _)| c.wrapping_sub(st.PresentCount) as i32 > 0);
+                }
+            }
+        }
+        if !s.stats {
+            return;
+        }
+        let now = victory_core::pace::now_ns();
+        self.window.present(now, victory_core::pace::input_latency(now));
+        if let Some(m) = self.window.take_if_due(now) {
+            tracing::info!(
+                "pace: {} presents, frame time p50 {:.1} / p95 {:.1} / p99 {:.1} ms, present-to-present jitter {:.2} ms, \
+                 input-to-present p50 {:.1} / p95 {:.1} ms, waited {:.0} ms for the swap chain and {:.0} ms by the pacer (period {:.1} ms)",
+                m.frames,
+                m.p50_ms,
+                m.p95_ms,
+                m.p99_ms,
+                m.jitter_ms,
+                m.latency_p50_ms,
+                m.latency_p95_ms,
+                m.latency_wait_ms,
+                m.pace_wait_ms,
+                self.pacer.as_ref().map_or(0.0, |p| p.period() as f64 / 1e6),
+            );
+        }
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -6628,6 +7373,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        re1_line(frames);
         barrier_line(frames);
         crate::draw::batch_line(frames);
         hazard_line(frames);
@@ -6672,6 +7418,17 @@ impl Meter {
             }
         }
         {
+            let c = crate::watch::REMAP_SOURCES.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames);
+            if c.iter().any(|&v| v > 0.0) {
+                tracing::info!(
+                    "page mapping per frame (VICTORY_PAGEMAP_RUNS={}): Scatter {:.1} calls of {:.0} pages in {:.0} groups;                      single maps {:.1} calls of {:.0} pages; page-mapping batches {:.1} of {:.0} pages ({:.0} of one page                      repeated) as {:.0} operations, {:.0} of their pages in GPU-only reservations; views mapped {:.0},                      unmapped {:.0}; the GPU side told {:.0} times ({:.0} left out by batching); placeholder splits left                      out {:.0}; {:.2} ms in the mapper",
+                    u8::from(crate::resource::page_batch_mapper().is_some()),
+                    c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[14], c[7], c[8], c[9], c[10], c[11], c[15], c[12],
+                    c[13] / 1e3,
+                );
+            }
+        }
+        {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if copies > 0.0 {
                 tracing::info!(
@@ -6699,6 +7456,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            crate::watch::pool_line();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -6872,7 +7630,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, swap_flags(p.pace.tearing))
             };
             match resized {
                 Ok(()) => (p.width, p.height, p.format) = (width, height, format),
@@ -6883,6 +7641,7 @@ impl Host {
             }
         }
         let state = D3D12_RESOURCE_STATES(state as i32);
+        p.pace.wait_for_room();
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -7099,7 +7858,10 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            p.pace.hold();
+            let (sync, flags) = p.pace.present_args();
+            let _ = p.swap_chain.Present(sync, flags);
+            p.pace.presented(&p.swap_chain);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -7121,6 +7883,7 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let tearing = victory_core::pace::switches().tearing && tearing_supported(&factory);
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -7132,11 +7895,13 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: swap_flags(tearing).0 as u32,
                 ..Default::default()
             };
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            let pace = Pace::new(&swap_chain, tearing);
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -7151,6 +7916,7 @@ impl Host {
                 meter: Meter::new(),
                 sampler: None,
                 splash: None,
+                pace,
             })
         }
     }

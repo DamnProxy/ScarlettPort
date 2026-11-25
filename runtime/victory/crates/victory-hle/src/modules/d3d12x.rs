@@ -19,6 +19,11 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    victory_gpu::use_title_memory(super::xmem::title_own_bytes);
+    victory_gpu::use_cpu_free(super::xmem::cpu_free);
+    if super::xmem::pagemap_runs() {
+        victory_gpu::resource::use_page_batch_mapper(super::xmem::map_alias_batch);
+    }
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)

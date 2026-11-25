@@ -943,6 +943,21 @@ pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }
 
+/// Maps a whole batch of page-mapping operations at once
+/// (`VICTORY_PAGEMAP_RUNS`); false if one failed.
+pub type PageBatchMapper = fn(&[victory_core::pagemap::AliasOp]) -> bool;
+static PAGE_BATCH_MAPPER: std::sync::OnceLock<PageBatchMapper> = std::sync::OnceLock::new();
+
+/// The runtime's batch page mapper, used instead of [`use_page_mapper`]'s
+/// for the queues' page-mapping copies when given.
+pub fn use_page_batch_mapper(mapper: PageBatchMapper) {
+    let _ = PAGE_BATCH_MAPPER.set(mapper);
+}
+
+pub(crate) fn page_batch_mapper() -> Option<PageBatchMapper> {
+    PAGE_BATCH_MAPPER.get().copied()
+}
+
 /// Allocation attributes for resource memory: allocator id, page size
 /// (bits 14-15: 2 MiB pages from 2 MiB up, else 64 KiB), alignment as log2
 /// (bits 24-28) and memory type (bits 29-32: write-combined for GPU-only
@@ -1806,7 +1821,7 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-        if crate::readback::creating_readback() {
+        if crate::readback::buffer_made(resource.data() as u64, desc.width) {
             crate::readback::tag(resource.data() as u64, desc.width);
         }
     }

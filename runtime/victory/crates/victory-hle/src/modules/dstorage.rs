@@ -231,7 +231,7 @@ extern "system" fn create_queue(
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = staging_limit(u64::from(size));
     }
     S_OK
 }
@@ -420,7 +420,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_limit(STAGING),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -649,6 +649,15 @@ fn staging_bytes(request: &Request) -> u64 {
     } else {
         0
     }
+}
+
+/// The staging limit for a title's request: ours (`VICTORY_DS_STAGING_MB`,
+/// with the pipeline) when larger. It is only our bookkeeping of compressed
+/// bytes held between the file and the destination; nothing on the GPU
+/// side waits on it.
+fn staging_limit(title: u64) -> u64 {
+    let config = pipeline::config();
+    if config.enabled { title.max(config.staging) } else { title }
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the

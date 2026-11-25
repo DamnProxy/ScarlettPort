@@ -495,7 +495,13 @@ fn link_check(validate: bool, pipelines: bool) -> Result<()> {
 }
 
 /// `victory precompile-graphics` (`Command::PrecompileGraphics`).
-pub fn precompile_graphics(archive: Option<PathBuf>, jobs: Option<usize>, limit: Option<usize>) -> Result<()> {
+pub fn precompile_graphics(
+    archive: Option<PathBuf>,
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    skip: usize,
+    mesh: bool,
+) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     let archive = match archive {
         Some(a) => a,
@@ -509,7 +515,7 @@ pub fn precompile_graphics(archive: Option<PathBuf>, jobs: Option<usize>, limit:
     let index = cfg.cache_subdir("precompiled")?.join("shaders.rpf.index");
     let jobs = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(1)));
     let started = std::time::Instant::now();
-    let report = victory_hle::modules::d3d12x::precompile_graphics(&archive, Some(&index), jobs, limit, &|done, r| {
+    let report = victory_hle::modules::d3d12x::precompile_graphics(&archive, Some(&index), jobs, limit, skip, mesh, &|done, r| {
         println!(
             "{:6.0} s  {done} records: {} made, {} failed, {} duplicates, {} unmapped, {} undecoded",
             started.elapsed().as_secs_f64(),

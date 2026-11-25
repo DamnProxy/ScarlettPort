@@ -1,6 +1,11 @@
 # Builds the VIctory-based runtime (the build that gets furthest today) and fetches the
 # D3D12 Agility SDK it needs on Windows 10.
-# Usage: .\scripts\setup-victory.ps1
+# Usage: .\scripts\setup-victory.ps1 [-Game "D:\path	o\your\dump"] [-SkipPrecompile]
+# With -Game it also prebuilds the title's precompiled graphics pipelines (needs a GPU; takes a while).
+param(
+    [string]$Game = '',
+    [switch]$SkipPrecompile
+)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $bin  = Join-Path $root 'runtime\victory\target\release'
@@ -31,6 +36,20 @@ if (-not (Test-Path (Join-Path $agility 'D3D12Core.dll'))) {
     New-Item -ItemType Directory -Force $agility | Out-Null
     Copy-Item (Join-Path $tmp 'build\native\bin\x64\D3D12Core.dll') $agility
     Copy-Item (Join-Path $tmp 'build\native\bin\x64\d3d12SDKLayers.dll') $agility
+}
+
+if ($Game -and -not $SkipPrecompile) {
+    if (-not (Test-Path $Game)) { throw "No folder '$Game'." }
+    Write-Host '==> Prebuilding precompiled graphics pipelines (victory precompile-graphics)...' -ForegroundColor Cyan
+    $env:VICTORY_GAME_DIR = $Game
+    $ErrorActionPreference = 'Continue'
+    & (Join-Path $bin 'victory.exe') precompile-graphics
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($code -ne 0) { throw "victory precompile-graphics failed (exit $code)." }
+    $logs = Join-Path $root 'logs'
+    New-Item -ItemType Directory -Force $logs | Out-Null
+    Set-Content -Path (Join-Path $logs 'precompile-graphics.done') -Value (Get-Date -Format s)
 }
 
 Write-Host ''

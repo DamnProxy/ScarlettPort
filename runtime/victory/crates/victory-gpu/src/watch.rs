@@ -400,12 +400,18 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Of those, blocks whose physical pages were written since
+    /// (`VICTORY_MEM2_GPU_ONLY_NOVIEW`: a page shown through the
+    /// translation table has no view, so it stays "absent", yet it shows
+    /// bytes): the next asking reports them written once.
+    poked: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    poked: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -464,6 +470,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             open = block >= uncommitted_until;
             if open {
                 g.absent.remove(&block);
+            } else if g.poked.remove(&block) {
+                // Shown through the translation table and written there
+                // (`physical_written`): reported once, left as it is.
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             }
         }
         if open {
@@ -657,9 +667,52 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // A kernel call writes there next: pages shown through the translation
+    // table (`VICTORY_MEM2_GPU_ONLY_NOVIEW`) are made views first, which
+    // the kernel can write.
+    crate::translate::materialize(at, len);
+    writing_soft(at, len);
+}
+
+/// [`writing`] for a write that goes through the translation table itself
+/// (`crate::host::write_mapped`): no page is made a view for it.
+pub(crate) fn writing_soft(at: usize, len: usize) {
+    // Copies compared against title memory instead of a snapshot
+    // (`VICTORY_MEM2_GPU_ONLY_NOSNAP`) keep the bytes from before.
+    crate::shadow::title_will_change(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    {
+        let mut g = guards();
+        open(&mut g, at, end);
+        // Pages shown through the translation table are written in their
+        // sections: no guard sees it, so their blocks are reported written
+        // at the next asking (as `physical_written` does).
+        if crate::translate::any(at, len) {
+            let absent: Vec<usize> = g.absent.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+            g.poked.extend(absent);
+        }
+    }
     // A placed texture there changes with no descriptor written.
+    crate::descriptor::host::remapped(at, len);
+}
+
+/// After the runtime wrote physical pages through a view of its own
+/// (`victory-hle` xmem, DirectStorage's page destinations): `[at, at + len)`
+/// shows them. As [`writing`], told after the fact, and without making
+/// translated pages views: their blocks are reported written at the next
+/// asking instead.
+pub fn physical_written(at: usize, len: usize) {
+    crate::shadow::title_changed(at, len);
+    let end = at.saturating_add(len);
+    {
+        let mut g = guards();
+        open(&mut g, at, end);
+        if crate::translate::any(at, len) {
+            let absent: Vec<usize> = g.absent.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+            g.poked.extend(absent);
+        }
+    }
     crate::descriptor::host::remapped(at, len);
 }
 
@@ -782,7 +835,130 @@ pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync
 /// ([`title_memory_remapping`]).
 pub struct Remapping {
     _held: Held<std::sync::RwLockWriteGuard<'static, ()>>,
+    /// Further bytes held by the same change ([`Remapping::extend`]).
+    more: Vec<Span>,
     since: std::time::Instant,
+}
+
+impl Remapping {
+    /// Holds `[at, at + len)` as well, for the rest of the same change (a
+    /// batch of mappings, `VICTORY_PAGEMAP_RUNS`): waits for reads in
+    /// place there and for other changes under way there, never for its
+    /// own. With all of title memory held already, nothing to do.
+    pub fn extend(&mut self, at: usize, len: usize) {
+        let Held::Bytes(first) = &self._held else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let started = std::time::Instant::now();
+        let own: Vec<u64> = std::iter::once(first.0).chain(self.more.iter().map(|s| s.0)).collect();
+        let end = at.saturating_add(len);
+        let mut s = spans();
+        s.next += 1;
+        let id = s.next;
+        s.changes.push((id, at, end, false));
+        while s.reads.iter().any(|r| meet(r.1, r.2, at, end))
+            || s.changes.iter().any(|c| c.3 && !own.contains(&c.0) && meet(c.1, c.2, at, end))
+        {
+            s = spans_wait(s);
+        }
+        if let Some(c) = s.changes.iter_mut().find(|c| c.0 == id) {
+            c.3 = true;
+        }
+        drop(s);
+        self.more.push(Span(id, true));
+        REMAPS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    }
+}
+
+/// Since the last frame-rate line, changes of title memory's mapping by
+/// where they come from ([`count_remap`]'s places).
+pub(crate) static REMAP_SOURCES: [std::sync::atomic::AtomicU64; REMAP_PLACES] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; REMAP_PLACES];
+pub(crate) const REMAP_PLACES: usize = 16;
+
+/// Counts `n` for place `i` of [`REMAP_SOURCES`] (the runtime's page
+/// mapper, `victory-hle` xmem): 0 Scatter calls, 1 their pages, 2 their
+/// groups (`VICTORY_PAGEMAP_RUNS`), 3 single map calls, 4 their pages,
+/// 5 page-mapping batches (`CopyPageMappingsBatchX`), 6 their pages, 7
+/// their operations after joining, 8 their pages in the title's GPU-only
+/// reservations, 9 views mapped, 10 views unmapped, 11 notifications sent,
+/// 12 placeholder splits left out, 13 microseconds in the mapper, 14 pages
+/// of one page repeated (kind 1), 15 notifications left out by batching.
+pub fn count_remap(i: usize, n: u64) {
+    if let Some(c) = REMAP_SOURCES.get(i) {
+        c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The title's GPU-only reservations (`victory-hle` xmem tells them).
+static GPU_ONLY: std::sync::RwLock<Vec<(usize, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// The title reserved `[at, at + len)` for the GPU alone (no CPU access).
+pub fn title_memory_gpu_only(at: usize, len: usize) {
+    GPU_ONLY.write().unwrap_or_else(|e| e.into_inner()).push((at, at.saturating_add(len)));
+}
+
+/// Which title pool `at` is in, for the memory line: 0 a GPU-only
+/// reservation, 1 a physical-page placeholder, 2 other memory.
+pub(crate) fn pool_class(at: usize) -> usize {
+    if GPU_ONLY.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a <= at && at < b) {
+        0
+    } else if crate::regions::all_placeholder(at, 1) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Reports the title's own memory (committed, physical pages), for the
+/// memory line; `victory-hle` gives it.
+static TITLE_OWN: std::sync::OnceLock<fn() -> (usize, usize)> = std::sync::OnceLock::new();
+
+pub fn use_title_memory(report: fn() -> (usize, usize)) {
+    let _ = TITLE_OWN.set(report);
+}
+
+/// Logs the memory line by pool (every few seconds): the process's
+/// memory, the title's own, and the host copies by title pool.
+pub(crate) fn pool_line() {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    let (committed, physical) = TITLE_OWN.get().map_or((0, 0), |f| f());
+    let gpu_only: usize = GPU_ONLY.read().unwrap_or_else(|e| e.into_inner()).iter().map(|r| r.1 - r.0).sum();
+    let pools = crate::shadow::POOL_LIVE.each_ref().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
+    let mb = |b: usize| b as f64 / 1e6;
+    tracing::info!(
+        "memory by pool: process {:.0} MB in memory (RSS), {:.0} MB committed; the title's own: {:.0} MB committed          allocations, {:.0} MB physical pages; GPU-only reservations {:.0} MB of addresses; host copies of title memory          by pool: GPU-only {:.0} MB, physical-page placeholders {:.0} MB, other {:.0} MB",
+        mb(c.WorkingSetSize),
+        mb(c.PagefileUsage),
+        mb(committed),
+        mb(physical),
+        mb(gpu_only),
+        pools[0],
+        pools[1],
+        pools[2],
+    );
+    crate::mem2::line();
+}
+
+/// Whether `[at, at + len)` lies in one of the title's GPU-only
+/// reservations.
+pub(crate) fn all_gpu_only(at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len);
+    GPU_ONLY.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a <= at && end <= b)
+}
+
+/// Whether a change of mapping holds all of title memory (then a thread
+/// must not take a second one while it holds one).
+pub fn title_memory_remapping_is_global() -> bool {
+    !by_range()
 }
 
 impl Drop for Remapping {
@@ -821,6 +997,7 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     REMAPS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     Remapping {
         _held: held,
+        more: Vec::new(),
         since: std::time::Instant::now(),
     }
 }
@@ -870,6 +1047,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // The record of what is mapped: nothing there until the runtime tells
     // of the views it maps (`crate::title_memory_view`).
     crate::regions::unmapped(at, len);
+    // Pages shown through the translation table that were made views
+    // stay views (the runtime's notes of a batch arrive at its end).
+    crate::translate::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -882,6 +1062,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
+        g.poked.remove(&block);
     }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {

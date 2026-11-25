@@ -7,7 +7,7 @@ No emulator, no streaming. The title's own x64 code runs on your CPU, and its RD
 
 ### Where it stands
 
-Developed and tested so far against one open-world title. It reaches the lit world on an RTX 3060 at about 3-4 fps (Series S profile). It is **not yet verified playable**.
+Developed and tested so far against one open-world title. It boots, gets through the menus, saves and legal screens, reaches the world and starts gameplay: about 4 fps in the prologue on an RTX 3060 (Series S profile), up from 2.6. A frozen tile-grid overlay still sits over gameplay and the speed is far from playable, so it is **not yet verified playable**.
 
 ![progress](https://img.shields.io/badge/progress-50%25-ff2d95?style=for-the-badge)
 
@@ -15,7 +15,7 @@ Developed and tested so far against one open-world title. It reaches the lit wor
 ██████████░░░░░░░░░░  50%
 ```
 
-`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `lit world` ✅ (3-4 fps) → `shadowed areas` 🔨 → `playable speed` ⏳
+`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `lit world` ✅ → `gameplay starts` ✅ (~4 fps) → `shadowed areas` 🔨 → `playable speed` ⏳
 
 <a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" height="45"/></a>
 <a href="https://ko-fi.com/ziggymar"><img src="https://img.shields.io/badge/BUY%20A%20COFFEE-Ko--fi-ff5f5f?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" height="45"/></a>
@@ -78,7 +78,8 @@ All captured on an RTX 3060 under Windows 10.
 
 Measured on an RTX 3060 (Series S profile, the title's own upscaler):
 
-- **Speed:** about 3-4 fps in the world. The intro cutscene is very slow unless it is skipped.
+- **Speed:** about 4 fps in the prologue (up from 2.6). The main costs are per-frame GPU readback waits (about 150 ms) and streaming remap storms; fixes are being tested. The intro cutscene is very slow unless it is skipped.
+- **A frozen tile-grid overlay** covers the picture during gameplay. Under investigation.
 - **Shadowed areas are too dark.** The title's ray-traced lighting and shadows do not run yet; the ray-tracing work so far is described in [`runtime/victory/docs/fork-ray-tracing.md`](runtime/victory/docs/fork-ray-tracing.md).
 - **Not verified playable:** nobody has played a session end to end.
 
@@ -92,13 +93,17 @@ Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROAD
 |---|:---:|---|
 | Executable loads, imports bind | ✅ | the title's console DLLs load |
 | Intro, setup and menus | ✅ | 30 fps, audio plays |
+| Saves and legal screens | ✅ | the title saves a checkpoint and loads it again |
 | Open world loads | ✅ | world data streams in through DirectStorage |
-| Lit world renders | ✅ | about 3-4 fps on an RTX 3060, Series S profile |
+| Lit world renders | ✅ | about 4 fps in the prologue on an RTX 3060, Series S profile (2.6 before) |
+| Gameplay starts | ✅ | the prologue runs; not played end to end |
+| Pipelines prebuilt | ✅ | 25,200 of 25,471 graphics pipelines made ahead of time |
 | All shaders translate and validate | ✅ | 26,084 of 26,084 (71 oversized mesh shaders validate when linked to their pixel shaders) |
 | Keyboard and mouse | ✅ | click to capture, W walks the character |
+| Tile-grid overlay over gameplay | 🔨 | frozen overlay; under investigation |
 | Shadowed areas | 🔨 | too dark |
 | Intro cutscene | 🔨 | very slow unless skipped |
-| Speed work | 🔨 | batched indirect draws, precise GPU waits, fewer memory copies: built, being measured |
+| Speed work | 🔨 | per-frame GPU readback waits (about 150 ms) and streaming remap storms are the main costs; fixes are being tested |
 | Playable | ⏳ | not verified |
 | 30 fps on a mid-range PC | ⏳ | the goal |
 

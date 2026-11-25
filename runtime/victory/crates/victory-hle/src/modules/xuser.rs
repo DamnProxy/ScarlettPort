@@ -6,6 +6,8 @@
 
 use std::ffi::{c_char, c_void};
 
+use victory_core::atomic;
+
 use super::xasync::{self, AsyncBlock, ProviderData};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
@@ -125,10 +127,15 @@ pub fn profile() -> &'static Profile {
     static P: std::sync::OnceLock<Profile> = std::sync::OnceLock::new();
     P.get_or_init(|| {
         let file = profiles_file();
-        let mut list = file
-            .as_ref()
-            .and_then(|f| std::fs::read_to_string(f).ok())
-            .map(|t| parse_profiles(&t))
+        // The file is only ever replaced atomically, the previous one kept
+        // as `.bak`; a missing, empty or damaged file reads as the `.bak`.
+        let good = |d: &[u8]| std::str::from_utf8(d).is_ok_and(|t| !parse_profiles(t).is_empty());
+        let found = file.as_ref().and_then(|f| atomic::read_good(f, good));
+        if let (Some((_, atomic::Found::Backup)), Some(f)) = (&found, &file) {
+            tracing::warn!(path = %f.display(), "the local profiles file was missing or damaged; using its last good copy");
+        }
+        let mut list = found
+            .map(|(d, _)| parse_profiles(&String::from_utf8_lossy(&d)))
             .unwrap_or_default();
         let wanted = std::env::var("VICTORY_PROFILE").ok();
         let (p, changed) = choose_profile(&mut list, wanted.as_deref());
@@ -139,10 +146,7 @@ pub fn profile() -> &'static Profile {
                 text += &format!("{:016X} {}
 ", q.xuid, q.gamertag);
             }
-            if let Some(dir) = f.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(e) = std::fs::write(f, text) {
+            if let Err(e) = atomic::replace(f, text.as_bytes()) {
                 tracing::warn!(path = %f.display(), %e, "the local profiles could not be written");
             }
         }

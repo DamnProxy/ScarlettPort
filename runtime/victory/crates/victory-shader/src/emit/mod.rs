@@ -178,6 +178,7 @@ pub fn group_sync() -> u8 {
     *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
+        Some("3") => 3,
         _ => 2,
     })
 }

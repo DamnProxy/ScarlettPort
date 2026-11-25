@@ -294,8 +294,25 @@ impl GraphicsState {
     /// "this format does not support blending"), and every draw of it is
     /// dropped. With one blend description for all targets, it is copied
     /// to each first so that only those targets change.
+    ///
+    /// Dual-source blending (an SRC1 factor on target 0) is D3D12's for
+    /// target 0 alone: the other targets go back to the default blend
+    /// (their write masks kept). The title's pipeline cache has such
+    /// pipelines whose registers repeat target 0's blend on all eight
+    /// targets with no write mask past target 0, which decode as
+    /// independent blending; D3D12 refused them (`E_INVALIDARG`, debug
+    /// layer: "Dual-source color blending cannot be used when BlendEnable
+    /// is set for a RenderTarget above 0").
     pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
         let mut blend = self.blend;
+        if dual_source(&blend.RenderTarget[0]) {
+            for t in &mut blend.RenderTarget[1..] {
+                *t = D3D12_RENDER_TARGET_BLEND_DESC {
+                    RenderTargetWriteMask: t.RenderTargetWriteMask,
+                    ..DEFAULT_TARGET_BLEND
+                };
+            }
+        }
         let n = self.targets.NumRenderTargets.min(8) as usize;
         let independent = blend.IndependentBlendEnable.as_bool();
         let fix: Vec<usize> = (0..n)
@@ -685,6 +702,10 @@ impl HostPipeline {
                 (Some((_, Some(p))), _) => bytes(p),
                 _ => code(i),
             };
+            // The pixel shader the mesh shader's outputs were linked to: the
+            // unlinked one reads interpolants the linked mesh shader no
+            // longer writes where it wrote them (`E_INVALIDARG`).
+            let ps_code = ps_at.map_or_else(none, &code);
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
@@ -872,6 +893,31 @@ impl HostPipeline {
             },
         })
     }
+}
+
+/// D3D12's default blend of one render target (blending off).
+const DEFAULT_TARGET_BLEND: D3D12_RENDER_TARGET_BLEND_DESC = D3D12_RENDER_TARGET_BLEND_DESC {
+    BlendEnable: windows::core::BOOL(0),
+    LogicOpEnable: windows::core::BOOL(0),
+    SrcBlend: D3D12_BLEND_ONE,
+    DestBlend: D3D12_BLEND_ZERO,
+    BlendOp: D3D12_BLEND_OP_ADD,
+    SrcBlendAlpha: D3D12_BLEND_ONE,
+    DestBlendAlpha: D3D12_BLEND_ZERO,
+    BlendOpAlpha: D3D12_BLEND_OP_ADD,
+    LogicOp: D3D12_LOGIC_OP_NOOP,
+    RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+};
+
+/// Whether a target's blend reads the pixel shader's second output.
+fn dual_source(t: &D3D12_RENDER_TARGET_BLEND_DESC) -> bool {
+    t.BlendEnable.as_bool()
+        && [t.SrcBlend, t.DestBlend, t.SrcBlendAlpha, t.DestBlendAlpha].iter().any(|&f| {
+            matches!(
+                f,
+                D3D12_BLEND_SRC1_COLOR | D3D12_BLEND_INV_SRC1_COLOR | D3D12_BLEND_SRC1_ALPHA | D3D12_BLEND_INV_SRC1_ALPHA
+            )
+        })
 }
 
 /// Whether a render target format is an integer one (`_UINT`, `_SINT`):
@@ -1182,6 +1228,39 @@ mod tests {
         let b = g.host_blend();
         assert!(!b.IndependentBlendEnable.as_bool());
         assert!(b.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    /// A dual-source blend repeated on all eight targets (as the title's
+    /// pipeline cache records it) keeps it on target 0 only.
+    #[test]
+    fn dual_source_blending_stays_on_target_0() {
+        for independent in [false, true] {
+            let mut g = blending(&[DXGI_FORMAT_R8G8B8A8_UNORM], independent);
+            for (i, t) in g.blend.RenderTarget.iter_mut().enumerate() {
+                t.DestBlend = D3D12_BLEND_INV_SRC1_COLOR;
+                t.DestBlendAlpha = D3D12_BLEND_INV_SRC1_ALPHA;
+                t.RenderTargetWriteMask = if i == 0 { 0xf } else { 0 };
+            }
+            let b = g.host_blend();
+            assert_eq!(b.IndependentBlendEnable.as_bool(), independent);
+            assert!(b.RenderTarget[0].BlendEnable.as_bool());
+            assert_eq!(b.RenderTarget[0].DestBlend, D3D12_BLEND_INV_SRC1_COLOR);
+            assert_eq!(b.RenderTarget[0].RenderTargetWriteMask, 0xf);
+            for t in &b.RenderTarget[1..] {
+                assert!(!t.BlendEnable.as_bool());
+                assert!(!dual_source(t) && t.DestBlend == D3D12_BLEND_ZERO && t.DestBlendAlpha == D3D12_BLEND_ZERO);
+                assert_eq!(t.RenderTargetWriteMask, 0);
+            }
+            // The state a run names the pipeline by is not changed.
+            assert_eq!(g.blend.RenderTarget[7].DestBlend, D3D12_BLEND_INV_SRC1_COLOR);
+        }
+    }
+
+    #[test]
+    fn blending_without_a_second_source_is_unchanged() {
+        let g = blending(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM], true);
+        let b = g.host_blend();
+        assert!(b.RenderTarget.iter().all(|t| t.BlendEnable.as_bool() && t.SrcBlend == D3D12_BLEND_SRC_ALPHA));
     }
 
     #[test]

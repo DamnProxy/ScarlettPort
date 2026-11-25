@@ -16,10 +16,14 @@
 //! - `VICTORY_DS_PIPELINE` 0: the old workers (default 1).
 //! - `VICTORY_DS_QD` reads in flight in all (default 64), `VICTORY_DS_QD_FILE`
 //!   per file (default 16).
-//! - `VICTORY_DS_COALESCE_KB` largest merged read (default 1024; 0: no merging),
-//!   `VICTORY_DS_GAP_KB` largest hole read through to merge (default 64).
+//! - `VICTORY_DS_COALESCE_KB` largest merged read (default 2048; 0: no merging),
+//!   `VICTORY_DS_GAP_KB` largest hole read through to merge (default 256).
 //! - `VICTORY_DS_DECODE_THREADS` (default: logical CPUs - 4, at least 2).
-//! - `VICTORY_DS_UNBUFFERED` 1: reads bypass the system file cache (default 0).
+//! - `VICTORY_DS_UNBUFFERED` 1: reads bypass the system file cache (default 1:
+//!   no second copy in the file cache, and ReadFile never blocks the I/O thread).
+//! - `VICTORY_DS_BUFFER_MB` read buffers alive at once, holes included (default 192).
+//! - `VICTORY_DS_STAGING_MB` the staging limit, raised over the title's 32 MiB
+//!   (default 128; 0: the title's).
 //! - `VICTORY_DS_CACHE_MB` a cache of recently read 256 KiB blocks, reads
 //!   widened to whole blocks (default 0: off).
 //! - `VICTORY_DS_MAX_JOBS` requests held by the pipeline at once (default 4096).
@@ -56,6 +60,9 @@ pub(super) struct Config {
     max_jobs: usize,
     /// Source bytes the pipeline may hold (reads and decode queue).
     max_held: u64,
+    max_buffers: u64,
+    /// The staging limit we use (bytes; 0: the title's).
+    pub staging: u64,
 }
 
 const CACHE_BLOCK: u64 = 256 << 10;
@@ -76,14 +83,16 @@ pub(super) fn config() -> &'static Config {
             enabled: env_u64("VICTORY_DS_PIPELINE", 1) != 0,
             qd: env_u64("VICTORY_DS_QD", 64).max(1) as usize,
             qd_file: env_u64("VICTORY_DS_QD_FILE", 16).max(1) as usize,
-            coalesce: env_u64("VICTORY_DS_COALESCE_KB", 1024).min(16 << 10) << 10,
-            gap: env_u64("VICTORY_DS_GAP_KB", 64) << 10,
+            coalesce: env_u64("VICTORY_DS_COALESCE_KB", 2048).min(16 << 10) << 10,
+            gap: env_u64("VICTORY_DS_GAP_KB", 256) << 10,
             decode_threads: env_u64("VICTORY_DS_DECODE_THREADS", cpus.saturating_sub(4).max(2) as u64)
                 .clamp(1, 64) as usize,
-            unbuffered: env_u64("VICTORY_DS_UNBUFFERED", 0) != 0,
+            unbuffered: env_u64("VICTORY_DS_UNBUFFERED", 1) != 0,
             cache_bytes: env_u64("VICTORY_DS_CACHE_MB", 0) << 20,
             max_jobs: env_u64("VICTORY_DS_MAX_JOBS", 4096).max(1) as usize,
             max_held: 512 << 20,
+            max_buffers: env_u64("VICTORY_DS_BUFFER_MB", 192).max(8) << 20,
+            staging: env_u64("VICTORY_DS_STAGING_MB", 128) << 20,
         };
         tracing::info!(
             pipeline = config.enabled,
@@ -95,6 +104,8 @@ pub(super) fn config() -> &'static Config {
             unbuffered = config.unbuffered,
             cache_mb = config.cache_bytes >> 20,
             max_jobs = config.max_jobs,
+            buffer_mb = config.max_buffers >> 20,
+            staging_mb = config.staging >> 20,
             "dstorage: io switches"
         );
         config
@@ -193,7 +204,11 @@ impl Buffer {
         let layout = std::alloc::Layout::from_size_align(len.max(1), SECTOR as usize).ok()?;
         // SAFETY: a non-zero size.
         let ptr = unsafe { std::alloc::alloc(layout) };
-        (!ptr.is_null()).then_some(Buffer { ptr, layout })
+        if ptr.is_null() {
+            return None;
+        }
+        BUFFERS.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        Some(Buffer { ptr, layout })
     }
 
     fn bytes(&self) -> &[u8] {
@@ -206,6 +221,7 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         // SAFETY: allocated with this layout.
         unsafe { std::alloc::dealloc(self.ptr, self.layout) }
+        BUFFERS.fetch_sub(self.layout.size() as u64, Ordering::Relaxed);
     }
 }
 
@@ -366,6 +382,7 @@ pub(super) fn log_summary(secs: f64) {
         instant_reads = take(&s.instant_reads),
         issue_ms = take(&s.issue_ns) / 1_000_000,
         cache_hits = take(&s.cache_hits),
+        buffer_mb = BUFFERS.load(Ordering::Relaxed) >> 20,
         "dstorage io: last {secs:.1} s"
     );
 }
@@ -376,6 +393,8 @@ pub(super) fn log_summary(secs: f64) {
 static PORT: OnceLock<usize> = OnceLock::new();
 static HELD_JOBS: AtomicUsize = AtomicUsize::new(0);
 static HELD_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Bytes of read buffers alive (in flight, or held by requests not yet decoded).
+static BUFFERS: AtomicU64 = AtomicU64::new(0);
 
 fn running() -> bool {
     PORT.get().is_some()
@@ -689,7 +708,11 @@ impl Io {
         let mut failed = Vec::new();
         let ids: Vec<u64> = self.files.keys().copied().collect();
         for id in ids {
-            if self.in_flight >= config.qd {
+            // Read buffers are capped (the cache's pinned blocks aside); with
+            // nothing in flight one read always starts, so this never stalls.
+            let buffers = BUFFERS.load(Ordering::Relaxed);
+            let cap = config.max_buffers + 2 * config.cache_bytes;
+            if self.in_flight >= config.qd || (self.in_flight > 0 && buffers >= cap) {
                 break;
             }
             let Some(file) = self.files.get_mut(&id) else {

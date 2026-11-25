@@ -1089,6 +1089,26 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 // The heap map leaves the fork's dynamic slots and guard slot in place.
 const _: () = assert!(MAP_SLOT + 1 + DYNAMIC == PORTABLE_VIEWS - 1);
 
+/// The size of a view heap smaller than the limit shaders clamp view
+/// indices to: up to and with that slot, which stays null (it lies past
+/// the dynamic slots). Without it an index between the heap's end and the
+/// clamp read past the heap, the read that hangs NVIDIA. Adapted from
+/// Zettrox/ztrx#20 (rivaldodev). `VICTORY_HEAP_PAD_NULL=0`: the heap is
+/// made to the size asked, as before.
+fn padded_size(sampler: bool, asked: u32) -> Option<u32> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if sampler || !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PAD_NULL").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    #[cfg(not(test))]
+    probe_view_limit();
+    padded_to(asked, victory_shader::emit::view_heap_limit())
+}
+
+fn padded_to(asked: u32, limit: u32) -> Option<u32> {
+    (limit != 0 && asked <= limit).then(|| limit + 1)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1133,7 +1153,10 @@ impl HostHeap {
                 );
                 make(l.size()).map(|heap| (heap, l.window, l.size()))
             }
-            None => make(count + extra).map(|heap| (heap, count, count + extra)),
+            None => match padded_size(sampler, count + extra) {
+                Some(size) => make(size).map(|heap| (heap, count, size)),
+                None => make(count + extra).map(|heap| (heap, count, count + extra)),
+            },
         };
         let (heap, count, size) = match made {
             Ok(made) => made,
@@ -1176,7 +1199,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(if layout.is_some() { size } else { count + extra }) * u64::from(step),
+            u64::from(size) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -4086,5 +4109,16 @@ mod tests {
         }
         assert_eq!(entry(heap, 30), (!freed, Some(freed)));
         assert_eq!(release(title), 0);
+    }
+}
+
+#[cfg(test)]
+mod pad_null {
+    #[test]
+    fn small_heaps_reach_the_clamp_slot() {
+        assert_eq!(super::padded_to(10, 0), None);
+        assert_eq!(super::padded_to(10, 999_999), Some(1_000_000));
+        assert_eq!(super::padded_to(999_999, 999_999), Some(1_000_000));
+        assert_eq!(super::padded_to(1_000_000, 999_999), None);
     }
 }

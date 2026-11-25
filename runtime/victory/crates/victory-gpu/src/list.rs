@@ -2400,6 +2400,9 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     }
     #[cfg(windows)]
     if let Some(list) = host_list_rec_quiet(this) {
+        if matches!(what, Written::Value(_)) {
+            crate::host::note_label(address as usize);
+        }
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }

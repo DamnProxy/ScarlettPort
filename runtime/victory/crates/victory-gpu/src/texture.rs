@@ -77,6 +77,10 @@ struct Last {
     /// ([`Staging::unseen_write`]): it is hashed at every check until this
     /// frame.
     unguarded: u64,
+    /// `VICTORY_MEM2_PAGE_REHASH`: the hash of each 64 KiB page of the
+    /// memory, and the whole hash they make (good while it is `hash`).
+    pages: Option<victory_core::mem2::PageHashes>,
+    pages_hash: Option<blake3::Hash>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -501,8 +505,22 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
-/// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
-/// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
+/// `VICTORY_STAGING_IDLE_FRAMES=n` (unset by default: 4 frames and a time
+/// that shrinks with free RAM): a texture's staging buffer goes once no list
+/// holds it (its upload has landed) and no list used it for `n` frames,
+/// whatever the time (MEMORY.md §4 #7: staging is ≈0.5-1 GiB). `1` lets go
+/// of every staging buffer not used in the last frame; a texture sampled
+/// again later is detiled and uploaded once more.
+fn staging_idle_frames() -> (u64, bool) {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    match *N.get_or_init(|| std::env::var("VICTORY_STAGING_IDLE_FRAMES").ok().and_then(|v| v.trim().parse().ok())) {
+        Some(n) => (n.max(1), true),
+        None => (4, false),
+    }
+}
+
+/// Lets go of the staging buffers no list recorded a use of for a time
+/// and some frames ([`staging_idle_frames`]) and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
 /// those of textures no longer sampled were kept for the run (2,246 of
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
@@ -510,7 +528,7 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
+    let (idle_frames, by_frames) = staging_idle_frames();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -518,14 +536,15 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    // `VICTORY_STAGING_IDLE_FRAMES`: frames alone decide, no time.
+    let idle_ms = if by_frames { 0 } else { crate::host::ram_idle_ms(crate::host::available_physical_ram()) };
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
@@ -778,6 +797,9 @@ impl Staging {
         // that only changed every eighth frame, one old picture after
         // another on the screen).
         let mut unseen = false;
+        // `VICTORY_MEM2_PAGE_REHASH`: the pages the guard saw written since
+        // the last check, when only they need hashing.
+        let mut recheck: Option<Vec<usize>> = None;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -786,7 +808,8 @@ impl Staging {
             // views of the runtime's own are told to the guards now
             // (`kernel_will_write` from xmem's `written`), so the check
             // finds less than it did.
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let prev = last.asked;
+            let unwritten = prev != 0 && written.iter().all(|&(_, w)| w <= prev);
             last.asked = now;
             let frame = crate::frame::current();
             let every = crate::memcopy::hash_every();
@@ -803,6 +826,12 @@ impl Staging {
                 return 0;
             }
             unseen = unwritten;
+            // Written pages named, no check turn (which hashes whole, to
+            // find writes the guard cannot see), not in a stretch of
+            // unseen writes: only the pages written are hashed.
+            if !unwritten && prev != 0 && !turn && !film && frame >= last.unguarded && crate::mem2::page_rehash() {
+                recheck = Some(written.iter().filter(|&&(_, w)| w > prev).map(|&(p, _)| p).collect());
+            }
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -856,9 +885,15 @@ impl Staging {
             let _ = changed;
             return size;
         }
-        if through_copy() {
+        // Pages shown through the translation table
+        // (`VICTORY_MEM2_GPU_ONLY_NOVIEW`) have no view to read in place:
+        // read through the copy, which translates them.
+        if through_copy() || crate::translate::any(start, size) {
             return with_title(self.memory, size, |tiled| {
-                let hash = crate::memcopy::content_hash(tiled);
+                let hash = match self.tex_hash(last, tiled, recheck.as_deref()) {
+                    Ok(hash) => hash,
+                    Err(hashed) => return hashed,
+                };
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -877,7 +912,10 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = crate::memcopy::content_hash(tiled);
+        let hash = match self.tex_hash(last, tiled, recheck.as_deref()) {
+            Ok(hash) => hash,
+            Err(hashed) => return hashed,
+        };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -891,6 +929,50 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
+    }
+
+    /// The hash of the texture's memory `tiled`, as the checks compare it.
+    /// With `VICTORY_MEM2_PAGE_REHASH` it is made of one hash per 64 KiB
+    /// page; when the guard named the pages written since the last check
+    /// (`recheck`) and the page hashes are those of the last hash, only
+    /// those pages are hashed, and `Err(bytes hashed)` says none of them
+    /// changed (the texture is as it was).
+    fn tex_hash(&self, last: &mut Last, tiled: &[u8], recheck: Option<&[usize]>) -> Result<blake3::Hash, usize> {
+        if !crate::mem2::page_rehash() {
+            return Ok(crate::memcopy::content_hash(tiled));
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        use victory_core::mem2::PageHashes;
+        let (start, size) = (self.memory as usize, tiled.len());
+        let page = |o: usize, n: usize| {
+            let h = crate::memcopy::content_hash(&tiled[o..o + n]);
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&h.as_bytes()[..16]);
+            u128::from_le_bytes(b)
+        };
+        let r = &crate::mem2::REHASH;
+        if let Some(pages) = recheck
+            && last.pages_hash.is_some()
+            && last.pages_hash == last.hash
+            && let Some(kept) = last.pages.as_mut().filter(|p| p.of(start, size))
+        {
+            let found = kept.recheck(pages.iter().copied(), page);
+            r[0].fetch_add(1, Relaxed);
+            r[1].fetch_add(found.hashed as u64, Relaxed);
+            r[2].fetch_add(size.saturating_sub(found.hashed) as u64, Relaxed);
+            if found.changed.is_empty() {
+                return Err(found.hashed);
+            }
+            r[3].fetch_add(1, Relaxed);
+            let hash = blake3::hash(&kept.digest_input());
+            last.pages_hash = Some(hash);
+            return Ok(hash);
+        }
+        let kept = PageHashes::build(start, size, page);
+        let hash = blake3::hash(&kept.digest_input());
+        last.pages = Some(kept);
+        last.pages_hash = Some(hash);
+        Ok(hash)
     }
 
     /// The texture's memory changed and the guard says nothing wrote it: it

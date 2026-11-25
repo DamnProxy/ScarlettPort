@@ -324,7 +324,9 @@ pub(crate) fn release_held(all: bool) {
                 match held.first() {
                     None => break,
                     Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                        if !all
+                            && crate::fence::completed(fence as This) < value
+                            && !crate::host::late_signal_queued(fence, value) =>
                     {
                         break;
                     }
@@ -719,6 +721,10 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
+        // Copies compared with title memory (`VICTORY_MEM2_GPU_ONLY_NOSNAP`)
+        // keep the bytes from before this write.
+        #[cfg(windows)]
+        crate::shadow::title_will_change(at as usize, bytes);
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
@@ -762,6 +768,9 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    // Read-back copy-backs old enough are done before the frame goes.
+    #[cfg(windows)]
+    crate::host::async_present();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
@@ -1009,6 +1018,40 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    if let Some(batch) = crate::resource::page_batch_mapper() {
+        // `VICTORY_PAGEMAP_RUNS`: the whole batch as one, in order.
+        use victory_core::pagemap::AliasOp;
+        let mut ops: Vec<AliasOp> = Vec::new();
+        for b in batches.into_iter().flatten() {
+            if b.ranges.is_null() {
+                continue;
+            }
+            // SAFETY: each batch holds `count` ranges.
+            let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+            let mut at = b.destination;
+            for r in ranges {
+                let len = u64::from(r.count) * PAGE;
+                let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+                let source = pool + u64::from(r.start) * PAGE;
+                match r.kind {
+                    0 if inside(r.count) => ops.push(AliasOp { to: at, from: Some(source), len, repeat: false }),
+                    1 if inside(1) => ops.push(AliasOp { to: at, from: Some(source), len, repeat: true }),
+                    2 => ops.push(AliasOp { to: at, from: None, len, repeat: false }),
+                    3 => {}
+                    _ => ok = false,
+                }
+                at += len;
+            }
+        }
+        ok &= batch(&ops);
+        if !ok {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        }
+        return S_OK;
+    }
+    #[cfg(windows)]
+    crate::watch::count_remap(5, 1);
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -1022,7 +1065,11 @@ extern "system" fn copy_page_mappings(
             let source = pool + u64::from(r.start) * PAGE;
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
+                1 if inside(1) => {
+                    #[cfg(windows)]
+                    crate::watch::count_remap(14, u64::from(r.count));
+                    (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE))
+                }
                 2 => map(at, 0, len),
                 3 => true,
                 _ => false,

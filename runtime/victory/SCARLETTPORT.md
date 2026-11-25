@@ -20,14 +20,33 @@ This tree is the VIctory-based runtime used by ScarlettPort, vendored as plain s
    - Not taken: upstream #1529 and 6d021fe, pipeline pre-build commits c47b529 / 9c58a1c / 819f622, #175, #186 (conflicting designs).
 7. **ScarlettPort changes** on top: Windows 10 Agility SDK opt-in, automatic input (`VICTORY_AUTO_INPUT`), a live press file with stick tokens, capture-every and frame dumps, fast boot (`VICTORY_FAST_BOOT`, testing only) and save slots (`VICTORY_SAVE_SLOT`), `SCARLETT_*` aliases for every `VICTORY_*` switch, a host descriptor-words table (descriptors read as numbers), exposure, ambient and shadow-mask stand-ins (off by default), `VICTORY_SHADER_OPT` and the relay left off by default, a `VICTORY_RAYTRACING=off` answer, and test switches (`VICTORY_TEST_NO_GPU`). Since the earlier snapshot: keyboard and mouse played like a PC game (`VICTORY_KBM`, `docs/input.md`), a splash inside the title's window, pipelined DirectStorage reads, precompiled graphics and compute pipelines (`VICTORY_PRECOMPILED_PSO`), linked mesh/pixel pairs, a geometry-stage path for merged ES-GS programs, ReBAR host copies (`VICTORY_REBAR`), and the opt-in speed switches for indirect clamps, barriers, synchronisation and memory copies (`VICTORY_INDIRECT_*`, `VICTORY_BARRIER_*`, `VICTORY_SYNC_PRECISE`, `VICTORY_KNOWN_WRITES`, `VICTORY_FAST_HASH`, `VICTORY_COPY_BACK_ONLY_READBACK`, ...; see `docs/RUNTIMES.md`). The ray-tracing node test (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) is emulated as inline DXIL in `crates/victory-shader/src/emit/intersect.rs`.
 
-Authors whose commits are in the range `4e17478..fx-harvest` (kept in the history of our working repository, not in this snapshot): Xeltax, fever308, iurysf, fxceless, UNYTIX, sedzz, ruvenesh, marquezini, gdawid94, Matheus, Looper_Salty, Last Thylacine, Christian Blomert, Bennet0k, Adrito, myokex, sagouindupm, uiliannn, lukka, DoubleD17, AscilCH, Ziggy.
+Authors whose commits are in the range `4e17478..fx-final` (kept in the history of our working repository, not in this snapshot): Xeltax, fever308, iurysf, fxceless, UNYTIX, sedzz, ruvenesh, marquezini, gdawid94, Matheus, Looper_Salty, Last Thylacine, Christian Blomert, Bennet0k, Adrito, myokex, sagouindupm, uiliannn, lukka, DoubleD17, AscilCH, AlanQiang0418, God489, iNaxxs, Rivaldo Freitas de Carvalho, Ziggy.
 
 Also credited: XCL by ivall and contributors (https://github.com/ivall/xcl, GPL-2.0-only), used as a reference for how a title behaves under another layer.
 
 ## This snapshot
 
-- Source: branch `fx-harvest` at `38e8e7c` of our fork's working repository, a merge of `fx-merge`, `fx-play`, `fx-all`, `fx-dispatch` (with `fx-batch` and `fx-sync`), `fx-mem-copy`, `fx-f3view`, `fx-mem-rebar`, `fx-pre`/`fx-pre2` and `fx-load`.
-- `patches/victory-stack.patch` (repository root) is the diff of this tree against fxceless/victory-fork `main` at `4e17478` (`git diff 4e17478 fx-harvest`). The patch is generated from this tree, so it carries the wording edits below.
+- Source: branch `fx-final` at `26f8afd` of our fork's working repository. It is the build behind the verified 4 fps settings, with `fx-msfix` and `fx-mem2` off by default.
+- Merged since the previous snapshot (`fx-harvest` at `38e8e7c`, which this repository took in 48ba23a), by branch:
+  - boot fixes
+  - saves fix (`fx-saves`, `fx-saves-h2`)
+  - splash and account picker (`fx-splash`)
+  - keyboard and mouse (`fx-kbm`)
+  - pacing (`fx-pace`)
+  - readback precise settles (`VICTORY_READ_SETTLE_PRECISE`, off by default in the runtime; the play script turns it on)
+  - indirect batching (`fx-batch`)
+  - dispatch hazards (`fx-dispatch`)
+  - memory-copy cuts (`fx-mem-copy`)
+  - loading pipeline (`fx-load`)
+  - msfix pipeline cache (25,200 of 25,471 pipelines prebuilt by `victory precompile-graphics`; `fx-msfix`, off by default)
+  - mem2, the second round of memory work (`fx-mem2`, off by default)
+  - cutscene diagnostics (`fx-cutscene`)
+  - audio (`fx-audio`)
+  - overlay (`fx-overlay`)
+  - stable watchdog (`fx-stable`)
+  - cachekey opt-in (`fx-cachekey`)
+  - f3 view fix (`fx-f3view`, default off)
+- `patches/victory-stack.patch` (repository root) is the diff of this tree against fxceless/victory-fork `main` at `4e17478` (`git diff 4e17478 fx-final`). The patch is generated from this tree, so it carries the wording edits below.
 - The base already took the title's name out of its tree; this snapshot keeps it that way. Two doc comments (`readback.rs`, `descriptor/slot_map.rs`), one line of `VICKY.md` (a former repository name) and one line of `README.md` (a note on how the fork was written) differ from the working repository for that reason.
 
 Build and run: see `docs/BUILDING.md`, `scripts/setup-victory.ps1` and `scripts/play-victory.ps1`.

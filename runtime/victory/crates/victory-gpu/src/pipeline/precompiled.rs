@@ -471,7 +471,8 @@ pub struct PrecompileReport {
 /// `VICTORY_PRECOMPILED_GRAPHICS=1`). Runs `jobs` workers at the lowest
 /// thread priority, in background mode (lowered I/O and memory priority
 /// too), so it can go on beside other work; needs a host GPU. Stops after
-/// `limit` records if given. The caller saves the library
+/// `limit` records if given, after the first `skip`; with `mesh_only`,
+/// only mesh-shader records count. The caller saves the library
 /// ([`super::save_pipeline_cache`]).
 #[cfg(windows)]
 pub fn precompile_graphics(
@@ -479,6 +480,8 @@ pub fn precompile_graphics(
     index: Option<&std::path::Path>,
     jobs: usize,
     limit: Option<usize>,
+    skip: usize,
+    mesh_only: bool,
     progress: &(dyn Fn(usize, &PrecompileReport) + Sync),
 ) -> Result<PrecompileReport, String> {
     use std::sync::atomic::AtomicUsize;
@@ -492,8 +495,14 @@ pub fn precompile_graphics(
     let file = pso_cache::find_in_archive(&bytes).ok_or("no pipeline cache in the shader archive")?;
     drop(bytes);
     let cache = pso_cache::Cache::parse(&file)?;
-    let records = limit.map_or(cache.graphics_count(), |l| l.min(cache.graphics_count()));
-    tracing::info!(records, shaders, jobs, "precompiling the title's graphics pipelines");
+    // The record numbers to make, in order.
+    let chosen: Vec<usize> = (0..cache.graphics_count())
+        .filter(|&i| !mesh_only || cache.graphics(i).is_some_and(|g| g.stages[2].is_some()))
+        .skip(skip)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+    let records = chosen.len();
+    tracing::info!(records, skip, mesh_only, shaders, jobs, "precompiling the title's graphics pipelines");
 
     let next = AtomicUsize::new(0);
     let keys = Mutex::new(HashSet::new());
@@ -507,10 +516,8 @@ pub fn precompile_graphics(
             s.spawn(|| {
                 background();
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= records {
-                        break;
-                    }
+                    let n = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&i) = chosen.get(n) else { break };
                     let Some(g) = cache.graphics(i) else { continue };
                     let state = cache
                         .block(g.state[0])
@@ -543,13 +550,16 @@ pub fn precompile_graphics(
                         count(&|r| r.duplicates += 1);
                         continue;
                     }
+                    if made == Some(false) {
+                        tracing::warn!(record = i, "precompile: the record's host pipeline failed");
+                    }
                     count(&|r| match made {
                         Some(true) => r.made += 1,
                         Some(false) => r.failed += 1,
                         None => r.left_out += 1,
                     });
-                    if (i + 1) % 500 == 0 {
-                        progress(i + 1, &report.lock().unwrap_or_else(|e| e.into_inner()));
+                    if (n + 1) % 500 == 0 {
+                        progress(n + 1, &report.lock().unwrap_or_else(|e| e.into_inner()));
                     }
                 }
             });

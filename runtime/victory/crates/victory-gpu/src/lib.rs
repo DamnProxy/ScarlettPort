@@ -44,7 +44,11 @@ mod primitive;
 mod profile;
 pub mod query;
 #[cfg(windows)]
+mod mem2;
+#[cfg(windows)]
 mod memcopy;
+#[cfg(windows)]
+mod translate;
 #[cfg(windows)]
 mod readback;
 mod rebar;
@@ -76,9 +80,23 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view}
 #[cfg(windows)]
 pub use regions::{title_memory_not_placeholder, title_memory_placeholder};
 #[cfg(windows)]
+pub use mem2::use_cpu_free;
+#[cfg(windows)]
+pub use shadow::gpu_only_exposed;
+#[cfg(windows)]
+pub use translate::{enabled as mem2_gpu_only_noview, title_memory_translated, title_memory_untranslated};
+#[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    count_remap, physical_written, title_memory_gpu_only, title_memory_reading, use_title_memory, title_memory_remapped,
+    title_memory_remapping, title_memory_remapping_is_global, writing as kernel_will_write, Remapping,
 };
+
+/// Whether `VICTORY_MEM2_GPU_ONLY_NOSNAP` is on (xmem then keeps the record
+/// of which pages the CPU can reach).
+#[cfg(windows)]
+pub fn mem2_nosnap() -> bool {
+    mem2::nosnap()
+}
 
 /// Total installed physical RAM in bytes, queried once from the OS.
 #[cfg(windows)]

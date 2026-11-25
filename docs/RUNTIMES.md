@@ -6,9 +6,9 @@ Both runtimes run a title from your own dump. Each currently gets further at som
 |---|---|---|
 | Shader path | RDNA2 to DXIL directly | RDNA2 to HLSL to DXC to DXIL |
 | Menus and loading | 30 fps | 30 fps |
-| Open world | lit world reached on an RTX 3060, Series S profile | world reached, survives 7+ minutes |
-| Speed in the world | about 3-4 fps (RTX 3060, Series S profile) | not rendering the final image |
-| Final image | lit; shadowed areas too dark | black |
+| Open world | world reached and gameplay starts on an RTX 3060, Series S profile | world reached, survives 7+ minutes |
+| Speed in the world | about 4 fps in the prologue (RTX 3060, Series S profile; 2.6 before) | not rendering the final image |
+| Final image | lit; shadowed areas too dark; a frozen tile-grid overlay over gameplay | black |
 | Extras | frame capture, save slots, press file, fast boot (testing) | launcher, pipeline journal and offline build, profiles, achievements, crash reports |
 | Scripts | `setup-victory.ps1`, `play-victory.ps1` | `setup.ps1`, `play.ps1`, launcher |
 
@@ -16,7 +16,7 @@ Neither is verified playable.
 
 ## VIctory-based runtime
 
-Vendored source of branch `fx-harvest` at `38e8e7c`: fxceless/victory-fork (`main` at `4e17478`, GPL-3.0) with the victory-amd fork, community pull requests, our speed branches and our changes merged in. It includes the `image_bvh_intersect_ray` / `image_bvh64_intersect_ray` emulation (`crates/victory-shader/src/emit/intersect.rs`), so ray-tracing compute programs translate. Credits and the full lineage: `runtime/victory/SCARLETTPORT.md`. Upstream is VIctory by Marvisak.
+Vendored source of branch `fx-final` at `26f8afd` (the build behind the verified 4 fps settings): fxceless/victory-fork (`main` at `4e17478`, GPL-3.0) with the victory-amd fork, community pull requests, our speed branches and our changes merged in. It includes the `image_bvh_intersect_ray` / `image_bvh64_intersect_ray` emulation (`crates/victory-shader/src/emit/intersect.rs`), so ray-tracing compute programs translate. Credits and the full lineage: `runtime/victory/SCARLETTPORT.md`. Upstream is VIctory by Marvisak.
 
 ```powershell
 .\scripts\setup-victory.ps1
@@ -40,7 +40,11 @@ Every `VICTORY_*` variable can also be given as `SCARLETT_*`. The full list is i
 | `VICTORY_KBM=0` | turn off keyboard and mouse as a pad (on by default; keys and settings in `runtime/victory/docs/input.md`) |
 | `VICTORY_PRESS_FILE=<file>` | live input: button and stick tokens written to the file are pressed |
 | `VICTORY_CAPTURE_EVERY=N` | save the frame every N frames (diagnostics build) |
-| `VICTORY_RELAY=1\|2` | opt-in submission relay (off by default) |
+| `VICTORY_RELAY=1\|2` | submission relay (off in the runtime by default; `play-victory.ps1` sets `2`) |
+| `VICTORY_SYNC_PRECISE=1` | a submission waits only for the submissions it depends on. Set by `play-victory.ps1` |
+| `VICTORY_READ_SETTLE_PRECISE=1` | read-backs settle on the exact submissions they need (needs the relay). Set by `play-victory.ps1` |
+| `VICTORY_PRECOMPILED_GRAPHICS=1` | make graphics pipelines from the title's precompiled cache, prebuilt with `victory precompile-graphics` (25,200 of 25,471 made). Set by `play-victory.ps1`, which runs the precompile once; `setup-victory.ps1 -Game <dump>` can do it too |
+| `VICTORY_PIPELINE_WAIT_MS=0` | do not hold a draw back for a pipeline build. Set by `play-victory.ps1` |
 | `VICTORY_SHADER_OPT=on` | opt-in shader clean-up passes (off by default; they can drop walls and roofs on some cards) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | cap on translated shader loop iterations (can smear hair; unset by default) |
 
@@ -55,7 +59,7 @@ None of these has been measured on the reference machine in this build. Try them
 | `VICTORY_CLAMP_SCOPED=1` | an indirect clamp waits only on its argument and count buffers |
 | `VICTORY_CLAMP_LIGHT_RESTORE` | light state restore after a clamp; on by default, `=0` turns it off |
 | `VICTORY_BARRIER_MERGE=1` | barriers on all resources only where unordered writes are pending; one call's barriers merged |
-| `VICTORY_SYNC_PRECISE=1` | a submission waits only for the submissions it depends on |
+| `VICTORY_MEM2_GPU_ONLY_NOSNAP=1`, `VICTORY_MEM2_GPU_ONLY_NOVIEW=1`, `VICTORY_MEM2_PAGE_REHASH=1` | the second round of memory work (`runtime/victory/crates/victory-core/src/mem2.rs`): off by default and left off by `play-victory.ps1`, like the pipeline-cache fix branch (`fx-msfix`) |
 | `VICTORY_BARRIER_HAZARD=1` | hold waits for earlier shader work until a direct dispatch conflicts with them |
 | `VICTORY_BARRIER_LITERAL=1` | read barrier groups exactly as D3D12 lays them out |
 | `VICTORY_FENCE_PRECISE=1` | a blocking fence wait waits only for that fence's own signal |
@@ -93,4 +97,4 @@ Offline path: the runtime journals every pipeline the title creates; `xcl pipeli
 | Patch | Base |
 |---|---|
 | `xcl-stack.patch` | upstream XCL `main` |
-| `victory-stack.patch` | fxceless/victory-fork `main` at `4e17478`; the diff of `fx-harvest` (`38e8e7c`) against it, as `git diff 4e17478 fx-harvest` |
+| `victory-stack.patch` | fxceless/victory-fork `main` at `4e17478`; the diff of `fx-final` (`26f8afd`) against it, as `git diff 4e17478 fx-final` |

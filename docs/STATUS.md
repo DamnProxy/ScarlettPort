@@ -4,7 +4,8 @@ Measured on: Windows 10 22H2, RTX 3060 12 GB, 32 GB RAM. Series S profile (`--co
 
 ## Summary
 
-- The VIctory-based runtime reaches the **lit world** at about **3-4 fps**.
+- The VIctory-based runtime boots, gets through the menus, saves and legal screens, reaches the **lit world** and starts gameplay at about **4 fps** in the prologue (2.6 before).
+- A **frozen tile-grid overlay** covers gameplay (under investigation).
 - **Shadowed areas are too dark.**
 - The **intro cutscene is very slow** unless it is skipped.
 - **Not yet verified playable.**
@@ -18,19 +19,20 @@ Measured on: Windows 10 22H2, RTX 3060 12 GB, 32 GB RAM. Series S profile (`--co
 
 ## What does not
 - Shadowed areas are too dark: the title's ray-traced bounce light and shadows do not run yet (`runtime/victory/docs/fork-ray-tracing.md` describes the work so far).
-- About 3-4 fps in the world; the intro cutscene is very slow unless skipped.
+- About 4 fps in the prologue. The main costs are per-frame GPU readback waits (about 150 ms) and streaming remap storms; fixes are being tested. The intro cutscene is very slow unless skipped.
+- A frozen tile-grid overlay over gameplay.
 - Some HUD text is cut off in captures.
 - Some cards lose the first room's walls and roof with certain switches (`runtime/victory/VICKY.md`).
 - Memory use is high (the base reports around 24 GB in use during play).
 - XCL: the final image is black; first-run shader compiles stall the world; two-pass mesh draws (`XCL_TWO_PASS_INDIRECT=1`) can reset the GPU.
 
 ## Notes on measurement
-- The 3-4 fps figure was taken with `VICTORY_OWN_UPSCALER=1`. The vendored source reads that switch.
+- The 4 fps figure was taken with `VICTORY_OWN_UPSCALER=1`, `VICTORY_RELAY=2`, `VICTORY_SYNC_PRECISE=1`, `VICTORY_READ_SETTLE_PRECISE=1`, `VICTORY_PRECOMPILED_GRAPHICS=1` and `VICTORY_PIPELINE_WAIT_MS=0` (what `play-victory.ps1` sets), with the experimental msfix and mem2 switches off.
 - Other numbers (shader coverage, per-feature timings) are in `runtime/victory/README.md` and `runtime/victory/VICKY.md`; they were measured by their authors on their own machines, not on the reference machine above.
 
 ## Shader coverage
 - XCL translates the title's whole shader pack to HLSL (26,084 programs); DXC compiles them in the background.
-- For the VIctory-based runtime, see the status tables in `runtime/victory/README.md`.
+- VIctory-based runtime: 25,200 of 25,471 graphics pipelines are prebuilt by `victory precompile-graphics`. See the status tables in `runtime/victory/README.md`.
 
 ## Known gaps
 - Ray tracing: structure builder and trace programs are partly translated and off by default.

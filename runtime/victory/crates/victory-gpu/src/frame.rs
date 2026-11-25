@@ -251,11 +251,77 @@ fn issued(token: u64) {
     keep(&ISSUED, (token, counter()));
 }
 
+/// The token of the last frame `PresentX` flipped.
+static LAST_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+/// The token of the frame flipped last (0: none yet).
+pub(crate) fn last_token() -> u64 {
+    LAST_TOKEN.load(Ordering::Relaxed)
+}
+
+/// The title's frame interval now.
+pub(crate) fn interval() -> Duration {
+    clock().as_ref().map_or(SIXTIETH, |c| c.interval)
+}
+
+/// Performance counter ticks per second.
+fn frequency() -> i64 {
+    #[cfg(windows)]
+    {
+        static F: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            let mut f = 0;
+            // SAFETY: a valid out pointer.
+            unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut f) };
+            f.max(1)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        1_000_000_000
+    }
+}
+
+/// `VICTORY_PACE_FEEDBACK`: the frame of `token` reached the display at
+/// performance counter `qpc` (the swap chain's statistics). What the title
+/// is told about the frame becomes that time, and the frame clock moves a
+/// step toward it, so the title's ticks fall where frames are shown instead
+/// of drifting against the display.
+pub(crate) fn displayed(token: u64, qpc: i64) {
+    if token == 0 || qpc <= 0 {
+        return;
+    }
+    {
+        let mut q = FLIPPED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = q.iter_mut().rev().find(|e| e.0 == token) {
+            e.2 = e.2.max(qpc);
+        }
+    }
+    let now = counter();
+    if qpc > now {
+        return;
+    }
+    let ago = Duration::from_nanos(((now - qpc) as u128 * 1_000_000_000 / frequency() as u128) as u64);
+    let Some(at) = Instant::now().checked_sub(ago) else { return };
+    if let Some(c) = clock().as_mut()
+        && let Some(elapsed) = at.checked_duration_since(c.start)
+    {
+        let nudge = victory_core::pace::phase_nudge(elapsed.as_nanos() as u64, c.interval.as_nanos() as u64);
+        // Ticks are start + n * interval: a later start moves them later.
+        if nudge >= 0 {
+            c.start += Duration::from_nanos(nudge as u64);
+        } else if let Some(s) = c.start.checked_sub(Duration::from_nanos(nudge.unsigned_abs())) {
+            c.start = s;
+        }
+    }
+}
+
 /// `PresentX` flipped the frame of `token` (0: a present without a frame).
 pub(crate) fn flipped(token: u64) {
     if token == 0 {
         return;
     }
+    LAST_TOKEN.store(token, Ordering::Relaxed);
     let origin = ISSUED
         .lock()
         .unwrap_or_else(|e| e.into_inner())

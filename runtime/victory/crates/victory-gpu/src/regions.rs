@@ -82,7 +82,23 @@ pub(crate) fn all_mapped(at: usize, len: usize) -> Option<bool> {
     if m.is_empty() {
         return None;
     }
-    m.all_mapped(at, len)
+    let all = m.all_mapped(at, len);
+    // Holes shown through the translation table
+    // (`VICTORY_MEM2_GPU_ONLY_NOVIEW`) count as mapped: they show bytes,
+    // read through the table or in place once made views. (The table is
+    // never asked with the record's lock held: its fault handler takes the
+    // record's lock with the table's held.)
+    let runs = (all == Some(false)).then(|| m.runs(at, len, false));
+    drop(m);
+    if let Some(runs) = runs
+        && crate::translate::any(at, len)
+    {
+        if runs.iter().any(|r| r.kind == Kind::Hole && crate::translate::bytes_in(r.start, r.len()) != r.len()) {
+            return Some(false);
+        }
+        return (!runs.iter().any(|r| r.kind == Kind::Unknown)).then_some(true);
+    }
+    all
 }
 
 /// How many bytes of `[at, at + len)` are mapped, if the record knows all
@@ -95,11 +111,14 @@ pub(crate) fn mapped_bytes(at: usize, len: usize) -> Option<u64> {
     if m.is_empty() {
         return None;
     }
+    let runs = m.runs(at, len, false);
+    drop(m);
     let mut bytes = 0u64;
-    for run in m.runs(at, len, false) {
+    for run in runs {
         match run.kind {
             Kind::Mapped => bytes += run.len() as u64,
-            Kind::Hole => {}
+            // Shown through the translation table: there.
+            Kind::Hole => bytes += crate::translate::bytes_in(run.start, run.len()) as u64,
             Kind::Unknown => return None,
         }
     }
@@ -177,6 +196,26 @@ pub(crate) fn copy(dst: *mut u8, src: *const u8, len: usize, os: impl Fn(*mut u8
                     // destination is the caller's host memory of `len` bytes.
                     unsafe { std::ptr::copy_nonoverlapping(run.start as *const u8, at(run.start), n) };
                     add(S::MappedBytes, n as u64);
+                }
+                Kind::Hole if crate::translate::any(run.start, n) => {
+                    // Pages shown through the translation table
+                    // (`VICTORY_MEM2_GPU_ONLY_NOVIEW`): their bytes; the
+                    // rest of the hole as below, piece by piece.
+                    crate::translate::read(run.start, at(run.start), n, |a, d, k| {
+                        add(S::Probes, 1);
+                        let mut byte = [0u8];
+                        if crate::host::read_into(a as *const u8, &mut byte) {
+                            add(S::Stale, 1);
+                            os(d, a as *const u8, k);
+                            add(S::OsBytes, k as u64);
+                        } else {
+                            // SAFETY: inside the caller's host destination.
+                            unsafe { d.write_bytes(0, k) };
+                            add(S::HoleBytes, k as u64);
+                        }
+                        true
+                    });
+                    add(S::MappedBytes, crate::translate::bytes_in(run.start, n) as u64);
                 }
                 Kind::Hole => {
                     // One look through the kernel at the hole's first byte:

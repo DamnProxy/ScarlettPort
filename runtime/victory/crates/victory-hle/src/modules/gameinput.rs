@@ -54,6 +54,10 @@ const DEVICES: usize = PADS + 2;
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
+/// `VICTORY_PACE_INPUT=1`: a title read finding the host's input older than
+/// this samples it again first, so a frame starts from input as fresh as
+/// possible instead of up to [`POLL`] old.
+const LATE_SAMPLE_NS: u64 = 1_000_000;
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
@@ -416,12 +420,33 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
+        let events = self.sample();
+        self.deliver(events);
+    }
+
+    /// Reads the host once on the title's thread, just before it reads
+    /// (`VICTORY_PACE_INPUT`). No callback runs here: connection events wait
+    /// for the polling thread to deliver them.
+    fn poll_late(&self) {
+        let events = self.sample();
+        if !events.is_empty() {
+            let mut state = self.state();
+            let mut events = events;
+            events.append(&mut state.pending);
+            state.pending = events;
+        }
+    }
+
+    /// Reads the host and records it; the callbacks due.
+    fn sample(&self) -> Vec<Event> {
+        let at = victory_core::pace::now_ns();
         let (pads, keys, buttons) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys(), source.mouse_buttons())
         };
-        let events = {
+        victory_core::pace::input_sampled(at);
+        {
             let mut state = self.state();
             let events = state.poll(&self.devices, pads, keys, &buttons, &self.counts);
             if let Some(c) = &mut state.controls
@@ -430,8 +455,7 @@ impl Hub {
                 cursor::release("Alt key");
             }
             events
-        };
-        self.deliver(events);
+        }
     }
 
     /// Runs callbacks, never under our lock: they call back into us. One
@@ -924,6 +948,11 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
+    if victory_core::pace::switches().input
+        && victory_core::pace::now_ns().saturating_sub(victory_core::pace::last_sampled()) >= LATE_SAMPLE_NS
+    {
+        hub.poll_late();
+    }
     let mut state = hub.state();
     if kind & GAMEPAD_KIND != 0 {
         state.title_read(&hub.devices, &hub.counts);
@@ -953,6 +982,9 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
+    if found.is_some() {
+        victory_core::pace::input_read();
+    }
     hand(out, found)
 }
 
