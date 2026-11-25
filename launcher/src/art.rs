@@ -1,52 +1,65 @@
-//! Original generated artwork for the header card: a dusk gradient, a low sun and a perspective grid.
-use eframe::egui::{Color32, ColorImage};
+//! Header artwork. The picture comes from the user's own game folder at run time (the
+//! package's splash screen, else its largest logo); the launcher ships no artwork of any title.
+//! Without a folder or a picture, a plain dark gradient is used.
+use eframe::egui::ColorImage;
+use std::path::{Path, PathBuf};
 
-fn lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    let t = t.clamp(0., 1.);
-    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+/// The picture to use from a game folder: `xbs_splash.png`, else the largest `xbs_logo_*.png`.
+pub fn pick(game: &Path) -> Option<PathBuf> {
+    let splash = game.join("xbs_splash.png");
+    if splash.is_file() {
+        return Some(splash);
+    }
+    std::fs::read_dir(game)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            n.starts_with("xbs_logo_") && n.ends_with(".png")
+        })
+        .filter_map(|e| Some((e.metadata().ok()?.len(), e.path())))
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, p)| p)
 }
 
-pub fn header() -> ColorImage {
-    let (w, h) = (960usize, 540usize);
-    let horizon = h as f32 * 0.62;
-    let top = [18., 10., 40.];
-    let mid = [96., 24., 90.];
-    let low = [255., 96., 84.];
-    let ground = [14., 8., 30.];
-    let (cx, cy, r) = (w as f32 * 0.62, horizon - 34., 118.);
-    let mut pixels = Vec::with_capacity(w * h);
+/// Loads the folder's picture, scaled down to at most 1600 px wide. None when there is none.
+pub fn from_game(game: &Path) -> Option<ColorImage> {
+    let img = image::open(pick(game)?).ok()?;
+    let img = if img.width() > 1600 { img.resize(1600, 1600 * img.height() / img.width().max(1), image::imageops::FilterType::Triangle) } else { img };
+    let rgba = img.to_rgba8();
+    Some(ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
+}
+
+/// A plain dark vertical gradient.
+pub fn fallback() -> ColorImage {
+    let (w, h) = (64usize, 256usize);
+    let mut pixels = Vec::with_capacity(w * h * 4);
     for y in 0..h {
-        for x in 0..w {
-            let (fx, fy) = (x as f32, y as f32);
-            let mut c = if fy < horizon {
-                let t = fy / horizon;
-                if t < 0.6 { lerp(top, mid, t / 0.6) } else { lerp(mid, low, (t - 0.6) / 0.4) }
-            } else {
-                ground
-            };
-            // Sun disc with horizontal cut lines.
-            let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
-            if d < r && fy < horizon {
-                let t = (fy - (cy - r)) / (2. * r);
-                let band = ((fy - cy) / 9.).sin();
-                if !(t > 0.55 && band > 0.35) {
-                    c = lerp([255., 214., 120.], [255., 70., 110.], t);
-                }
-            } else if d < r + 26. && fy < horizon {
-                c = lerp(c, [255., 120., 100.], 0.18 * (1. - (d - r) / 26.));
-            }
-            // Perspective grid on the ground.
-            if fy >= horizon {
-                let depth = (fy - horizon) / (h as f32 - horizon) + 0.001;
-                let z = 1. / depth;
-                let line_z = ((z * 2.2).fract() < 0.06 / depth.max(0.15)) as u8 as f32;
-                let lx = (fx - w as f32 / 2.) / (w as f32 / 2.) * z * 0.6;
-                let line_x = ((lx * 6.).fract().abs() < 0.04 * z.min(8.)) as u8 as f32;
-                let g = ((line_z.max(line_x)) * (0.55 * depth.sqrt() + 0.1)).clamp(0., 1.);
-                c = lerp(c, [90., 200., 255.], g * 0.5);
-            }
-            pixels.push(Color32::from_rgb(c[0] as u8, c[1] as u8, c[2] as u8));
+        let t = y as f32 / (h - 1) as f32;
+        let c = |a: f32, b: f32| (a + (b - a) * t) as u8;
+        for _ in 0..w {
+            pixels.extend_from_slice(&[c(34., 12.), c(28., 10.), c(48., 18.), 255]);
         }
     }
-    ColorImage { size: [w, h], pixels }
+    ColorImage::from_rgba_unmultiplied([w, h], &pixels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_splash_then_largest_logo() {
+        let d = std::env::temp_dir().join(format!("sp-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(pick(&d), None);
+        std::fs::write(d.join("xbs_logo_44.png"), [0u8; 10]).unwrap();
+        std::fs::write(d.join("xbs_logo_150.png"), [0u8; 50]).unwrap();
+        assert_eq!(pick(&d), Some(d.join("xbs_logo_150.png")));
+        std::fs::write(d.join("xbs_splash.png"), [0u8; 5]).unwrap();
+        assert_eq!(pick(&d), Some(d.join("xbs_splash.png")));
+        assert!(from_game(&d).is_none()); // not a real PNG
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

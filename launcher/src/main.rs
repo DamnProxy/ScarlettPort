@@ -4,10 +4,12 @@
 
 mod art;
 mod display;
+mod engine;
 mod flow;
 mod game;
 mod runtime;
 mod saves;
+mod shaderbuild;
 mod theme;
 mod view;
 
@@ -30,7 +32,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPO_URL: &str = "https://github.com/ZigZagBoi1/ScarlettPort";
 pub const PAYPAL_URL: &str = "https://www.paypal.me/SalwanStudios";
 pub const KOFI_URL: &str = "https://ko-fi.com/ziggymar";
-pub const PLAYABLE_PERCENT: f32 = 25.;
+pub const PLAYABLE_PERCENT: f32 = 50.;
 const MAX_LOG: usize = 3000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,7 +59,7 @@ pub enum LogKind {
     Error,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     #[serde(default)]
     pub game_path: String,
@@ -75,6 +77,64 @@ pub struct Config {
     /// Window mode, resolution, frame rate cap, vsync and monitor (passed to the runtime).
     #[serde(default)]
     pub display: display::DisplayCfg,
+    /// "classic" (XCL) or "world" (the 3D-world engine).
+    #[serde(default = "default_engine")]
+    pub engine: String,
+    /// World engine: Series S console profile instead of Series X.
+    #[serde(default)]
+    pub console_s: bool,
+    #[serde(default)]
+    pub raytracing: bool,
+    #[serde(default = "yes")]
+    pub fallback_light: bool,
+    #[serde(default)]
+    pub debug_view: bool,
+    /// World engine bundle hash the shaders were built for.
+    #[serde(default)]
+    pub world_shaders_hash: String,
+    /// Set once the engine default moved to World (older settings files said Classic by default).
+    #[serde(default)]
+    pub engine_v2: bool,
+    /// Shader build: stop a step that shows no progress for `slow_secs` and leave its shaders
+    /// to compile on demand in game.
+    #[serde(default = "yes")]
+    pub skip_slow: bool,
+    #[serde(default = "default_slow_secs")]
+    pub slow_secs: u64,
+}
+
+fn default_engine() -> String {
+    engine::WORLD.to_string()
+}
+
+fn default_slow_secs() -> u64 {
+    60
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            game_path: String::new(),
+            auto_menu: false,
+            cache_dir: String::new(),
+            shaders_hash: String::new(),
+            world_len: 0,
+            display: display::DisplayCfg::default(),
+            engine: default_engine(),
+            console_s: true,
+            raytracing: false,
+            fallback_light: true,
+            debug_view: false,
+            world_shaders_hash: String::new(),
+            engine_v2: true,
+            skip_slow: true,
+            slow_secs: default_slow_secs(),
+        }
+    }
 }
 
 pub enum Message {
@@ -84,7 +144,11 @@ pub enum Message {
     Pipelines(u32),
     World { done: u64, left: u64 },
     Ended(RunKind, Option<i32>),
-    RuntimeReady(Result<PathBuf, String>),
+    /// The engines found beside the launcher.
+    RuntimeReady(Result<runtime::Found, String>),
+    /// Shader build progress and its end (a summary, or why it did not finish).
+    Build(shaderbuild::Progress),
+    BuildEnded(Result<String, String>),
     Picked(Option<PathBuf>),
 }
 
@@ -95,6 +159,17 @@ pub struct Launcher {
     pub config: Config,
     pub runtime_dir: Option<PathBuf>,
     pub runtime_note: String,
+    /// Set when victory.exe is in the runtime folder.
+    pub world_dir: Option<PathBuf>,
+    pub world_hash: Option<String>,
+    /// The running (or last) shader build's progress.
+    pub build: Option<shaderbuild::Progress>,
+    /// The header picture from the selected game folder, and the folder it was loaded for.
+    pub header: Option<egui::TextureHandle>,
+    pub header_for: Option<String>,
+    /// Scroll offset of the Settings, Game tab and the height of its content.
+    pub game_scroll: f32,
+    pub game_content: f32,
     pub game_ok: bool,
     pub game_checks: Vec<game::FileCheck>,
     pub runtime_hash: Option<String>,
@@ -164,11 +239,17 @@ impl Launcher {
             let size = [img.width() as usize, img.height() as usize];
             cc.egui_ctx.load_texture("mark", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR)
         };
-        let art = cc.egui_ctx.load_texture("art", art::header(), egui::TextureOptions::LINEAR);
+        let art = cc.egui_ctx.load_texture("art", art::fallback(), egui::TextureOptions::LINEAR);
         let mut config: Config = std::fs::read(config_path())
             .ok()
             .and_then(|v| serde_json::from_slice(&v).ok())
             .unwrap_or_default();
+        if !config.engine_v2 {
+            // The World engine is the default now: its shader build takes minutes, not hours.
+            config.engine = engine::WORLD.to_string();
+            config.console_s = true;
+            config.engine_v2 = true;
+        }
         let fresh_cache = config.cache_dir.trim().is_empty();
         if fresh_cache {
             config.cache_dir = game::default_cache();
@@ -182,7 +263,14 @@ impl Launcher {
             started: Instant::now(),
             config,
             runtime_dir: None,
-            runtime_note: "Unpacking runtime…".into(),
+            runtime_note: "Looking for the engines…".into(),
+            world_dir: None,
+            world_hash: None,
+            build: None,
+            header: None,
+            header_for: None,
+            game_scroll: 0.,
+            game_content: 0.,
             game_ok,
             game_checks,
             runtime_hash: None,
@@ -235,7 +323,7 @@ impl Launcher {
     pub fn unpack_runtime(&self) {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Message::RuntimeReady(runtime::ensure()));
+            let _ = tx.send(Message::RuntimeReady(runtime::locate()));
         });
     }
 
@@ -321,10 +409,10 @@ impl Launcher {
         if self.running.is_some() {
             return;
         }
-        let Some(rt) = self.runtime_dir.clone() else {
-            self.status = "The runtime is still unpacking.".into();
+        if !self.engine_ready() {
+            self.status = self.runtime_note.clone();
             return;
-        };
+        }
         if !self.game_ok {
             self.status = format!("Pick a game folder containing {GAME_EXE} first.");
             self.go(Page::Settings);
@@ -332,20 +420,36 @@ impl Launcher {
             return;
         }
         let game = PathBuf::from(&self.config.game_path);
+        let _ = std::fs::create_dir_all(self.config.cache_dir.trim());
+        if kind == RunKind::Precompile {
+            return self.start_build(game);
+        }
         if kind == RunKind::Play {
             self.save_note = self.backup_saves().unwrap_or_default();
             self.play_since = Some(std::time::SystemTime::now());
             self.crash_report = None;
+        }
+        let rt = runtime::runtime_dir();
+        if self.world_selected() {
+            if kind != RunKind::Play {
+                return;
+            }
+            let mut cmd = Command::new(runtime::victory_exe());
+            cmd.current_dir(&rt).args(engine::world_args(&self.config, &game));
+            for (k, v) in engine::world_env(&self.config, &game, &self.config.cache_dir) {
+                cmd.env(k, v);
+            }
+            self.fps = None;
+            self.status = "Running".into();
+            self.log(format!("> victory.exe run \"{}\" --execute", game.join(GAME_EXE).display()), LogKind::Info);
+            return self.spawn(cmd, kind);
         }
         let _ = std::fs::create_dir_all(game::dxil_dir(&self.config.cache_dir));
         let mut cmd = Command::new(runtime::xcl_exe());
         cmd.current_dir(&rt)
             .env("XCL_NO_WATCHDOG", "1")
             .env("XCL_DXC_DIR", &rt)
-            .env("XCL_DXIL_CACHE", game::dxil_dir(&self.config.cache_dir))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+            .env("XCL_DXIL_CACHE", game::dxil_dir(&self.config.cache_dir));
         match kind {
             RunKind::Play => {
                 cmd.env("XCL_DXC_THREADS", "4").env("XCL_PSO_PRELOAD", "0").arg("run").arg(&game);
@@ -360,42 +464,65 @@ impl Launcher {
                 self.status = "Starting…".into();
                 self.log(format!("> xcl.exe run \"{}\"", game.display()), LogKind::Info);
             }
-            RunKind::Precompile => {
-                let pack = game.join("shaders.rpf");
-                if !pack.is_file() {
-                    self.status = "No shaders.rpf in the game folder.".into();
-                    return;
-                }
-                cmd.env("XCL_DXC_THREADS", "8")
-                    .env("XCL_PIPELINE_THREADS", "3")
-                    .arg("shaders")
-                    .arg(&pack)
-                    .args(["--precompile", "--pipelines", "--only", "cs"]);
-                self.shader = None;
-                self.pipelines = None;
-                self.eta.reset();
-                self.eta_secs = None;
-                self.status = "Building shaders…".into();
-                self.log("> xcl.exe shaders shaders.rpf --precompile --pipelines --only cs", LogKind::Info);
-            }
             RunKind::Pipelines => {
                 cmd.arg("pipelines").arg(&game).args(["--threads", "2"]);
                 self.world_progress = None;
                 self.status = "Building world pipelines…".into();
                 self.log(format!("> xcl.exe pipelines \"{}\" --threads 2", game.display()), LogKind::Info);
             }
+            RunKind::Precompile => return,
         }
+        self.spawn(cmd, kind);
+    }
+
+    /// Starts the shader build of the selected engine on its own thread (`shaderbuild`).
+    fn start_build(&mut self, game: PathBuf) {
+        let world = self.world_selected();
+        let hash = if world { self.world_hash.clone() } else { self.runtime_hash.clone() }.unwrap_or_default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let job = shaderbuild::Job {
+            world,
+            exe: if world { runtime::victory_exe() } else { runtime::xcl_exe() },
+            runtime: runtime::runtime_dir(),
+            game,
+            cache_dir: self.config.cache_dir.trim().to_string(),
+            hash,
+            slow_secs: self.config.skip_slow.then_some(self.config.slow_secs.max(10)),
+            stop: stop.clone(),
+            tx: self.tx.clone(),
+        };
+        self.stop = Some(stop);
+        self.running = Some(RunKind::Precompile);
+        self.build = None;
+        self.shader = None;
+        self.pipelines = None;
+        self.status = "Building shaders…".into();
+        std::thread::spawn(move || shaderbuild::build(job));
+    }
+
+    /// True when the selected engine was found beside the launcher.
+    pub fn engine_ready(&self) -> bool {
+        if self.world_selected() { self.world_dir.is_some() } else { self.runtime_dir.is_some() && self.runtime_hash.is_some() }
+    }
+
+    /// True when the World engine is selected and present (else Classic is used).
+    pub fn world_selected(&self) -> bool {
+        (engine::is_world(&self.config) || self.runtime_hash.is_none()) && self.world_dir.is_some()
+    }
+
+    fn spawn(&mut self, mut cmd: Command, kind: RunKind) {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW, plus BELOW_NORMAL_PRIORITY_CLASS for the background builds
+            // CREATE_NO_WINDOW (output goes to the Logs page), plus BELOW_NORMAL_PRIORITY_CLASS for builds
             let low = if kind == RunKind::Play { 0 } else { 0x0000_4000 };
             cmd.creation_flags(0x0800_0000 | low);
         }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                self.status = format!("Could not start the runtime: {e}");
+                self.status = format!("Could not start the engine: {e}");
                 self.log(self.status.clone(), LogKind::Error);
                 return;
             }
@@ -404,14 +531,14 @@ impl Launcher {
         self.stop = Some(stop.clone());
         self.running = Some(kind);
         let tx = self.tx.clone();
-        for (stream, is_err) in [
-            (child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>), false),
-            (child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>), true),
-        ] {
-            if let Some(stream) = stream {
-                let tx = tx.clone();
-                std::thread::spawn(move || read_lines(stream, tx, is_err));
-            }
+        for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>)]
+            .into_iter()
+            .flatten()
+        {
+            let tx = tx.clone();
+            std::thread::spawn(move || split_lines(stream, |l| {
+                let _ = tx.send(Message::Log(l, LogKind::Out));
+            }));
         }
         std::thread::spawn(move || {
             let code = loop {
@@ -434,23 +561,39 @@ impl Launcher {
         self.game_ok && !self.game_checks.is_empty() && game::missing(&self.game_checks).is_empty()
     }
 
+    /// The hash the shaders were built for and the hash of the selected engine.
+    fn shader_hashes(&self) -> (&str, Option<&str>) {
+        if self.world_selected() {
+            (&self.config.world_shaders_hash, self.world_hash.as_deref())
+        } else {
+            (&self.config.shaders_hash, self.runtime_hash.as_deref())
+        }
+    }
+
     pub fn stage(&self) -> flow::Stage {
+        let (built_hash, runtime_hash) = self.shader_hashes();
         flow::stage(&flow::Inputs {
             game_complete: self.game_complete(),
             precompiling: self.running == Some(RunKind::Precompile),
-            built_hash: &self.config.shaders_hash,
-            runtime_hash: self.runtime_hash.as_deref(),
+            built_hash,
+            runtime_hash,
+            inline_shaders: false,
         })
     }
 
     pub fn world(&self) -> flow::World {
+        if self.world_selected() {
+            // World pipelines are a Classic feature; the World engine records its own as it runs.
+            return if self.stage() == flow::Stage::Ready { flow::World::Done } else { flow::World::Waiting };
+        }
         let len = self.journal.and_then(|(_, l)| l);
         flow::world(self.stage(), self.running == Some(RunKind::Pipelines), len, self.config.world_len)
     }
 
-    /// True when shaders were built, but by a different runtime than the one in this launcher.
+    /// True when shaders were built, but by a different engine build than the one beside the launcher.
     pub fn shaders_stale(&self) -> bool {
-        !self.config.shaders_hash.is_empty() && self.runtime_hash.as_deref().is_some_and(|h| h != self.config.shaders_hash)
+        let (built, now) = self.shader_hashes();
+        !built.is_empty() && now.is_some_and(|h| h != built)
     }
 
     pub fn stop_run(&mut self) {
@@ -458,6 +601,16 @@ impl Launcher {
             s.store(true, Ordering::Relaxed);
             self.status = "Stopping…".into();
         }
+    }
+
+    /// Loads the header picture from the game folder when the folder changed (`art::from_game`).
+    fn refresh_header(&mut self, ctx: &egui::Context) {
+        let want = if self.game_ok { Some(self.config.game_path.clone()) } else { None };
+        if self.header_for == want {
+            return;
+        }
+        self.header_for = want.clone();
+        self.header = want.and_then(|g| art::from_game(std::path::Path::new(&g))).map(|img| ctx.load_texture("game-art", img, egui::TextureOptions::LINEAR));
     }
 
     /// `--screenshot=FILE` renders the window to a PNG (the launcher's own framebuffer, so
@@ -516,21 +669,10 @@ impl Launcher {
                     self.running = None;
                     self.stop = None;
                     self.fps = None;
-                    if code == Some(0) {
-                        match kind {
-                            RunKind::Precompile => {
-                                if let Some(h) = &self.runtime_hash {
-                                    self.config.shaders_hash = h.clone();
-                                    self.save();
-                                }
-                            }
-                            RunKind::Pipelines => {
-                                if let Some(l) = game::journal_len(std::path::Path::new(&self.config.game_path)) {
-                                    self.config.world_len = l;
-                                    self.save();
-                                }
-                            }
-                            RunKind::Play => {}
+                    if code == Some(0) && kind == RunKind::Pipelines {
+                        if let Some(l) = game::journal_len(std::path::Path::new(&self.config.game_path)) {
+                            self.config.world_len = l;
+                            self.save();
                         }
                     }
                     if kind == RunKind::Play && code != Some(0) {
@@ -543,26 +685,40 @@ impl Launcher {
                         None => "Stopped.".to_string(),
                     };
                     self.status = if self.crash_report.is_some() { "The game crashed - a report was saved.".to_string() } else { note.clone() };
-                    self.log(
-                        format!(
-                            "{} ended. {note}",
-                            match kind {
-                                RunKind::Play => "Game",
-                                RunKind::Precompile => "Shader build",
-                                RunKind::Pipelines => "World pipeline build",
+                    let what = if kind == RunKind::Play { "Game" } else { "World pipeline build" };
+                    self.log(format!("{what} ended. {note}"), if code == Some(0) { LogKind::Info } else { LogKind::Error });
+                }
+                Message::Build(p) => self.build = Some(p),
+                Message::BuildEnded(r) => {
+                    self.running = None;
+                    self.stop = None;
+                    match r {
+                        Ok(note) => {
+                            if self.world_selected() {
+                                self.config.world_shaders_hash = self.world_hash.clone().unwrap_or_default();
+                            } else {
+                                self.config.shaders_hash = self.runtime_hash.clone().unwrap_or_default();
                             }
-                        ),
-                        if matches!(code, Some(0)) { LogKind::Info } else { LogKind::Error },
-                    );
+                            self.save();
+                            self.log(format!("Shader build ended. {note}"), LogKind::Info);
+                            self.status = note;
+                        }
+                        Err(e) => {
+                            self.log(format!("Shader build ended. {e}"), LogKind::Error);
+                            self.status = e;
+                        }
+                    }
                 }
                 Message::RuntimeReady(r) => match r {
-                    Ok(dir) => {
-                        self.runtime_hash = Some(runtime::bundle_hash().to_string());
-                        self.runtime_dir = Some(dir.clone());
-                        self.runtime_note = dir.display().to_string();
+                    Ok(found) => {
+                        self.runtime_note = found.dir.display().to_string();
+                        self.world_dir = found.world.is_some().then(|| found.dir.clone());
+                        self.world_hash = found.world;
+                        self.runtime_hash = found.classic;
+                        self.runtime_dir = Some(found.dir);
                     }
                     Err(e) => {
-                        self.runtime_note = format!("Could not unpack the runtime: {e}");
+                        self.runtime_note = e;
                         self.log(self.runtime_note.clone(), LogKind::Error);
                     }
                 },
@@ -578,16 +734,16 @@ impl Launcher {
     }
 }
 
-/// Splits a byte stream on \n and \r (progress lines are rewritten in place with \r).
-fn read_lines(mut stream: Box<dyn Read + Send>, tx: Sender<Message>, is_err: bool) {
+/// Splits a byte stream into lines on \n and \r (progress lines are rewritten in place with \r).
+pub fn split_lines(mut stream: Box<dyn Read + Send>, mut each: impl FnMut(String)) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
-    let flush = |buf: &mut Vec<u8>, tx: &Sender<Message>| {
+    let mut flush = |buf: &mut Vec<u8>| {
         if !buf.is_empty() {
             let text = String::from_utf8_lossy(buf).trim_end().to_string();
             buf.clear();
             if !text.trim().is_empty() {
-                let _ = tx.send(Message::Log(text, if is_err { LogKind::Out } else { LogKind::Out }));
+                each(text);
             }
         }
     };
@@ -597,13 +753,13 @@ fn read_lines(mut stream: Box<dyn Read + Send>, tx: Sender<Message>, is_err: boo
         }
         for &b in &chunk[..n] {
             if b == b'\n' || b == b'\r' {
-                flush(&mut buf, &tx);
+                flush(&mut buf);
             } else {
                 buf.push(b);
             }
         }
     }
-    flush(&mut buf, &tx);
+    flush(&mut buf);
 }
 
 /// Pulls progress out of runtime output: `  2600/26503 (718 s)`, `pipelines: 75 made`,
@@ -622,14 +778,8 @@ fn parse_line(line: &str, tx: &Sender<Message>) {
             let _ = tx.send(Message::Pipelines(n));
         }
     }
-    if t.contains("frames presented") || t.contains("fps") {
-        if let Some(i) = t.find("fps") {
-            let before = t[..i].trim_end();
-            let num = before.rsplit(|c: char| !(c.is_ascii_digit() || c == '.')).next().unwrap_or("");
-            if let Ok(f) = num.parse::<f32>() {
-                let _ = tx.send(Message::Fps(f));
-            }
-        }
+    if let Some(f) = engine::parse_fps(t) {
+        let _ = tx.send(Message::Fps(f));
     }
 }
 
@@ -640,6 +790,7 @@ impl eframe::App for Launcher {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump(ctx);
+        self.refresh_header(ctx);
         self.draw(ctx);
         self.screenshot(ctx);
     }

@@ -40,6 +40,35 @@ fn cover(ui: &mut Ui, tex: &egui::TextureHandle, rect: Rect, radius: u8, tint: C
 }
 
 impl Launcher {
+    /// What the shader build is doing now: phase, count, the current item and how long it has
+    /// taken, so a long compile never looks frozen.
+    pub(crate) fn build_line(&self) -> String {
+        let Some(b) = &self.build else { return self.status.clone() };
+        let count = if b.total > 0 { format!("  ·  {} of {}", b.done, b.total) } else { String::new() };
+        let quiet = b.last_output.elapsed().as_secs();
+        let note = if quiet >= 20 { format!("  ·  no output for {quiet} s (large shaders take minutes; still working)") } else { String::new() };
+        format!(
+            "Phase {}/{}: {}{count}  ·  now: {} ({} s)  ·  {} total{note}",
+            b.phase,
+            b.phases,
+            b.name,
+            b.current,
+            b.current_since.elapsed().as_secs(),
+            flow::duration(b.started.elapsed().as_secs())
+        )
+    }
+
+    /// How long a first shader build takes with the selected engine (measured on a 12-thread CPU).
+    pub(crate) fn build_estimate(&self) -> String {
+        if self.world_selected() {
+            if crate::engine::PRECOMPILED_GRAPHICS { "about 12 min".into() } else { "about 3 min".into() }
+        } else if self.config.skip_slow {
+            "about 30 min".into()
+        } else {
+            "45 min to several hours".into()
+        }
+    }
+
     fn animating(&self) -> bool {
         self.running.is_some()
     }
@@ -171,24 +200,23 @@ impl Launcher {
             self.settings_tab = 0;
             self.go(Page::Settings);
         }
-        let (status, color) = if self.runtime_dir.is_some() { ("Ready", Some(SUCCESS)) } else { ("Unpacking…", None) };
-        let note = self.runtime_note.clone();
-        if section_row(ui, row(52.), "row-runtime", Icon::Server, "XCL runtime", &note, Status { text: status, color }, true) {
+        let world_sel = self.world_selected();
+        let ready = if world_sel { self.world_dir.is_some() } else { self.runtime_dir.is_some() };
+        let (status, color) = if ready { ("Ready", Some(SUCCESS)) } else { ("Not found", Some(WARNING)) };
+        let note = format!("{} engine  ·  {}", if world_sel { "World" } else { "Classic" }, self.runtime_note);
+        if section_row(ui, row(52.), "row-runtime", Icon::Server, "Engine", &note, Status { text: status, color }, true) {
             self.settings_tab = 3;
             self.go(Page::Settings);
         }
         let stage = self.stage();
         let (meta, status, color) = match stage {
-            Stage::BuildingShaders => match self.shader {
-                Some((d, t, s)) => {
-                    let eta = self.eta_secs.map(|e| format!("  ·  about {} left", flow::duration(e))).unwrap_or_default();
-                    (format!("{d} of {t} shaders  ·  {s} s elapsed{eta}"), format!("{}%", d * 100 / t.max(1)), None)
-                }
+            Stage::BuildingShaders => match &self.build {
+                Some(b) => (self.build_line(), format!("{:.0}%", b.overall * 100.), None),
                 None => ("Starting the shader build…".to_string(), "Building".to_string(), None),
             },
             Stage::Ready => ("Built for this runtime".to_string(), "Ready".to_string(), Some(SUCCESS)),
             Stage::ShadersNotBuilt if self.shaders_stale() => ("The runtime changed since the shaders were built. Rebuild them (resumes where it stopped).".to_string(), "Stale".to_string(), Some(WARNING)),
-            Stage::ShadersNotBuilt => ("Build the shader cache once (about 45 min, resumable)".to_string(), "Not built".to_string(), Some(WARNING)),
+            Stage::ShadersNotBuilt => (format!("Build the shader cache once ({}, resumable)", self.build_estimate()), "Not built".to_string(), Some(WARNING)),
             Stage::GameNotSet => ("Needs the game folder first".to_string(), "Waiting".to_string(), None),
         };
         if section_row(ui, row(52.), "row-shaders", Icon::Download, "Shaders", &meta, Status { text: &status, color }, true) {
@@ -213,11 +241,12 @@ impl Launcher {
             self.start(RunKind::Pipelines);
         }
         let prog = row(52.);
-        section_row(ui, prog, "row-progress", Icon::Info, "Progress to playable", "Menus, loading and world streaming work. World rendering is next.", Status { text: &format!("{PLAYABLE_PERCENT:.0}%"), color: None }, false);
+        section_row(ui, prog, "row-progress", Icon::Info, "Progress to playable", "World engine: lit world, gameplay starts at about 4 fps. Speed is next.", Status { text: &format!("{PLAYABLE_PERCENT:.0}%"), color: None }, false);
         let track = Rect::from_min_max(pos2(prog.min.x + 14., prog.max.y - 5.), pos2(prog.max.x - 14., prog.max.y - 3.));
         progress(&ui.painter().clone(), track, Some(PLAYABLE_PERCENT / 100.), time);
         let (status, color) = match self.fps {
             Some(f) => (format!("{f:.1} fps"), Some(SUCCESS)),
+            None if self.running == Some(RunKind::Play) => ("running".to_string(), Some(SUCCESS)),
             None => ("Not running".to_string(), None),
         };
         if section_row(ui, row(52.), "row-fps", Icon::History, "Frame rate", "Read live from the game log", Status { text: &status, color }, true) {
@@ -229,15 +258,17 @@ impl Launcher {
         let p = ui.painter().clone();
         let hover = ui.ctx().animate_bool_with_time(ui.id().with("hdr-hover"), ui.rect_contains_pointer(rect), 0.5);
         // Cover-crop the art into the wide card; zoom 3% on hover.
-        let [iw, ih] = self.art.size();
+        let art = self.header.clone().unwrap_or_else(|| self.art.clone());
+        let [iw, ih] = art.size();
         let img_aspect = iw as f32 / ih as f32;
         let aspect = rect.width() / rect.height();
         let zoom = 1. + 0.03 * ease(hover);
         let (uw, uh) = if aspect > img_aspect { (1. / zoom, img_aspect / aspect / zoom) } else { (aspect / img_aspect / zoom, 1. / zoom) };
         let (cx, cy) = (0.5, 0.55);
         let uv = Rect::from_min_max(pos2(cx - uw / 2., (cy - uh / 2.).max(0.)), pos2(cx + uw / 2., (cy - uh / 2.).max(0.) + uh));
-        egui::Image::new((self.art.id(), rect.size())).uv(uv).corner_radius(RADIUS_LG).paint_at(ui, rect);
-        vertical_fill(&p, rect, RADIUS_LG as f32, |v| Color32::from_black_alpha((((v - 0.15) / 0.85).clamp(0., 1.).powf(1.3) * 215.) as u8));
+        egui::Image::new((art.id(), rect.size())).uv(uv).corner_radius(RADIUS_LG).paint_at(ui, rect);
+        // A light scrim over the whole picture, darker towards the text at the bottom.
+        vertical_fill(&p, rect, RADIUS_LG as f32, |v| Color32::from_black_alpha((60. + ((v - 0.1) / 0.9).clamp(0., 1.).powf(1.2) * 175.) as u8));
         p.rect_stroke(rect, RADIUS_LG, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
 
         let label = if self.game_ok { "CHANGE GAME FOLDER" } else { "SELECT GAME FOLDER" };
@@ -248,25 +279,19 @@ impl Launcher {
         let x = rect.min.x + 26.;
         let bottom = rect.max.y - 24.;
         let white = |a: f32| fade(Color32::WHITE, a);
-        spaced(&p, pos2(x, bottom - 70.), Align2::LEFT_BOTTOM, "XCL RUNTIME  ·  WINDOWS  ·  EARLY PREVIEW", font(11., "bold"), white(0.75), 1.2);
+        spaced(&p, pos2(x, bottom - 70.), Align2::LEFT_BOTTOM, if self.world_selected() { "WORLD ENGINE  ·  WINDOWS  ·  EARLY PREVIEW" } else { "CLASSIC ENGINE  ·  WINDOWS  ·  EARLY PREVIEW" }, font(11., "bold"), white(0.75), 1.2);
         p.text(pos2(x, bottom - 30.), Align2::LEFT_BOTTOM, "ScarlettPort", font(30., "black"), Color32::WHITE);
 
         let running = self.running;
         let stage = self.stage();
         let (fraction, mut meta_color): (Option<Option<f32>>, Color32) = match running {
-            Some(RunKind::Precompile) => (Some(self.shader.map(|(d, t, _)| d as f32 / t.max(1) as f32)), white(0.75)),
+            Some(RunKind::Precompile) => (Some(self.build.as_ref().map(|b| b.overall)), white(0.75)),
             Some(RunKind::Pipelines) => (Some(self.world_progress.map(|(d, l)| d as f32 / (d + l).max(1) as f32)), white(0.75)),
             Some(RunKind::Play) => (Some(None), white(0.75)),
             None => (None, white(0.75)),
         };
         let meta = if running == Some(RunKind::Precompile) {
-            match self.shader {
-                Some((d, t, secs)) => {
-                    let eta = self.eta_secs.map(|e| format!("  ·  about {} left", flow::duration(e))).unwrap_or_default();
-                    format!("Building shaders {d}/{t}  ·  {} elapsed{eta}", flow::duration(secs))
-                }
-                None => self.status.clone(),
-            }
+            if self.build.is_some() { self.build_line() } else { self.status.clone() }
         } else if running.is_some() && !self.status.is_empty() {
             self.status.clone()
         } else if !self.game_ok {
@@ -277,11 +302,11 @@ impl Launcher {
             format!("Game folder incomplete  ·  missing {}", game::missing(&self.game_checks).join(", "))
         } else if stage == Stage::ShadersNotBuilt {
             meta_color = WARNING;
-            if self.shaders_stale() { "Runtime updated  ·  rebuild the shaders before playing".to_string() } else { "Step 2: build the shaders once (about 45 min)  ·  then press Play".to_string() }
+            if self.shaders_stale() { "Runtime updated  ·  rebuild the shaders before playing".to_string() } else { format!("Step 2: build the shaders once ({})  ·  then press Play", self.build_estimate()) }
         } else if !self.status.is_empty() {
             self.status.clone()
         } else {
-            format!("{}  ·  XCL runtime {}", self.config.game_path, if self.runtime_dir.is_some() { "ready" } else { "unpacking" })
+            format!("{}  ·  {} engine {}", self.config.game_path, if self.world_selected() { "World" } else { "Classic" }, if self.engine_ready() { "ready" } else { "unpacking" })
         };
         let shown = fit(ui, &meta, font(13., "regular"), rect.width() - 250.);
         p.text(pos2(x, bottom), Align2::LEFT_BOTTOM, &shown, font(13., "regular"), meta_color);
@@ -299,7 +324,7 @@ impl Launcher {
             };
             let enabled = match stage {
                 Stage::GameNotSet => !self.folder_busy,
-                _ => self.runtime_dir.is_some(),
+                _ => self.engine_ready(),
             };
             let icon = if stage == Stage::Ready { Icon::Play } else if stage == Stage::GameNotSet { Icon::Folder } else { Icon::Download };
             if button_font(ui, button_rect, "hdr-play", text, Kind::Primary, enabled, Some(icon), kind_font, tracking) {
@@ -310,7 +335,7 @@ impl Launcher {
                     Stage::BuildingShaders => {}
                 }
             }
-            if stage != Stage::Ready && self.game_ok && self.runtime_dir.is_some() && link(ui, pos2(button_rect.center().x - 28., button_rect.max.y + 12.), Align2::LEFT_CENTER, "hdr-anyway", "play anyway") {
+            if stage != Stage::Ready && self.game_ok && self.engine_ready() && link(ui, pos2(button_rect.center().x - 28., button_rect.max.y + 12.), Align2::LEFT_CENTER, "hdr-anyway", "play anyway") {
                 self.start(RunKind::Play);
             }
         }
@@ -395,34 +420,38 @@ impl Launcher {
     fn setup_page(&mut self, ui: &mut Ui, area: Rect, time: f32) {
         let p = ui.painter().clone();
         let top = 72.;
-        caption(&p, pos2(area.min.x, top), Align2::LEFT_TOP, "Shader precompile");
-        let text = "Builds the compute-shader and pipeline cache for your game once, so play sessions start smoothly. It takes about 45 minutes and resumes where it stopped if you close it.";
+        caption(&p, pos2(area.min.x, top), Align2::LEFT_TOP, "Shader build");
+        let text = if self.world_selected() {
+            "Translates every shader of your game into the cache once (World engine: about 3 minutes on 12 threads), so play sessions do not stop to translate. It resumes where it stopped if you close it. A runtime update that changes the shader translator translates everything again."
+        } else {
+            "Builds the Classic engine's shader and pipeline cache once. Most shaders finish in minutes; the last ~4,000 (from about 83%) are huge world shaders that take the graphics driver 6 to 190 s each. With \"skip slow shaders\" (Settings, Options) those compile in game instead. It resumes where it stopped."
+        };
         let g = p.layout(text.into(), font(13., "regular"), TEXT_MUTED, area.width().min(720.));
         let gh = g.size().y;
         p.galley(pos2(area.min.x, top + 22.), g, TEXT_MUTED);
 
         let fy = top + 22. + gh + 22.;
-        let (done, total, secs) = self.shader.unwrap_or((0, 0, 0));
+        let b = self.build.clone();
         let facts = [
-            ("Shaders done", if total > 0 { format!("{done} / {total}") } else { "-".into() }),
-            ("Elapsed", if total > 0 { format!("{} min {} s", secs / 60, secs % 60) } else { "-".into() }),
-            ("Pipelines made", self.pipelines.map(|n| n.to_string()).unwrap_or_else(|| "-".into())),
-            ("Progress", if total > 0 { format!("{}%", done * 100 / total.max(1)) } else { "-".into() }),
+            ("Phase", b.as_ref().map(|b| format!("{} of {}  ·  {}", b.phase, b.phases, b.name)).unwrap_or_else(|| "-".into())),
+            ("Done", b.as_ref().filter(|b| b.total > 0).map(|b| format!("{} / {}", b.done, b.total)).unwrap_or_else(|| "-".into())),
+            ("Elapsed", b.as_ref().map(|b| flow::duration(b.started.elapsed().as_secs())).unwrap_or_else(|| "-".into())),
+            ("Parallel jobs", b.as_ref().map(|b| b.jobs.to_string()).unwrap_or_else(|| "-".into())),
         ];
+        let (done, total) = b.as_ref().map(|b| ((b.overall * 1000.) as u64, 1000)).unwrap_or((0, 0));
         let cw = (area.width() - 30.) / 4.;
         for (i, (k, v)) in facts.iter().enumerate() {
             let r = Rect::from_min_size(pos2(area.min.x + i as f32 * (cw + 10.), fy), vec2(cw, 58.));
             p.rect_filled(r, RADIUS_MD, BG_100);
             p.rect_stroke(r, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
             caption(&p, pos2(r.min.x + 14., r.min.y + 12.), Align2::LEFT_TOP, k);
-            p.text(pos2(r.min.x + 14., r.min.y + 30.), Align2::LEFT_TOP, v, font(16., "bold"), TEXT);
+            p.text(pos2(r.min.x + 14., r.min.y + 30.), Align2::LEFT_TOP, fit(ui, v, font(16., "bold"), cw - 28.), font(16., "bold"), TEXT);
         }
         let py = fy + 80.;
         let precompiling = self.running == Some(RunKind::Precompile);
-        let frac = if precompiling { Some(self.shader.map(|(d, t, _)| d as f32 / t.max(1) as f32)).unwrap_or(None) } else { Some(if total > 0 { done as f32 / total as f32 } else { 0. }) };
-        let frac = if precompiling && self.shader.is_none() { None } else { frac };
+        let frac = if precompiling && b.is_none() { None } else { Some(if total > 0 { done as f32 / total as f32 } else { 0. }) };
         progress(&p, Rect::from_min_size(pos2(area.min.x, py), vec2(area.width(), 6.)), frac, time);
-        let line = if precompiling { self.status.clone() } else if !self.game_ok { format!("Pick a game folder containing {GAME_EXE} first.") } else { self.status.clone() };
+        let line = if precompiling && b.is_some() { self.build_line() } else if !self.game_ok { format!("Pick a game folder containing {GAME_EXE} first.") } else { self.status.clone() };
         p.text(pos2(area.min.x, py + 18.), Align2::LEFT_TOP, fit(ui, &line, font(13., "semibold"), area.width()), font(13., "semibold"), TEXT);
 
         let by = py + 52.;
@@ -430,7 +459,7 @@ impl Launcher {
             if button(ui, Rect::from_min_size(pos2(area.min.x, by), vec2(120., CONTROL)), "setup-stop", "Stop", Kind::Secondary, true, Some(Icon::Stop)) {
                 self.stop_run();
             }
-        } else if button(ui, Rect::from_min_size(pos2(area.min.x, by), vec2(220., CONTROL)), "setup-go", "Precompile shaders", Kind::Primary, self.running.is_none() && self.runtime_dir.is_some(), Some(Icon::Download)) {
+        } else if button(ui, Rect::from_min_size(pos2(area.min.x, by), vec2(220., CONTROL)), "setup-go", "Build shaders", Kind::Primary, self.running.is_none() && self.engine_ready(), Some(Icon::Download)) {
             if self.game_ok {
                 self.confirm_precompile = true;
             } else {
@@ -445,10 +474,13 @@ impl Launcher {
 
     fn precompile_modal(&mut self, ctx: &egui::Context) {
         let mut close = false;
-        let closed = modal(ctx, "precompile", vec2(520., 250.), "Precompile shaders", "Runs once and resumes if interrupted.", true, |ui, body, foot| {
+        let text = format!(
+            "This uses your CPU and GPU heavily for {}. You can keep using the PC; Stop is always available, and pressing Build shaders again picks up where it stopped.",
+            self.build_estimate()
+        );
+        let closed = modal(ctx, "precompile", vec2(520., 250.), "Build shaders", "Runs once and resumes if interrupted.", true, |ui, body, foot| {
             let p = ui.painter().clone();
-            let text = "This uses your CPU and GPU heavily for about 45 minutes. You can leave the launcher open and keep using the PC; Stop is always available.";
-            let g = p.layout(text.into(), font(13., "regular"), TEXT, body.width());
+            let g = p.layout(text.clone(), font(13., "regular"), TEXT, body.width());
             p.galley(body.min, g, TEXT);
             if button(ui, Rect::from_min_size(foot.min, vec2(100., CONTROL)), "pc-cancel", "Cancel", Kind::Ghost, true, None) {
                 close = true;
@@ -562,8 +594,101 @@ impl Launcher {
         }
     }
 
-    fn settings_game(&mut self, ui: &mut Ui, c: Rect) {
+    /// A two-or-three way segmented control, right aligned in `row`. The picked index.
+    fn segments(ui: &mut Ui, row: Rect, id: &str, labels: &[&str], sel: usize, enabled: &[bool]) -> Option<usize> {
+        let bw = 96.;
+        let total = labels.len() as f32 * bw + (labels.len() - 1) as f32 * 6.;
+        let mut picked = None;
+        for (k, label) in labels.iter().enumerate() {
+            let x = row.max.x - 18. - total + k as f32 * (bw + 6.);
+            let kind = if k == sel { Kind::Primary } else { Kind::Secondary };
+            let r = Rect::from_min_size(pos2(x, row.center().y - CONTROL / 2.), vec2(bw, CONTROL));
+            if button(ui, r, (id, k), label, kind, enabled[k], None) && k != sel {
+                picked = Some(k);
+            }
+        }
+        picked
+    }
+
+    fn settings_game(&mut self, ui: &mut Ui, view: Rect) {
+        // The tab scrolls with the wheel; everything is drawn relative to the scrolled origin.
+        let old_clip = ui.clip_rect();
+        ui.set_clip_rect(view.intersect(old_clip));
+        let max_scroll = (self.game_content - view.height()).max(0.);
+        let (pointer, wheel) = ui.input(|i| (i.pointer.hover_pos(), i.raw_scroll_delta.y));
+        if pointer.is_some_and(|q| view.contains(q)) && wheel != 0. {
+            self.game_scroll -= wheel;
+        }
+        self.game_scroll = self.game_scroll.clamp(0., max_scroll);
+        let origin = view.min.y - self.game_scroll;
+        let c = Rect::from_min_max(pos2(view.min.x, origin), view.max);
         let p = ui.painter().clone();
+
+        // ---- engine and World settings
+        caption(&p, pos2(c.min.x, c.min.y), Align2::LEFT_TOP, "Engine");
+        let w = c.width().min(640.);
+        let row_at = |i: usize| Rect::from_min_size(pos2(c.min.x, c.min.y + 28. + i as f32 * 62.), vec2(w, 54.));
+        let bundled = self.world_dir.is_some();
+        let world = self.world_selected();
+        let idle = self.running.is_none();
+        let engine_sub = if !bundled {
+            "victory.exe was not found in the runtime folder  ·  using Classic".to_string()
+        } else if world {
+            crate::engine::WORLD_LABEL.to_string()
+        } else {
+            crate::engine::CLASSIC_LABEL.to_string()
+        };
+        let rows = [
+            ("Engine", engine_sub.as_str()),
+            ("Console profile", "World engine. Series S reports the smaller console to the game."),
+            ("Ray tracing", "World engine. Hardware ray-traced lighting."),
+            ("Fallback lighting", "World engine. Simple lighting where the game's own is missing."),
+            ("Debug view", "World engine. Shows a debug render target (slower)."),
+            ("Auto-advance menus", "Presses through the title and account screens."),
+        ];
+        for (i, (title, sub)) in rows.iter().enumerate() {
+            let row = row_at(i);
+            p.rect_filled(row, RADIUS_MD, BG_100);
+            p.rect_stroke(row, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
+            p.text(pos2(row.min.x + 18., row.center().y - 9.), Align2::LEFT_CENTER, *title, font(15., "semibold"), TEXT);
+            let shown = fit(ui, sub, font(12., "regular"), row.width() - 36. - 210.);
+            p.text(pos2(row.min.x + 18., row.center().y + 10.), Align2::LEFT_CENTER, shown, font(12., "regular"), TEXT_MUTED);
+        }
+        let mut changed = false;
+        if let Some(k) = Self::segments(ui, row_at(0), "eng", &["World", "Classic"], if world { 0 } else { 1 }, &[bundled && idle, idle && self.runtime_hash.is_some()]) {
+            self.config.engine = if k == 0 { crate::engine::WORLD } else { crate::engine::CLASSIC }.to_string();
+            changed = true;
+        }
+        let on = [idle && world; 4];
+        if let Some(k) = Self::segments(ui, row_at(1), "console", &["Series X", "Series S"], self.config.console_s as usize, &on[..2]) {
+            self.config.console_s = k == 1;
+            changed = true;
+        }
+        if let Some(k) = Self::segments(ui, row_at(2), "rt", &["Off", "On"], self.config.raytracing as usize, &on[..2]) {
+            self.config.raytracing = k == 1;
+            changed = true;
+        }
+        if let Some(k) = Self::segments(ui, row_at(3), "fb", &["Off", "On"], self.config.fallback_light as usize, &on[..2]) {
+            self.config.fallback_light = k == 1;
+            changed = true;
+        }
+        if let Some(k) = Self::segments(ui, row_at(4), "dbg", &["Off", "On"], self.config.debug_view as usize, &on[..2]) {
+            self.config.debug_view = k == 1;
+            changed = true;
+        }
+        let mut auto = self.config.auto_menu;
+        let r = row_at(5);
+        if switch(ui, Rect::from_center_size(pos2(r.max.x - 44., r.center().y), vec2(40., 24.)), "auto-menu-game", &mut auto) {
+            self.config.auto_menu = auto;
+            changed = true;
+        }
+        if changed {
+            self.save();
+        }
+        p.text(pos2(c.min.x, row_at(5).max.y + 10.), Align2::LEFT_TOP, "Applied the next time you press Play.", font(12.5, "regular"), TEXT_MUTED);
+        let shift = 28. + 6. * 62. + 22. + 14.;
+        let c = c.translate(vec2(0., shift));
+
         caption(&p, pos2(c.min.x, c.min.y), Align2::LEFT_TOP, "Game folder");
         p.text(pos2(c.min.x, c.min.y + 20.), Align2::LEFT_TOP, format!("The folder that contains {GAME_EXE}. It is used read-only."), font(12.5, "regular"), TEXT_MUTED);
         let field = Rect::from_min_size(pos2(c.min.x, c.min.y + 46.), vec2(c.width(), 44.));
@@ -600,6 +725,15 @@ impl Launcher {
         }
         p.text(pos2(c.min.x, sy + CONTROL + 12.), Align2::LEFT_TOP, fit_end(ui, &self.save_note, font(12.5, "regular"), c.width()), font(12.5, "regular"), TEXT_MUTED);
         p.text(pos2(c.min.x, sy + CONTROL + 32.), Align2::LEFT_TOP, format!("Saves are also backed up before each Play (the last {} are kept).", saves::KEEP), font(12., "regular"), TEXT_FAINT);
+
+        self.game_content = sy + CONTROL + 52. - origin;
+        if max_scroll > 0. {
+            let track = Rect::from_min_max(pos2(view.max.x - 4., view.min.y), pos2(view.max.x - 2., view.max.y - 6.));
+            let th = track.height() * view.height() / self.game_content;
+            let ty = track.min.y + (track.height() - th) * self.game_scroll / max_scroll;
+            p.rect_filled(Rect::from_min_size(pos2(track.min.x, ty), vec2(2., th)), 1, LINE_HOVER);
+        }
+        ui.set_clip_rect(old_clip);
     }
 
     fn settings_display(&mut self, ui: &mut Ui, c: Rect) {
@@ -698,7 +832,8 @@ impl Launcher {
         if changed {
             self.save();
         }
-        p.text(pos2(c.min.x, row_at(4).max.y + 16.), Align2::LEFT_TOP, "Applied the next time you press Play.", font(12.5, "regular"), TEXT_MUTED);
+        let applied = if self.world_selected() { "Applied the next time you press Play (Classic engine only)." } else { "Applied the next time you press Play." };
+        p.text(pos2(c.min.x, row_at(4).max.y + 16.), Align2::LEFT_TOP, applied, font(12.5, "regular"), TEXT_MUTED);
     }
 
     /// The closed dropdown: current value and a chevron. True when clicked.
@@ -776,9 +911,29 @@ impl Launcher {
             self.save();
         }
 
+        let row = Rect::from_min_size(pos2(c.min.x, row.max.y + 10.), vec2(c.width().min(640.), 58.));
+        p.rect_filled(row, RADIUS_MD, BG_100);
+        p.rect_stroke(row, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
+        p.text(pos2(row.min.x + 18., row.center().y - 9.), Align2::LEFT_CENTER, "Skip slow shaders", font(15., "semibold"), TEXT);
+        let sub = format!("A build step with no progress for {} s is stopped; its shaders compile on demand in game.", self.config.slow_secs);
+        p.text(pos2(row.min.x + 18., row.center().y + 10.), Align2::LEFT_CENTER, fit(ui, &sub, font(12., "regular"), row.width() - 200.), font(12., "regular"), TEXT_MUTED);
+        let mut on = self.config.skip_slow;
+        if switch(ui, Rect::from_center_size(pos2(row.max.x - 44., row.center().y), vec2(40., 24.)), "skip-slow", &mut on) {
+            self.config.skip_slow = on;
+            self.save();
+        }
+        for (k, secs) in [30u64, 60, 180].iter().enumerate() {
+            let r = Rect::from_min_size(pos2(row.max.x - 88. - (3 - k) as f32 * 46., row.center().y - 14.), vec2(42., 28.));
+            let kind = if self.config.slow_secs == *secs { Kind::Primary } else { Kind::Secondary };
+            if button(ui, r, ("slow", k), &format!("{secs}s"), kind, self.config.skip_slow && self.running.is_none(), None) {
+                self.config.slow_secs = *secs;
+                self.save();
+            }
+        }
+
         let top = row.max.y + 28.;
         caption(&p, pos2(c.min.x, top), Align2::LEFT_TOP, "Cache location");
-        p.text(pos2(c.min.x, top + 20.), Align2::LEFT_TOP, "Compiled shaders go to <folder>\\dxil. It needs about 40 GB, so pick a drive with room.", font(12.5, "regular"), TEXT_MUTED);
+        p.text(pos2(c.min.x, top + 20.), Align2::LEFT_TOP, "Translated shaders go to <folder>\\victory (World) or <folder>\\dxil (Classic, about 40 GB).", font(12.5, "regular"), TEXT_MUTED);
         let field = Rect::from_min_size(pos2(c.min.x, top + 46.), vec2(c.width().min(640.), 44.));
         let busy = self.running.is_some();
         if text_field(ui, field, "cache-edit", &mut self.config.cache_dir, "Folder", Some(Icon::Folder), !busy).changed() {
@@ -807,10 +962,10 @@ impl Launcher {
         p.text(pos2(c.min.x + 60., c.min.y + 4.), Align2::LEFT_TOP, "ScarlettPort", font(20., "bold"), TEXT);
         p.text(pos2(c.min.x + 60., c.min.y + 30.), Align2::LEFT_TOP, format!("Launcher v{VERSION}"), font(13., "regular"), TEXT_MUTED);
         let y = c.min.y + 72.;
-        if button(ui, Rect::from_min_size(pos2(c.min.x, y), vec2(190., CONTROL)), "reunpack", "Re-extract runtime", Kind::Secondary, self.running.is_none(), Some(Icon::Refresh)) {
-            let _ = std::fs::remove_file(crate::runtime::runtime_dir().join(".hash"));
+        if button(ui, Rect::from_min_size(pos2(c.min.x, y), vec2(190., CONTROL)), "relocate", "Look for engines", Kind::Secondary, self.running.is_none(), Some(Icon::Refresh)) {
             self.runtime_dir = None;
-            self.runtime_note = "Unpacking runtime…".into();
+            self.world_dir = None;
+            self.runtime_note = "Looking for the engines…".into();
             self.unpack_runtime();
         }
         if button(ui, Rect::from_min_size(pos2(c.min.x + 200., y), vec2(140., CONTROL)), "copy-version", "Copy version", Kind::Secondary, true, None) {
@@ -826,5 +981,10 @@ impl Launcher {
         if link(ui, pos2(c.min.x, y + 100.), Align2::LEFT_CENTER, "site", "github.com/ZigZagBoi1/ScarlettPort") {
             ui.ctx().open_url(egui::OpenUrl::new_tab(REPO_URL));
         }
+        let y = y + 126.;
+        caption(&p, pos2(c.min.x, y), Align2::LEFT_TOP, "Built on");
+        let built = "The Classic engine is built on XCL (github.com/ivall/xcl, GPL-2.0-only). The World engine is built on VIctory by Marvisak (github.com/Marvisak/VIctory, GPL-3.0-or-later). ScarlettPort's own code and changes are licensed as set out in LICENSE.md. No game code or assets are included.";
+        let g = p.layout(built.into(), font(12.5, "regular"), TEXT_MUTED, c.width().min(620.));
+        p.galley(pos2(c.min.x, y + 20.), g, TEXT_MUTED);
     }
 }

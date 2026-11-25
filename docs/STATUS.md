@@ -31,8 +31,10 @@ Measured on: Windows 10 22H2, RTX 3060 12 GB, 32 GB RAM. Series S profile (`--co
 - Other numbers (shader coverage, per-feature timings) are in `runtime/victory/README.md` and `runtime/victory/VICKY.md`; they were measured by their authors on their own machines, not on the reference machine above.
 
 ## Shader coverage
-- XCL translates the title's whole shader pack to HLSL (26,084 programs); DXC compiles them in the background.
-- VIctory-based runtime: 25,200 of 25,471 graphics pipelines are prebuilt by `victory precompile-graphics`. See the status tables in `runtime/victory/README.md`.
+- VIctory-based translator: all **26,084** programs translate. **26,013** pass DXIL validation on their own; the other **71** are oversized mesh shaders (outputs past the host's 32 KiB) that validate only when linked with their pixel shader (`VICTORY_LINK_PAIRS`, `crates/victory-shader/src/emit/link.rs`). So "100% translated" is true; "100% validate on their own" is not.
+- `victory warm` (the launcher's shader build) translates 25,889 distinct shaders from the title's archives into the cache in about 171 s on the reference machine.
+- 25,200 of 25,471 graphics pipelines are prebuilt by `victory precompile-graphics` (491 s). Play runs currently leave `VICTORY_PRECOMPILED_GRAPHICS` off (rectangle-list pipelines decode wrong in this copy), so the launcher skips that step for now.
+- XCL counts differently: its precompile walks the 26,503 records of the shader pack and goes through its own HLSL and DXC path, so its translated and compiled numbers are not the VIctory ones above. Its last ~4,000 records (from about 83%) are large compute shaders whose driver compiles take 6–190 s each.
 
 ## Known gaps
 - Ray tracing: structure builder and trace programs are partly translated and off by default.

@@ -98,7 +98,7 @@ Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROAD
 | Lit world renders | ✅ | about 4 fps in the prologue on an RTX 3060, Series S profile (2.6 before) |
 | Gameplay starts | ✅ | the prologue runs; not played end to end |
 | Pipelines prebuilt | ✅ | 25,200 of 25,471 graphics pipelines made ahead of time |
-| All shaders translate and validate | ✅ | 26,084 of 26,084 (71 oversized mesh shaders validate when linked to their pixel shaders) |
+| Shaders translate (VIctory-based translator) | ✅ | all 26,084 translate; 26,013 pass DXIL validation on their own, the other 71 (oversized mesh shaders) validate only when linked with their pixel shader. XCL's counts differ ([`docs/STATUS.md`](docs/STATUS.md)) |
 | Keyboard and mouse | ✅ | click to capture, W walks the character |
 | Tile-grid overlay over gameplay | 🔨 | frozen overlay; under investigation |
 | Shadowed areas | 🔨 | too dark |
@@ -115,7 +115,19 @@ Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROAD
 
 **Requirements:** Windows 10/11 x64 · a D3D12 GPU with Shader Model 6.6 and mesh shaders (RTX 20-series / RX 6000 or newer) · 32 GB RAM recommended · [Rust](https://rustup.rs) (MSVC) · Windows SDK
 
-Two runtimes are included ([`docs/RUNTIMES.md`](docs/RUNTIMES.md)):
+**Easiest: the launcher.** Download `ScarlettPort-<version>-win64.zip` from [Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases), extract the whole ZIP (keep `ScarlettPort.exe` and the `runtime` folder side by side), run `ScarlettPort.exe`, pick your dump folder, press **Build shaders**, then **Play**. The release is built by CI from this repo, is not code-signed, and lists SHA-256 checksums in its notes.
+
+The shader build uses the World engine (VIctory-based runtime, `victory warm`) by default:
+
+| | Expected time (12-thread CPU) | What you see |
+|---|---|---|
+| World engine (default) | about 3 min (measured 171 s for 25,889 shaders) | phase, count, the current step and its elapsed time |
+| Classic engine (XCL, Settings → Game) | 20–30 min with "skip slow shaders" on; 45 min to several hours with it off | the same, plus "no output for N s" during the slow tail |
+
+- **It resumes.** Stop it or close the launcher at any time; pressing **Build shaders** again skips what is done (finished phases are recorded in `<cache>\build-world.json`, translated shaders are read back from the cache).
+- **What "83%" means (Classic engine).** XCL's precompile gets through about 22,400 of 26,503 programs quickly. The last ~4,000 are huge world compute shaders that the graphics driver takes 6–190 s each to compile, and the counter only moves when one finishes, so it can sit at 83–85% for a long time while still working. The launcher now shows the time since the last progress and runs as many of these at once as your CPU and free RAM allow. With **Skip slow shaders** (Settings → Options, on by default, 60 s) a step that shows no progress for that long is stopped and the rest compile on demand in game. Or switch to the World engine, which does not have this tail.
+
+To run the runtimes without the launcher, two are included ([`docs/RUNTIMES.md`](docs/RUNTIMES.md)):
 
 **A. VIctory-based runtime: furthest today** (lit world)
 
@@ -126,14 +138,12 @@ cd ScarlettPort
 .\scripts\play-victory.ps1 -Game "D:\path\to\your\dump"       # Series S profile by default
 ```
 
-**B. XCL + launcher: menus and loading screens**
+**B. XCL: menus and loading screens**
 
 ```powershell
-.\scripts\setup.ps1 -Game "D:\path\to\your\dump"     # build + Agility SDK + precompile shaders (~45 min, once)
+.\scripts\setup.ps1 -Game "D:\path\to\your\dump"     # build + Agility SDK + precompile shaders (45 min to hours, once; resumes)
 .\scripts\play.ps1  -Game "D:\path\to\your\dump" -AutoMenu
 ```
-
-Or download the one-exe launcher from [Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases).
 
 - `play-victory.ps1` sets the recommended environment (`--console series-s`, `VICTORY_OWN_UPSCALER=1`, `VICTORY_NO_WATCHDOG=1`). Its switches include `-AutoInput`, `-FastBoot` (testing only) and `-SaveSlot`.
 - While the game runs, write button names into `press.txt` (e.g. `DOWN DOWN A`) to press them.
@@ -141,6 +151,19 @@ Or download the one-exe launcher from [Releases](https://github.com/ZigZagBoi1/S
 - Controls: an Xbox controller works best. On the VIctory runtime with no pad connected, the keyboard is a pad: Enter = A, Backspace = B, WASD = left stick, IJKL = right stick.
 
 Environment variables: [`docs/RUNTIMES.md`](docs/RUNTIMES.md). Build instructions: [`docs/BUILDING.md`](docs/BUILDING.md).
+
+---
+
+## ❓ FAQ
+
+**The shader build looks stuck at ~85%.**
+That is the Classic (XCL) engine's slow tail: the last ~4,000 of 26,503 programs are huge world shaders that the graphics driver compiles in 6–190 s each, so the count stops moving for minutes at a time while it is still working (one report: 22,200/26,503). Update the launcher: it uses the World engine by default (about 3 minutes), shows the current step and how long it has taken, and with **Skip slow shaders** on leaves the slowest ones to compile in game. Whatever you already built is kept; pressing **Build shaders** again resumes.
+
+**Do I need to rebuild after updates?**
+After a launcher or runtime update the launcher marks the shaders as needing a rebuild. The shipped World engine keys its shader cache on the whole translator source, so a runtime update that changes the shader translator translates everything again (about 3 minutes); an update that does not touch the translator reuses the cache and the rebuild finishes quickly. A per-shader key that rebuilds only changed shaders exists in our fork (`fx-cachekey`) but is not in the runtime shipped here yet. The Classic engine's cache is keyed by the generated code, so it recompiles what changed.
+
+**How can I contribute?**
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md), then pick a task below or open an issue with one of the [issue templates](https://github.com/ZigZagBoi1/ScarlettPort/issues/new/choose) (bug report, hardware report, shader failure). Testers with different GPUs and hardware reports help most right now: GPU, driver, CPU, RAM, how long the shader build took and how far the game got.
 
 ---
 
@@ -163,7 +186,7 @@ Every task is sized for **one person + one AI coding agent**. Pick one, comment 
 ### Tooling & docs
 
 - [ ] **#7 Hardware reports.** Run it on your GPU and post results (GPU, driver, fps, how far it got).
-- [ ] **#8 One-click launcher** for the VIctory-based runtime.
+- [x] **#8 One-click launcher** for the VIctory-based runtime (done: it is the launcher's default engine).
 
 ---
 
@@ -175,7 +198,7 @@ ScarlettPort/
 ├── runtime/
 │   ├── xcl/          XCL (ivall/xcl) with our changes: console OS layer, D3D12.X, RDNA2 -> HLSL -> DXIL
 │   └── victory/      VIctory-based runtime: fxceless/victory-fork + merged community work + our changes (see SCARLETTPORT.md)
-├── launcher/         native one-exe launcher (Rust, egui) for the XCL runtime
+├── launcher/         native launcher (Rust, egui); runs the engines from a runtime\ folder beside it
 ├── patches/          our changes to each runtime as plain diffs (xcl-stack.patch, victory-stack.patch)
 ├── docs/             STATUS, RUNTIMES, BUILDING, ROADMAP
 ├── assets/           screenshots

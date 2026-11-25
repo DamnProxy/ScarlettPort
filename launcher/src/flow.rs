@@ -26,10 +26,12 @@ pub struct Inputs<'a> {
     pub built_hash: &'a str,
     /// None while the runtime is unpacking: staleness is then unknown and not reported.
     pub runtime_hash: Option<&'a str>,
+    /// The engine builds its shaders while you play: nothing to build up front.
+    pub inline_shaders: bool,
 }
 
 pub fn shaders_current(i: &Inputs) -> bool {
-    !i.built_hash.is_empty() && i.runtime_hash.is_none_or(|h| h == i.built_hash)
+    i.inline_shaders || (!i.built_hash.is_empty() && i.runtime_hash.is_none_or(|h| h == i.built_hash))
 }
 
 pub fn stage(i: &Inputs) -> Stage {
@@ -119,7 +121,7 @@ mod tests {
     use super::*;
 
     fn inp<'a>(game: bool, pre: bool, built: &'a str, rt: Option<&'a str>) -> Inputs<'a> {
-        Inputs { game_complete: game, precompiling: pre, built_hash: built, runtime_hash: rt }
+        Inputs { game_complete: game, precompiling: pre, built_hash: built, runtime_hash: rt, inline_shaders: false }
     }
 
     #[test]
@@ -156,6 +158,14 @@ mod tests {
         // runtime still unpacking: trust the stored hash
         assert_eq!(stage(&inp(true, false, "old", None)), Stage::Ready);
         assert_eq!(stage(&inp(false, false, "h", Some("h"))), Stage::GameNotSet);
+    }
+
+    #[test]
+    fn inline_shaders_are_ready() {
+        let i = Inputs { game_complete: true, precompiling: false, built_hash: "", runtime_hash: Some("h"), inline_shaders: true };
+        assert_eq!(stage(&i), Stage::Ready);
+        let i = Inputs { game_complete: false, ..i };
+        assert_eq!(stage(&i), Stage::GameNotSet);
     }
 
     #[test]

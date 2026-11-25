@@ -9,8 +9,9 @@ Both runtimes run a title from your own dump. Each currently gets further at som
 | Open world | world reached and gameplay starts on an RTX 3060, Series S profile | world reached, survives 7+ minutes |
 | Speed in the world | about 4 fps in the prologue (RTX 3060, Series S profile; 2.6 before) | not rendering the final image |
 | Final image | lit; shadowed areas too dark; a frozen tile-grid overlay over gameplay | black |
-| Extras | frame capture, save slots, press file, fast boot (testing) | launcher, pipeline journal and offline build, profiles, achievements, crash reports |
-| Scripts | `setup-victory.ps1`, `play-victory.ps1` | `setup.ps1`, `play.ps1`, launcher |
+| Extras | frame capture, save slots, press file, fast boot (testing), launcher (default engine) | launcher (Classic engine), pipeline journal and offline build, profiles, achievements, crash reports |
+| Shader build | `victory warm`: about 3 min | `xcl shaders --precompile`: 45 min to hours (slow tail from 83%) |
+| Scripts | `setup-victory.ps1`, `play-victory.ps1`, launcher | `setup.ps1`, `play.ps1`, launcher |
 
 Neither is verified playable.
 
@@ -73,9 +74,22 @@ None of these has been measured on the reference machine in this build. Try them
 | `VICTORY_LINK_PAIRS=<file>` | linked mesh/pixel pairs file for translation |
 | `VICTORY_F3_VIEW_FIX` | host-side view fix; leave off |
 
+### Shader build (launcher)
+
+The launcher's **Build shaders** runs, from the `runtime` folder beside it:
+
+1. `victory warm "<dump>" --jobs N` with `VICTORY_GAME_DIR=<dump>` and `VICTORY_CACHE_DIR=<cache>\victory`: translates every shader into the cache and makes the compute pipelines. About 3 min (171 s for 25,889 shaders on a 12-thread CPU). It prints a line every 2,000 shaders; between lines the launcher shows the current range and its elapsed time. `N` is the logical core count minus one, capped by free RAM (512 MB per job).
+2. `victory precompile-graphics "<dump>\shaders.rpf" --skip S --limit 1000` in chunks of 1,000 records, each saved when it ends (491 s for 25,200 pipelines in one run). **Off for now**: play runs leave `VICTORY_PRECOMPILED_GRAPHICS` unset until the rectangle-list fix is in this copy (`engine::PRECOMPILED_GRAPHICS` in the launcher turns both on together).
+
+Resuming: finished steps and chunks are recorded in `<cache>\build-world.json`, keyed by the SHA-256 of `victory.exe`; translated shaders are read back from the cache, so a restarted build skips them. A different `victory.exe` starts the record over; the translation cache is keyed by the translator's source, so only a translator change makes every shader translate again. Play runs use the same `VICTORY_CACHE_DIR`.
+
+With **Skip slow shaders** (Settings, Options; on, 60 s by default) a pipeline chunk or the Classic precompile that prints nothing for that long is stopped and its shaders compile on demand in game. `victory warm` is never stopped this way.
+
+Classic engine: `xcl shaders shaders.rpf --precompile --pipelines --only cs` with `XCL_PIPELINE_THREADS` set from the CPU count and free RAM (1.5 GB per driver compile, at most 8). It gets to about 22,400 of 26,503 (83–85%) quickly; the rest are huge compute shaders the driver compiles in 6–190 s each, during which the count does not move. It resumes from its DXIL and driver caches.
+
 ## XCL
 
-Our modified XCL tree (ivall/xcl): console OS layer, D3D12.X, RDNA2 to HLSL to DXIL recompiler. Run it through `play.ps1` or the launcher (`launcher/`, one exe with the runtime embedded). Our changes against upstream are in `patches/xcl-stack.patch`.
+Our modified XCL tree (ivall/xcl): console OS layer, D3D12.X, RDNA2 to HLSL to DXIL recompiler. Run it through `play.ps1`, or through the launcher's Classic engine when `xcl.exe` is in its `runtime` folder. Our changes against upstream are in `patches/xcl-stack.patch`.
 
 | Variable | Effect |
 |---|---|

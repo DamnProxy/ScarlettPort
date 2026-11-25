@@ -40,7 +40,7 @@ Windows 10 needs the D3D12 Agility SDK (1.614.1) next to the executable, in a `D
 
 ## Launcher
 
-The launcher embeds the XCL runtime (`xcl.exe`, Agility SDK DLLs, `dxcompiler.dll`, `dxil.dll`), so build XCL first.
+The launcher embeds no runtime. It runs the engines from a `runtime` folder beside `ScarlettPort.exe` (`victory.exe` plus its `D3D12\` folder; optionally `xcl.exe`, `dxcompiler.dll` and `dxil.dll` for the Classic engine). It never unpacks, downloads or writes executables.
 
 ```powershell
 cd launcher
@@ -48,18 +48,17 @@ cargo build --release --locked
 cargo test --release --locked
 ```
 
-`build.rs` copies the runtime files into `launcher\runtime` from `XCL_SRC` (a folder holding `xcl.exe` and `D3D12\`; default `runtime\xcl\target\release`) and `DXC_SRC` (a folder holding `dxcompiler.dll` and `dxil.dll`, for example the Windows SDK `bin\<version>\x64`). Files already in `launcher\runtime` are used as is.
+To run a development build, either copy `runtime\victory\target\release\victory.exe` and its `D3D12` folder into `launcher\target\release\runtime\`, or set `SCARLETT_RUNTIME_DIR` to a folder holding them. `ScarlettPort.exe --screenshot=FILE.png` renders the window to a PNG and exits.
 
-To build and test the launcher without any runtime files (CI does this), set `SCARLETT_NO_EMBED=1`. It embeds empty placeholders; the result builds but cannot run a game.
-
+Releases are built by `.github/workflows/release.yml` on a `v*` tag: launcher and VIctory-based runtime in release mode, the Agility SDK from NuGet, a ZIP with `ScarlettPort.exe` and `runtime\`, and SHA-256 checksums. No binaries are committed.
 ## Where things live
 
 | What | Where |
 |---|---|
 | Build output | `runtime\xcl\target`, `runtime\victory\target`, `launcher\target` |
-| Launcher unpacked runtime | `%LOCALAPPDATA%\ScarlettPort\runtime` |
+| Launcher engines | `runtime\` beside `ScarlettPort.exe` |
 | Launcher settings and default cache | `%LOCALAPPDATA%\ScarlettPort`, cache on the fixed drive with the most free space (`<drive>\ScarlettCache`) |
-| DXIL shader cache | `<cache>\dxil` |
+| Shader caches | `<cache>\victory` (World), `<cache>\dxil` (Classic); build progress in `<cache>\build-world.json` / `build-classic.json` |
 | XCL title data, pipeline journal | `%XCL_DATA_ROOT%` or `%LOCALAPPDATA%\XCL`, then the package name; `cache\pipelines.bin` inside it |
 
 Caches are safe to delete; they are rebuilt on the next run (slowly: first-run shader compiles stall the world).

@@ -127,9 +127,6 @@ jobs:
     defaults:
       run:
         working-directory: launcher
-    env:
-      # Build without the runtime binaries; see launcher/build.rs.
-      SCARLETT_NO_EMBED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
