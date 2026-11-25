@@ -87,6 +87,25 @@ Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROAD
 
 ---
 
+## 🧪 In progress (after v0.2.1)
+
+Nothing below is in a release yet. "In testing" means built and unit-tested, waiting for A/B game runs on our RTX 3060; "planned" means not built yet. The only measured number today is about 4 fps in the prologue on that card; none of these items has a measured fps gain on it yet.
+
+| Work | Status | What it does |
+|---|:---:|---|
+| Streaming stutter fixes | 🧪 in testing | fewer waits on title memory while world data streams: narrower declared GPU write ranges, fills and buffer copies served on the card, a fixed copy-back mode that no longer gives a black picture |
+| Missing geometry: character skin shaders | 🧪 in testing | skin, hair and clothes pixel shaders that were refused (draws dropped) translate again |
+| Missing geometry: mesh output limit | 🧪 in testing | the 71 over-budget mesh shaders are linked under D3D12's 32 KiB output limit instead of being dropped on NVIDIA |
+| Missing geometry: view heap | 🧪 in testing | view heap sized so world draws no longer run out of slots on NVIDIA |
+| CPU recording cuts | 🧪 in testing | less per-draw preparing and recording cost on the CPU, with a per-part timing line to measure it |
+| FSR upscaler | 📋 planned | the title's FidelityFX calls answered by AMD's PC FidelityFX |
+| Frame generation | 📋 planned | only once the base frame rate is high enough for it to make sense |
+| Launcher v0.3 | 🧪 in testing | local build mode, switch presets, **Verify files**, fix for a blank launcher window |
+| Save safety | 🧪 in testing | protects your save folder from being overwritten by test runs |
+| One-command benchmark queue | 🧪 in testing | queues A/B runs of switch sets and collects the frame-time logs in one command |
+
+---
+
 ## 🚦 Where we are
 
 | Stage | Status | Notes |

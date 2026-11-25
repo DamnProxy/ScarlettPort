@@ -32,3 +32,21 @@ Run the title the way the smaller console does (its memory budget, resolution an
 ## 7. Verify playable
 
 Play a session end to end, with saves, and record what breaks.
+
+## Changelog
+
+### Unreleased (work in progress after v0.2.1)
+
+Measured state is unchanged: about 4 fps in the prologue on an RTX 3060 (Series S profile). No item below has a measured fps gain on that card yet.
+
+- **In testing:** streaming stutter fixes (narrower declared write ranges, fills and copies served on the card, read-back-only copy mode fixed).
+- **In testing:** missing-geometry fixes: character skin shaders, mesh shaders linked under the 32 KiB output limit, view heap size on NVIDIA.
+- **In testing:** CPU recording cuts, with a per-part preparing line for measuring them.
+- **In testing:** launcher v0.3: local build mode, presets, Verify files, blank-window fix.
+- **In testing:** save-safety fix.
+- **In testing:** one-command benchmark queue for A/B runs.
+- **Planned:** FSR upscaler (AMD PC FidelityFX) and frame generation.
+
+### v0.2.1
+
+- Runtime synced to the verified default build; launcher with Discord status, updates from Releases and hardware report.
