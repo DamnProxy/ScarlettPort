@@ -84,6 +84,7 @@ Measured on an RTX 3060 (Series S profile, the title's own upscaler):
 - **Not verified playable:** nobody has played a session end to end.
 
 Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROADMAP.md).
+Questions: [`docs/FAQ.md`](docs/FAQ.md). Problems: [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
 
 ---
 
@@ -221,7 +222,7 @@ ScarlettPort/
 │   └── victory/      VIctory-based runtime: fxceless/victory-fork + merged community work + our changes (see SCARLETTPORT.md)
 ├── launcher/         native launcher (Rust, egui); runs the engines from a runtime\ folder beside it
 ├── patches/          our changes to each runtime as plain diffs (xcl-stack.patch, victory-stack.patch)
-├── docs/             STATUS, RUNTIMES, BUILDING, ROADMAP
+├── docs/             STATUS, RUNTIMES, BUILDING, ROADMAP, FAQ, TROUBLESHOOTING
 ├── assets/           screenshots
 └── LICENSE.md        licensing overview
 ```
