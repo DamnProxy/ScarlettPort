@@ -55,7 +55,7 @@ if (-not $KeepWatchdog) { $env:VICTORY_NO_WATCHDOG = '1' }
 $env:VICTORY_RELAY = '2'
 $env:VICTORY_SYNC_PRECISE = '1'
 $env:VICTORY_READ_SETTLE_PRECISE = '1'
-$env:VICTORY_PRECOMPILED_GRAPHICS = '1'
+# VICTORY_PRECOMPILED_GRAPHICS stays off for now: this runtime decodes rectangle-list pipelines wrong (a half-tile grid over the picture). Fixed upstream of this copy; it will be turned on with the next sync.
 $env:VICTORY_PIPELINE_WAIT_MS = '0'
 if ($FastBoot) { $env:VICTORY_FAST_BOOT = '1' }
 if ($SaveSlot) { $env:VICTORY_SAVE_SLOT = $SaveSlot }
