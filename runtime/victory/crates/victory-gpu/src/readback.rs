@@ -9,6 +9,17 @@
 //! is noted here; with the switch on, shader writes to other memory stay on
 //! the card.
 //!
+//! "Stay on the card" must not mean "lost": the runtime itself reads title
+//! memory in several places, and run R2a (the switch on, the world drawn,
+//! the picture black) put stale title bytes back over shader results there.
+//! The ranges are still declared (flights in the air hold them, so readers
+//! wait), and what stays in a host copy is "owned" by it
+//! (`victory_core::gpuown`, `crate::shadow`'s `owning`/`owned`): its
+//! refreshes leave those bytes alone, and the title's buffer copies run on
+//! the CPU, fills, textures and other copies over the same memory get them
+//! written into title memory first. A page the title writes over owned
+//! bytes gives them to the title and is copied back from then on.
+//!
 //! shortcut: the function is found on the stack by scanning the stack for
 //! a return address into it (the title's unwind data is not registered
 //! with the system), so a stale return address left in a caller's frame
@@ -246,6 +257,7 @@ pub(crate) fn tagged_in(start: u64, len: u64) -> bool {
 
 /// Whether shader writes to `[start, start + len)` are copied back: always
 /// with the switch off; with it on, only where a read-back buffer lies.
+/// Asked at submission, per declared range (`Shadow::writing`).
 pub(crate) fn copy_back(start: u64, len: u64) -> bool {
     if !enabled() {
         return true;

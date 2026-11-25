@@ -302,6 +302,11 @@ fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader,
     if let Some(code) = code {
         native.code = code;
     }
+    // (the passes that run on every program: `crate::rules` keeps a cached translation's
+    // fingerprints of them)
+    for pass in ["pass:spill", "pass:structure", "pass:resource", "pass:io"] {
+        crate::rules::note(pass);
+    }
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -551,6 +556,7 @@ pub fn emit(
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
         return original;
     }
+    crate::rules::note("pass:threading");
     let edges = threading::constant_edges(p, st);
     if edges.is_empty() {
         return original;
@@ -773,6 +779,7 @@ fn emit_program(
     // lowering lays out the title's rows: 16-bit packing, unnamed rows.)
     let mut dropped = Vec::new();
     if let Some(keep) = link::kept() {
+        crate::rules::note("feature:link");
         let kept = |e: &container::SigElement| e.kind != 0 || keep.iter().any(|k| k.names(&e.name, e.index));
         match native.stage {
             HwStage::Ms => {

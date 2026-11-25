@@ -352,6 +352,22 @@ const DEFAULT_BLEND: TargetBlend = TargetBlend {
 /// +0x4c u32 input elements, then each: u32 name bytes (with the NUL),
 ///       the name, u32 index, format, slot, offset, class, step rate
 /// ```
+/// The console's rectangle-list topology type, as the title's pipeline
+/// streams name it.
+pub const RECTANGLES: u32 = 19;
+
+/// The topology byte at +0x26 as (topology type, strip cut value). 0x13
+/// (408 records) is the console's rectangle list, not a triangle type with
+/// a strip cut: taken apart as such, its pipelines lost the geometry stage
+/// that completes each rectangle and drew half of each one.
+fn topology(byte: u32) -> (u32, u32) {
+    if byte == RECTANGLES {
+        (RECTANGLES, 0)
+    } else {
+        (bits(byte, 0, 4), bits(byte, 4, 2))
+    }
+}
+
 fn description(block: &[u8], d: &mut GraphicsDesc) -> Result<(), Error> {
     let u = |at: usize| -> Result<u32, Error> {
         block
@@ -372,8 +388,7 @@ fn description(block: &[u8], d: &mut GraphicsDesc) -> Result<(), Error> {
     if d.num_targets > 8 {
         return Err(Error::Desc("more than eight render targets"));
     }
-    d.topology = bits(w, 16, 4);
-    d.strip_cut = bits(w, 20, 2);
+    (d.topology, d.strip_cut) = topology(bits(w, 16, 8));
     d.sample_count = bits(u(0x28)?, 0, 8).max(1);
     d.sample_quality = 0;
     if u(0x3c)? != 12 || u(0x40)? != 0 || u(0x44)? != 0 {
@@ -509,6 +524,13 @@ mod tests {
         let d = decode(&a, &b).unwrap();
         assert!(consistent(&a, &d));
         d
+    }
+
+    #[test]
+    fn the_rectangle_list_byte_is_a_topology_not_a_strip_cut() {
+        assert_eq!(topology(0x13), (RECTANGLES, 0));
+        assert_eq!(topology(3), (3, 0));
+        assert_eq!(topology(0x23), (3, 2));
     }
 
     #[test]

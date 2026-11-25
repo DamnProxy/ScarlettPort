@@ -120,7 +120,7 @@ fn inline_f16(c: u8) -> u32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Numeric {
+pub(crate) enum Numeric {
     Unorm,
     Snorm,
     Uscaled,
@@ -135,7 +135,7 @@ enum Numeric {
 /// Formats are numbered in families (`8`, `16`, `8_8`, ...: AMD names
 /// list channels from the highest bits), each with its numeric formats in
 /// the order unorm, snorm, uscaled, sscaled, uint, sint, float.
-fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
+pub(crate) fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     use Numeric::*;
     const NORM: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint];
     const ALL: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint, Float];
@@ -671,6 +671,7 @@ enum Wave {
 // the only mix of old and new lanes that is looked at.
 pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'static str)> {
     use super::wave::{Op, Shape};
+    crate::rules::note("feature:wave");
     const FIRST: Why = "a wave's first-lane number used as data";
     const TOTAL: Why = "a count or sum over the wave used as data";
     const PREFIX: Why = "a count or sum over the lanes below used without a reserved base";
@@ -834,6 +835,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
         Ok((out, reserved))
     };
     let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b)).collect();
+    if sections.iter().any(|s| !s.is_empty()) {
+        crate::rules::note("feature:wave");
+    }
     let order = crate::ir::reverse_postorder(&p.blocks);
     let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
         for &b in &order {
@@ -1695,6 +1699,7 @@ impl<'a> Lower<'a> {
             },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
+                    crate::rules::note("feature:wave");
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
                 }
                 _ => Default::default(),
@@ -1968,6 +1973,7 @@ impl<'a> Lower<'a> {
     /// this host wave's.
     fn shape(&mut self, shape: super::wave::Shape, own: bool) -> Result<V, Why> {
         use super::wave::{Op, Shape};
+        crate::rules::note("feature:wave");
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -3821,6 +3827,7 @@ impl<'a> Lower<'a> {
         (m, e, special)
     }
 
+    // rule-region: begin valu:v_ldexp_f32
     /// `x * 2^n` for a signed integer `n` (`v_ldexp_f32`), rounded once,
     /// to nearest even: in range, `x` with its exponent replaced; past it
     /// infinity; below it the denormal (or zero, or the least normal) that
@@ -3880,7 +3887,9 @@ impl<'a> Lower<'a> {
         let r = self.s.m.select(c, special, bits, r);
         self.as_float(r)
     }
+    // rule-region: end
 
+    // rule-region: begin valu:v_frexp_*
     /// `v_frexp_mant_f32` and `v_frexp_exp_i32_f32` of `f`: `f = mant ×
     /// 2^exp` with |mant| in [0.5, 1) and `f`'s sign; zero, infinity and
     /// NaN give `f` itself and exponent 0, as C's `frexp` (and LLVM, which
@@ -3904,6 +3913,7 @@ impl<'a> Lower<'a> {
         let exp = self.s.m.select(c, special, zero, exp);
         (self.as_float(mant), exp)
     }
+    // rule-region: end
 
     /// An f32 as a 16-bit normalized integer, as `v_cvt_pknorm_*_f32` make
     /// it: clamped to [-1, 1] (`signed`) or [0, 1], times 32767 or 65535,
@@ -5336,6 +5346,7 @@ impl<'a> Lower<'a> {
             // program where its results are needed, and two trace programs
             // came out without their test that way.
             Fields::Image { .. } if name.starts_with("image_bvh") => {
+                crate::rules::note("feature:bvh");
                 return match self.bvh(inst, b, i) {
                     Err(_) if crate::resource::rt_miss() => self.bvh_miss(inst, b, i),
                     r => r,
@@ -7220,6 +7231,36 @@ impl<'a> Lower<'a> {
         Ok(self.as_int(x))
     }
 
+    /// Whether the typed buffer view `src` names is one of three 32-bit
+    /// channels (`words::f3_view_fix`): its descriptor words' format field
+    /// (dword 3 bits 12-18) is 32_32_32_UINT, _SINT or _FLOAT, read from
+    /// the descriptor-words table in the current block. The host then made
+    /// the view one channel wide over the same dwords: element `i`, channel
+    /// `k` is element `3 * i + k` of the host's view. An i1, uniform where
+    /// the descriptor is (a scalar load). None where the descriptor is not
+    /// a heap load's (those keep one element per index).
+    fn f3_format(&mut self, src: &Source) -> Option<V> {
+        use super::words::FORMAT_32_32_32;
+        // (off by default: the translation is what it was before the switch)
+        if !super::words::f3_view_fix() {
+            return None;
+        }
+        let Source::Loaded { load, first } = *src else {
+            return None;
+        };
+        if !self.in_view_heap(load) {
+            return None;
+        }
+        let w3 = self.table_word(load, u32::from(first) + 3).ok()?;
+        let c = self.cur;
+        let (k12, k7f) = (self.s.m.i32(12), self.s.m.i32(0x7F));
+        let f = self.s.m.bin(c, Bin::LShr, w3, k12);
+        let f = self.s.m.bin(c, Bin::And, f, k7f);
+        let (lo, n) = (self.s.m.i32(FORMAT_32_32_32.0), self.s.m.i32(FORMAT_32_32_32.1));
+        let d = self.s.m.bin(c, Bin::Sub, f, lo);
+        Some(self.s.m.cmp(c, pred::IULT, d, n))
+    }
+
     /// Whether the scalar load at `load` reads a view heap (a table or the
     /// resource heap), so its dwords are in the descriptor-words table.
     fn in_view_heap(&self, load: Site) -> bool {
@@ -7541,6 +7582,8 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        // (instructions whose lowering is a region of its own: `crate::rules`)
+        crate::rules::note_op("valu", name);
         let c = self.cur;
         let f = |l: &mut Self, k| l.fsrc(inst, k);
         let s = |l: &mut Self, k| l.src(inst, k);
@@ -7992,6 +8035,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            // rule-region: begin valu:v_ldexp_f32
             "v_ldexp_f32" => {
                 // src0 × 2^src1, src1 a signed integer.
                 let a = f(self, 0)?;
@@ -7999,6 +8043,8 @@ impl<'a> Lower<'a> {
                 let r = self.ldexp(a, n);
                 float(self, r)
             }
+            // rule-region: end
+            // rule-region: begin valu:v_frexp_*
             "v_frexp_mant_f32" => {
                 let a = f(self, 0)?;
                 let (r, _) = self.frexp(a);
@@ -8009,6 +8055,7 @@ impl<'a> Lower<'a> {
                 let (_, r) = self.frexp(a);
                 int(self, r)
             }
+            // rule-region: end
             "v_cvt_off_f32_i4" => {
                 // The low nibble as a signed number of sixteenths: 8 is -0.5,
                 // 7 is 0.4375 (an interpolation offset).
@@ -11123,7 +11170,7 @@ impl<'a> Lower<'a> {
             return Err(name);
         }
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let mut guard = self.guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
@@ -11433,10 +11480,40 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                let element = index.unwrap_or(self.s.m.i32(0));
+                args.extend([h, element, iu]);
                 for x in vals {
                     args.push(self.as_float(x));
+                }
+                if let Some(is3) = self.f3_format(src) {
+                    // A float3 view (one channel wide on the host): x, y
+                    // and z to elements 3i, 3i + 1, 3i + 2 where the format
+                    // says so (w has no place); the store below elsewhere.
+                    let c = self.cur;
+                    let yes = self.s.m.bool(true);
+                    let not3 = self.s.m.bin(c, Bin::Xor, is3, yes);
+                    let (g3, other) = match guard {
+                        Some(g) => (
+                            self.s.m.bin(c, Bin::And, g, is3),
+                            self.s.m.bin(c, Bin::And, g, not3),
+                        ),
+                        None => (is3, not3),
+                    };
+                    let three = self.s.m.i32(3);
+                    let first = self.s.m.bin(c, Bin::Mul, element, three);
+                    let at = self.begin_guarded(Some(g3));
+                    let (mask, void) = (self.s.m.i8(0xF), self.s.t.void);
+                    for k in 0..3 {
+                        let kk = self.s.m.i32(k);
+                        let e = self.s.m.bin(self.cur, Bin::Add, first, kk);
+                        let x = args[3 + k as usize];
+                        let a = [h, e, iu, x, x, x, x, mask];
+                        self.s
+                            .op(self.cur, "bufferStore.f32", Attr::NoUnwind, void, 69, &a);
+                    }
+                    self.end_guarded(at, &[]);
+                    guard = Some(other);
                 }
                 (69, "bufferStore.f32")
             } else {
@@ -11487,6 +11564,8 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // Channels read otherwise than from one result (a float3 view).
+        let mut channels: Option<Vec<V>> = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -11496,14 +11575,21 @@ impl<'a> Lower<'a> {
             }
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
+            match self.f3_format(src) {
+                Some(is3) => {
+                    let (r, xyzw) = self.f3_load(h, index, is3, count);
+                    channels = Some(xyzw);
+                    r
+                }
+                None => self.s.op(
+                    c,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                ),
+            }
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
@@ -11552,6 +11638,12 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
+        // (A float3 view's reads end in a later block.)
+        let c = self.cur;
+        let channel = |l: &mut Self, k: u32| match &channels {
+            Some(xyzw) => xyzw[k as usize],
+            None => l.s.m.extract(c, r, k),
+        };
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);
@@ -11559,7 +11651,7 @@ impl<'a> Lower<'a> {
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
+                    let f = channel(self, ch);
                     let h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
@@ -11576,11 +11668,49 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
+            let x = channel(self, k);
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// A typed load of element `index` through handle `h` whose view may be
+    /// a float3 one made one channel wide (`is3`, from [`Self::f3_format`]):
+    /// the first result and channels x, y, z, w (f32). Element `3i` (or `i`)
+    /// gives x and, on either view, the w the host's view has for a missing
+    /// channel; y and z are elements `3i + 1` and `3i + 2` read in a branch
+    /// only float3 views take (uniform where `is3` is), the three-channel
+    /// result's y and z otherwise. Only the `channels` the instruction
+    /// writes are read.
+    fn f3_load(&mut self, h: V, index: V, is3: V, channels: u32) -> (V, Vec<V>) {
+        let c = self.cur;
+        let iu = self.s.m.undef(self.s.t.i32);
+        let three = self.s.m.i32(3);
+        let first = self.s.m.bin(c, Bin::Mul, index, three);
+        let at = self.s.m.select(c, is3, first, index);
+        let rt = self.s.t.res_ret;
+        let r = self
+            .s
+            .op(c, "bufferLoad.f32", Attr::ReadOnly, rt, 68, &[h, at, iu]);
+        let mut xyzw: Vec<V> = (0..4).map(|k| self.s.m.extract(c, r, k)).collect();
+        if channels > 1 {
+            let at = self.begin_guarded(Some(is3));
+            let mut inside = Vec::new();
+            for k in 1..channels.min(3) {
+                let b = self.cur;
+                let kk = self.s.m.i32(k);
+                let e = self.s.m.bin(b, Bin::Add, first, kk);
+                let rk = self
+                    .s
+                    .op(b, "bufferLoad.f32", Attr::ReadOnly, rt, 68, &[h, e, iu]);
+                inside.push((self.s.m.extract(b, rk, 0), xyzw[k as usize]));
+            }
+            for (k, v) in self.end_guarded(at, &inside).into_iter().enumerate() {
+                xyzw[k + 1] = v;
+            }
+        }
+        (r, xyzw)
     }
 
     /// Geometry: an LDS read takes input vertex data, an LDS write stores
@@ -12612,6 +12742,260 @@ mod tests {
             mesh_stride: 0,
             dropped: Vec::new(),
         })
+    }
+
+    /// How the host made a typed buffer view of title dwords `data`.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum HostView {
+        /// Three 32-bit channels (R32G32B32: `VICTORY_F3_VIEW_FIX` off).
+        Three,
+        /// One channel over the same dwords (R32: the switch on).
+        One,
+        /// Four channels (R32G32B32A32, not a float3 view).
+        Four,
+    }
+
+    impl HostView {
+        fn channels(self) -> usize {
+            match self {
+                HostView::Three => 3,
+                HostView::One => 1,
+                HostView::Four => 4,
+            }
+        }
+    }
+
+    const F32_ONE: u64 = 0x3F80_0000;
+
+    /// The float3 programs: s1 the table (two views: a typed SRV at 0, a
+    /// UAV at 0x20), s0 the element. `store_typed`: the element read is
+    /// written to the UAV's same element (typed); else its four channels
+    /// to the UAV's first 16 bytes (raw).
+    fn f3_program(store_typed: bool) -> (Vec<u32>, Vec<RootParam>, Vec<UsedResource>) {
+        let mut words = vec![
+            0xBE84_0301, // s_mov_b32 s4, s1: the table
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0: the typed view
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20: the UAV
+            0x7E0A_0200, // v_mov_b32 v5, s0: the element
+            0xE00C_2000,
+            0x8002_0105, // buffer_load_format_xyzw v[1:4], v5, s[8:11], 0 idxen
+        ];
+        if store_typed {
+            // buffer_store_format_xyzw v[1:4], v5, s[12:15], 0 idxen
+            words.extend([0xE01C_2000, 0x8003_0105]);
+        } else {
+            // buffer_store_dwordx4 v[1:4], off, s[12:15], 0
+            words.extend([0xE078_0000, 0x8003_0100]);
+        }
+        words.push(S_ENDPGM);
+        let layout = vec![
+            RootParam {
+                sgprs: 1,
+                ..root(RootType::Constants, 0, 0)
+            },
+            root(RootType::Table, 1, 1),
+        ];
+        let entry = |kind, table_offset_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 1,
+            slot: 1,
+        };
+        (words, layout, vec![entry(ResourceType::Srv, 0), entry(ResourceType::Uav, 8)])
+    }
+
+    /// Runs a lowered float3 program on the CPU: element `element`, the
+    /// typed view `src` (its words' format `format`, the host's view of the
+    /// title dwords `data`), the UAV `dst` the same way (typed stores) with
+    /// `out` its title dwords. Returns the raw store's dwords (raw
+    /// programs) and the UAV's title dwords after the run.
+    #[allow(clippy::too_many_arguments)]
+    fn f3_run(
+        m: &super::super::bitcode::Module,
+        element: u32,
+        data: &[u32],
+        src: HostView,
+        format: u32,
+        dst: HostView,
+        dst_format: u32,
+        out: &mut Vec<u32>,
+    ) -> Vec<u32> {
+        use super::super::shader::{ROOT_CBV_SPACE, SLOT_WORDS, USER_DATA_SPACE};
+        use super::super::words::{Shape, WORDS, console_words};
+        const TABLE: u32 = 0x40; // slots 2 (the typed view) and 3 (the UAV)
+        let mut table = vec![0u32; (WORDS * 8) as usize];
+        for (slot, f, n) in [(2, format, data.len()), (3, dst_format, out.len())] {
+            let w = console_words(&Shape::Buffer {
+                address: 0x1000,
+                stride: 12,
+                records: n as u32 / 3,
+                format: f,
+            });
+            table[slot * WORDS as usize..][..8].copy_from_slice(&w);
+        }
+        let user = [element, TABLE, 0, 0, 0, 0, 0, 0];
+        const BINDING: u64 = 1 << 40;
+        let mut raw = vec![0u32; 4];
+        let view_load = |view: HostView, dwords: &[u32], i: u64| -> Vec<u64> {
+            let n = view.channels() as u64;
+            let mut r = vec![0, 0, 0, F32_ONE, 0];
+            if (i + 1) * n <= dwords.len() as u64 {
+                for k in 0..n {
+                    r[k as usize] = u64::from(dwords[(i * n + k) as usize]);
+                }
+            }
+            r
+        };
+        super::super::bitcode::interp::run(m, &mut |name, a| {
+            let s = |k: usize| a[k][0];
+            match name {
+                "createHandleFromBinding" => {
+                    // {lower, upper, space, class}, index, non-uniform
+                    vec![BINDING | a[1][2] << 20 | a[1][3] << 16 | a[1][0]]
+                }
+                "createHandleFromHeap" => vec![s(1)],
+                "annotateHandle" => vec![s(1)],
+                "binary.i32" => vec![match s(0) {
+                    39 => s(1).max(s(2)),
+                    40 => s(1).min(s(2)),
+                    37 => (s(1) as u32 as i32).max(s(2) as u32 as i32) as u32 as u64,
+                    38 => (s(1) as u32 as i32).min(s(2) as u32 as i32) as u32 as u64,
+                    op => panic!("binary {op}"),
+                }],
+                "cbufferLoadLegacy.i32" => {
+                    let h = s(1);
+                    let row = s(2) as usize;
+                    if h == BINDING | u64::from(USER_DATA_SPACE) << 20 | 2 << 16 {
+                        (0..4).map(|k| u64::from(*user.get(4 * row + k).unwrap_or(&0))).collect()
+                    } else {
+                        vec![0; 4]
+                    }
+                }
+                "rawBufferLoad.f32" => {
+                    let words = BINDING
+                        | u64::from(ROOT_CBV_SPACE) << 20
+                        | u64::from(SLOT_WORDS);
+                    assert_eq!(s(1), words, "a raw read of the words table only");
+                    let at = s(2) as usize / 4;
+                    let mut r: Vec<u64> =
+                        (0..4).map(|k| u64::from(*table.get(at + k).unwrap_or(&0))).collect();
+                    r.push(0);
+                    r
+                }
+                "bufferLoad.f32" => {
+                    assert_eq!(s(1), 2, "the typed view's slot");
+                    view_load(src, data, s(2))
+                }
+                "rawBufferStore.i32" => {
+                    assert_eq!(s(1), 3);
+                    let at = s(2) as usize / 4;
+                    let mask = s(8);
+                    for k in 0..4 {
+                        if mask >> k & 1 != 0 {
+                            raw[at + k] = s(4 + k) as u32;
+                        }
+                    }
+                    vec![]
+                }
+                "bufferStore.f32" => {
+                    assert_eq!(s(1), 3);
+                    let (i, n) = (s(2) as usize, dst.channels());
+                    if (i + 1) * n <= out.len() {
+                        for k in 0..n {
+                            out[i * n + k] = s(4 + k) as u32;
+                        }
+                    }
+                    vec![]
+                }
+                _ => vec![0; 5],
+            }
+        });
+        raw
+    }
+
+    fn f3_module(store_typed: bool) -> super::super::bitcode::Module {
+        super::super::words::f3_view_fix_for_this_test();
+        let (words, layout, used) = f3_program(store_typed);
+        lower_with(&words, layout, used).expect("lower");
+        super::super::bitcode::interp::last().expect("the module")
+    }
+
+    /// Differential: a typed load of element i of a float3 view reads
+    /// title dwords 3i, 3i+1, 3i+2 (and w = 1) through either host view
+    /// shape, the words' format telling the program which it has; a
+    /// four-channel view keeps one element per index.
+    #[test]
+    fn float3_typed_loads_read_the_same_dwords_through_either_view() {
+        use super::super::words::FORMAT_32_32_32;
+        let m = f3_module(false);
+        let data: Vec<u32> = (0..24).map(|n| 0x4000_0000 + n).collect();
+        let float3 = FORMAT_32_32_32.0 + 2;
+        for i in 0..8u32 {
+            let i3 = 3 * i as usize;
+            let want = [data[i3], data[i3 + 1], data[i3 + 2], F32_ONE as u32];
+            let mut none = Vec::new();
+            // The switch on: one channel, the format in the words.
+            let on = f3_run(&m, i, &data, HostView::One, float3, HostView::One, 0, &mut none);
+            assert_eq!(on, want, "element {i}, one-channel view");
+            // Off: three channels, no format.
+            let off = f3_run(&m, i, &data, HostView::Three, 0, HostView::One, 0, &mut none);
+            assert_eq!(off, want, "element {i}, three-channel view");
+            // UINT and SINT float3 views: the same dwords.
+            for f in [FORMAT_32_32_32.0, FORMAT_32_32_32.0 + 1] {
+                let r = f3_run(&m, i, &data, HostView::One, f, HostView::One, 0, &mut none);
+                assert_eq!(r, want, "element {i}, format {f}");
+            }
+        }
+        // Not a float3 view: four channels per index, as before.
+        for i in 0..6u32 {
+            let i4 = 4 * i as usize;
+            let mut none = Vec::new();
+            let r = f3_run(&m, i, &data, HostView::Four, 77, HostView::One, 0, &mut none);
+            assert_eq!(r, data[i4..i4 + 4], "element {i}, four channels");
+        }
+    }
+
+    /// Differential: a typed store of element i to a float3 UAV writes
+    /// title dwords 3i..3i+2 and nothing else, through either view shape.
+    #[test]
+    fn float3_typed_stores_write_the_same_dwords_through_either_view() {
+        use super::super::words::FORMAT_32_32_32;
+        let m = f3_module(true);
+        let data: Vec<u32> = (0..24).map(|n| 0x4000_0000 + n).collect();
+        let float3 = FORMAT_32_32_32.0 + 2;
+        for i in 0..8u32 {
+            let i3 = 3 * i as usize;
+            let mut want = vec![0xDEAD_0000u32; 24];
+            want[i3..i3 + 3].copy_from_slice(&data[i3..i3 + 3]);
+            for (src, dst, f) in [
+                (HostView::One, HostView::One, float3),
+                (HostView::Three, HostView::Three, 0),
+            ] {
+                let mut out = vec![0xDEAD_0000u32; 24];
+                f3_run(&m, i, &data, src, f, dst, f, &mut out);
+                assert_eq!(out, want, "element {i}, {src:?} views");
+            }
+        }
+    }
+
+    /// The lowering of a typed load or store through a heap descriptor
+    /// reads the descriptor's format from the words table; the y and z
+    /// reads of a float3 view sit in a branch of their own.
+    #[test]
+    fn typed_buffer_accesses_read_the_format_word() {
+        super::super::words::f3_view_fix_for_this_test();
+        for typed_store in [false, true] {
+            let (words, layout, used) = f3_program(typed_store);
+            let l = lower_with(&words, layout, used).expect("lower");
+            assert!(l.root_srvs.contains(&super::super::shader::SLOT_WORDS));
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

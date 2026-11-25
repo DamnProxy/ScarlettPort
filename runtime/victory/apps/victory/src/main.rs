@@ -112,6 +112,16 @@ enum Command {
         /// Only translate: no host pipelines.
         #[arg(long)]
         no_pipelines: bool,
+        /// Bring the cache up to date with this build's translator and say how much of it
+        /// changed: entries of another translator build whose rules did not change are
+        /// restamped, the others translated again and compared; a shader whose output is
+        /// the same keeps its entry and its compiled pipelines.
+        #[arg(long)]
+        incremental: bool,
+        /// With --incremental: translate every shader again whatever its entry's rule stamp
+        /// says (the check on the stamps).
+        #[arg(long, requires = "incremental")]
+        verify_all: bool,
     },
     /// Make the host pipelines of the graphics records of the title's
     /// precompiled pipeline cache (in its shaders.rpf) into the pipeline
@@ -221,7 +231,6 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
         Command::PrecompileGraphics {
             archive,
             jobs,
@@ -229,6 +238,13 @@ fn main() -> Result<()> {
             skip,
             mesh,
         } => translate::precompile_graphics(archive, jobs, limit, skip, mesh),
+        Command::Warm {
+            paths,
+            jobs,
+            no_pipelines,
+            incremental,
+            verify_all,
+        } => translate::warm(paths, jobs, !no_pipelines, incremental, verify_all),
         Command::Run {
             exe,
             unimplemented,

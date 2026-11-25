@@ -86,6 +86,98 @@ pub(crate) struct Shadow {
     /// With `nosnap`: title bytes the runtime overwrote during the flight,
     /// as they were before ([`title_will_change`]).
     pre: Mutex<victory_core::mem2::PreImages>,
+    /// `VICTORY_COPY_BACK_ONLY_READBACK` (`crate::readback`): the ranges of
+    /// `pending` whose shader writes stay in the copy (title address, end,
+    /// the write-watch asking they were declared after, the submission
+    /// that first declared them, [`PREPARED`]): no snapshot, and left out
+    /// of every copy-back. Locked inside `pending`'s lock.
+    owning: Mutex<Vec<(usize, usize, u64, u64)>>,
+    /// Those whose submissions are done ([`Shadow::copy_back_done`]): the
+    /// copy holds the truth of these bytes, title memory the bytes from
+    /// before. Never locked while `pending` is taken.
+    owned: Mutex<victory_core::gpuown::Owned>,
+}
+
+/// `VICTORY_COPY_BACK_ONLY_READBACK`: the copies with owned bytes (`owning`
+/// or `owned` not empty), by their span.
+static OWNERS: Mutex<victory_core::gpuown::Spans<std::sync::Weak<Shadow>>> = Mutex::new(victory_core::gpuown::Spans::new());
+/// How many there are, read without the lock.
+static OWNERS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The mark of a declared range the title wrote over while a flight held
+/// it: any write found counts, so the title's bytes win when it lands.
+const TITLE_WROTE: u64 = 0;
+
+thread_local! {
+    /// The copies whose owned bytes this thread is putting into title
+    /// memory ([`Shadow::materialize`]): their own writes are not theirs to
+    /// look at again.
+    static PUTTING: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The copies with owned bytes whose span meets `[at, end)`.
+fn owners_over(at: usize, end: usize) -> Vec<Arc<Shadow>> {
+    if OWNERS_COUNT.load(Ordering::Relaxed) == 0 || at >= end {
+        return Vec::new();
+    }
+    let owners = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+    owners.overlapping(at, end).into_iter().filter_map(|(_, w)| w.upgrade()).collect()
+}
+
+/// `VICTORY_COPY_BACK_ONLY_READBACK`: something other than a copy's own
+/// refresh is about to read title memory `[at, at + len)` (a title buffer
+/// copy run on the CPU, a fill of upload memory, a texture, another host
+/// copy: `except` names that copy, 0 for none). The bytes shaders wrote
+/// there and that stayed in a copy go into title memory first.
+pub(crate) fn own_read(at: usize, len: usize, except: u64) {
+    let end = at.saturating_add(len);
+    for s in owners_over(at / PAGE * PAGE, end.div_ceil(PAGE).saturating_mul(PAGE)) {
+        if s.id != except {
+            s.materialize(at, len, false);
+        }
+    }
+}
+
+/// [`own_read`] of all title memory (a step of ours whose reads are not
+/// known).
+pub(crate) fn own_read_all() {
+    if OWNERS_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let all: Vec<Arc<Shadow>> = {
+        let owners = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+        owners.all().into_iter().filter_map(|(_, w)| w.upgrade()).collect()
+    };
+    for s in all {
+        let (start, len) = (s.start as usize, s.len as usize);
+        s.materialize(start, len, false);
+    }
+}
+
+/// `VICTORY_COPY_BACK_ONLY_READBACK`: the runtime is about to write title
+/// memory `[at, at + len)`. Owned bytes there are the title's from now on;
+/// owned bytes beside them on the same 64 KiB pages go into title memory
+/// first (the write shows as a title write of the whole page, which would
+/// give them to the title too).
+pub(crate) fn own_write(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    for s in owners_over(at / PAGE * PAGE, end.div_ceil(PAGE).saturating_mul(PAGE)) {
+        if !PUTTING.with(|p| p.borrow().contains(&s.id)) {
+            s.materialize(at, len, true);
+        }
+    }
+}
+
+/// For the memcopy line: owned bytes now, and the copies holding them.
+pub(crate) fn owned_now() -> (u64, u64) {
+    if OWNERS_COUNT.load(Ordering::Relaxed) == 0 {
+        return (0, 0);
+    }
+    let all: Vec<Arc<Shadow>> = {
+        let owners = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+        owners.all().into_iter().filter_map(|(_, w)| w.upgrade()).collect()
+    };
+    let bytes = all.iter().map(|s| s.owned.lock().unwrap_or_else(|e| e.into_inner()).bytes() as u64).sum();
+    (bytes, all.len() as u64)
 }
 
 /// `VICTORY_MEM2_GPU_ONLY_NOSNAP`: the copies whose declared ranges have no
@@ -117,6 +209,9 @@ fn nosnap_over(at: usize, len: usize) -> Vec<Arc<Shadow>> {
 /// memory after their flight keep the bytes from before the write.
 pub(crate) fn title_will_change(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
+    if len != 0 {
+        own_write(at, len);
+    }
     if NOSNAP_COUNT.load(Relaxed) == 0 || len == 0 {
         return;
     }
@@ -150,6 +245,9 @@ pub(crate) fn title_changed(at: usize, len: usize) {
 /// `victory-hle` xmem: the page shown at GPU-only address `at` is now shown
 /// where the CPU can reach it too, so the title may write it from now on.
 pub fn gpu_only_exposed(at: usize) {
+    // Not a write: owned bytes there go into title memory, where the CPU
+    // may read them from now on (and are then no longer owned).
+    own_read(at / PAGE * PAGE, PAGE, 0);
     title_will_change(at / PAGE * PAGE, PAGE);
 }
 
@@ -1584,6 +1682,12 @@ pub(crate) static POOL_LIVE: [std::sync::atomic::AtomicU64; 3] = [const { std::s
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if OWNERS_COUNT.load(Ordering::Relaxed) != 0 {
+            let mut owners = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+            if owners.remove(self.id).is_some() {
+                OWNERS_COUNT.store(owners.len(), Ordering::Relaxed);
+            }
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -1792,6 +1896,9 @@ pub(crate) fn let_go_idle() {
         });
     }
     for shadow in gone {
+        // What shaders wrote and stayed in it goes into title memory, as
+        // its copy-back would have put it there.
+        shadow.materialize(shadow.start as usize, shadow.len as usize, false);
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
@@ -1934,6 +2041,8 @@ impl Shadow {
             rebar: 0,
             nosnap: std::sync::atomic::AtomicBool::new(false),
             pre: Mutex::default(),
+            owning: Mutex::default(),
+            owned: Mutex::new(victory_core::gpuown::Owned::new(PAGE)),
         }
     }
 
@@ -1954,6 +2063,296 @@ impl Shadow {
             && crate::watch::all_gpu_only(start, len)
             && crate::mem2::cpu_free(start, len)
             && !crate::readback::tagged_in(self.start, self.len)
+    }
+
+    /// `VICTORY_COPY_BACK_ONLY_READBACK`: whether what shaders write in
+    /// `[address, address + len)` stays in the copy. Not for a read-back
+    /// buffer's range, nor beside one on the same 64 KiB page (its
+    /// copy-back writes the page, which would read as the title's write
+    /// over the bytes that stayed), nor on a page where the title wrote
+    /// over bytes that stayed before (`Owned::demoted`): those go back from
+    /// then on, merged with the title's as without the switch.
+    fn own_instead(&self, address: usize, len: usize) -> bool {
+        let end = address.saturating_add(len);
+        let (lo, hi) = (address / PAGE * PAGE, end.div_ceil(PAGE).saturating_mul(PAGE));
+        !self.owned.lock().unwrap_or_else(|e| e.into_inner()).demoted(address, end)
+            && !crate::readback::copy_back(address as u64, len as u64)
+            && !crate::readback::tagged_in(lo as u64, (hi - lo) as u64)
+    }
+
+    /// [`Shadow::writing`] of a range whose shader writes stay in the copy:
+    /// pending (refreshes leave it alone, the flight holds it), without a
+    /// snapshot, marked with the write-watch asking it follows.
+    fn writing_owned(self: &Arc<Self>, range: (usize, usize)) {
+        let mark = crate::watch::moment();
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if relay() {
+                self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
+            }
+            let mut owning = self.owning.lock().unwrap_or_else(|e| e.into_inner());
+            // A range a submission sent earlier still holds keeps that
+            // submission's number: the card may be writing it.
+            match owning.iter_mut().find(|r| (r.0, r.1) == range) {
+                Some(r) if r.2 != TITLE_WROTE => r.2 = r.2.max(mark),
+                Some(_) => {}
+                None => owning.push((range.0, range.1, mark, PREPARED.load(Ordering::Relaxed))),
+            }
+            if !pending.contains(&range) {
+                pending.push(range);
+            }
+        }
+        let mut owners = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+        if !owners.contains(self.id) {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            owners.insert(start, end, self.id, Arc::downgrade(self));
+            OWNERS_COUNT.store(owners.len(), Ordering::Relaxed);
+        }
+    }
+
+    /// Offsets `(at, bytes)` of the copy, cut to leave out the ranges whose
+    /// shader writes stay in it (`owning`): not copied back.
+    fn clip_owning(&self, pieces: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        let owning: Vec<(usize, usize)> = self
+            .owning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|&(a, e, _, _)| (a, e))
+            .collect();
+        if owning.is_empty() {
+            return pieces;
+        }
+        let start = self.start as usize;
+        let mut out = Vec::with_capacity(pieces.len());
+        for (at, n) in pieces {
+            let parts = victory_core::gpuown::subtract(start + at, start + at + n, owning.iter().copied());
+            out.extend(parts.into_iter().map(|(a, e)| (a - start, e - a)));
+        }
+        out
+    }
+
+    /// Ranges of `owning` whose submissions are all done (`landed`, as
+    /// declared): their bytes are owned. Called with `pending` locked.
+    fn owned_landed(&self, landed: &[(usize, usize)]) {
+        let done: Vec<(usize, usize, u64)> = {
+            let mut owning = self.owning.lock().unwrap_or_else(|e| e.into_inner());
+            if owning.is_empty() {
+                return;
+            }
+            let mut done = Vec::new();
+            owning.retain(|&(a, e, mark, _)| {
+                let free = landed.contains(&(a, e));
+                if free {
+                    done.push((a, e, mark));
+                }
+                !free
+            });
+            done
+        };
+        if done.is_empty() {
+            return;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+        for &(a, e, mark) in &done {
+            owned.own(a.max(start), e.min(end), mark);
+        }
+        drop(owned);
+        // The shaders changed the copy there and no compare said so: a kept
+        // snapshot is not current.
+        for &(a, e, _) in &done {
+            let (from, to) = self.inside(a, e.saturating_sub(a));
+            self.changed(from, to);
+        }
+    }
+
+    /// Owned bytes in `[from, to)` (title addresses) on pages the title
+    /// wrote after they were declared are the title's again (its bytes
+    /// win; the pages are demoted, ranges there go back from then on).
+    /// Counted, the first ones logged. Where the write watching cannot
+    /// say, the copy's bytes stay.
+    fn owned_conflicts(&self, from: usize, to: usize) {
+        let held = self.owned.lock().unwrap_or_else(|e| e.into_inner()).within(from, to);
+        let (Some(first), Some(last)) = (held.first(), held.last()) else {
+            return;
+        };
+        let (lo, hi) = (first.0, last.1);
+        if let Some(written) = self.title_writes(lo, hi) {
+            self.take_conflicts(lo, hi, &written);
+        }
+    }
+
+    /// The pages of `[lo, hi)` the title wrote and the asking that last
+    /// found each (`crate::watch::writes`); `None` where the write watching
+    /// cannot say.
+    fn title_writes(&self, lo: usize, hi: usize) -> Option<Vec<(usize, u64)>> {
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED || lo >= hi {
+            return None;
+        }
+        crate::watch::writes(lo, hi, true).map(|(_, written)| written)
+    }
+
+    /// [`Shadow::owned_conflicts`] with the writes asked for.
+    fn take_conflicts(&self, lo: usize, hi: usize, written: &[(usize, u64)]) {
+        if written.is_empty() {
+            return;
+        }
+        let back = self.owned.lock().unwrap_or_else(|e| e.into_inner()).title_wrote(lo, hi, written);
+        if back.is_empty() {
+            return;
+        }
+        let bytes: usize = back.iter().map(|&(a, e)| e - a).sum();
+        crate::memcopy::add(crate::memcopy::M::OwnConflicts, back.len() as u64);
+        crate::memcopy::add(crate::memcopy::M::OwnConflictBytes, bytes as u64);
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+            tracing::warn!(
+                copy = self.id,
+                at = format_args!("{:#x}", back[0].0),
+                bytes,
+                "VICTORY_COPY_BACK_ONLY_READBACK: the title wrote a page holding shader results that stayed in the copy; \
+                 its bytes win there, and ranges on that page are copied back from now on"
+            );
+        }
+    }
+
+    /// For [`Shadow::update`] of `[from, to)`: the owned ranges in it, cut
+    /// to it, after the title's writes took theirs back.
+    fn owned_held(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        {
+            let owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+            if owned.is_empty() || !owned.overlaps(from, to) {
+                return Vec::new();
+            }
+        }
+        self.owned_conflicts(from, to);
+        self.owned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .within(from, to)
+            .into_iter()
+            .map(|(a, e, _)| (a, e))
+            .collect()
+    }
+
+    /// Owned bytes on the 64 KiB pages of `[at, at + len)` go into title
+    /// memory and are owned no more ([`own_read`], [`own_write`]); with
+    /// `writing`, those inside `[at, at + len)` are only let go (the
+    /// runtime writes them next). Bytes the title wrote over since are its
+    /// own ([`Shadow::owned_conflicts`]); ranges a flight in the air may be
+    /// writing (`owning`, declared by a submission sent before this one)
+    /// are left (a reader waited for such flights first). Ranges declared
+    /// only by the submission being prepared are not written yet: the
+    /// bytes from the flights before go to title memory like the others
+    /// (a dispatch writing a buffer and a title copy out of it in the same
+    /// submission: the copy runs at preparing, before the card), and their
+    /// marks move past this write, which is not the title's. Whole pages:
+    /// what is written into title memory shows as a title write of the
+    /// page, which would give the rest to the title. Returns the bytes
+    /// written.
+    fn materialize(&self, at: usize, len: usize, writing: bool) -> usize {
+        let end = at.saturating_add(len);
+        let (start, stop) = (self.start as usize, (self.start + self.len) as usize);
+        let (lo, hi) = ((at / PAGE * PAGE).max(start), end.div_ceil(PAGE).saturating_mul(PAGE).min(stop));
+        if lo >= hi || !self.owned.lock().unwrap_or_else(|e| e.into_inner()).overlaps(lo, hi) {
+            return 0;
+        }
+        // The title's writes so far (asked of the kernel now): owned bytes
+        // it wrote over are its own; a declared range it wrote over keeps
+        // that (its mark is set below every asking, so the write counts
+        // when it lands), as the asking after our own write below moves the
+        // others' marks past it.
+        let watched = self.watched.load(Ordering::Relaxed) != NOT_WATCHED;
+        let before = if watched { crate::watch::consume(lo, hi).map(|(_, written)| written) } else { None };
+        if let Some(written) = &before {
+            self.take_conflicts(lo, hi, written);
+        }
+        let now = PREPARED.load(Ordering::Relaxed);
+        let flying: Vec<(usize, usize)> = {
+            let mut owning = self.owning.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(written) = &before {
+                for r in owning.iter_mut().filter(|r| r.0 < hi && lo < r.1) {
+                    let (a, e) = (r.0.max(lo), r.1.min(hi));
+                    if written.iter().any(|&(page, write)| write > r.2 && page * PAGE < e && a < (page + 1) * PAGE) {
+                        r.2 = TITLE_WROTE;
+                    }
+                }
+            }
+            owning
+                .iter()
+                .filter(|&&(_, _, _, number)| number != now)
+                .map(|&(a, e, _, _)| (a, e))
+                .collect()
+        };
+        let take: Vec<(usize, usize)> = {
+            let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+            let mut out = Vec::new();
+            for (a, e, _) in owned.within(lo, hi) {
+                for (p, q) in victory_core::gpuown::subtract(a, e, flying.iter().copied()) {
+                    out.extend(owned.release(p, q));
+                }
+            }
+            out
+        };
+        PUTTING.with(|p| p.borrow_mut().push(self.id));
+        let mut written = 0;
+        for (a, e) in take {
+            let parts = if writing { victory_core::gpuown::subtract(a, e, [(at, end)]) } else { vec![(a, e)] };
+            for (p, q) in parts {
+                written += self.put_title(p, q);
+            }
+        }
+        PUTTING.with(|p| {
+            let mut p = p.borrow_mut();
+            if let Some(i) = p.iter().rposition(|&id| id == self.id) {
+                p.remove(i);
+            }
+        });
+        if written != 0 {
+            // Our write shows as the title's at the next asking: asked now,
+            // and what is still owned or declared on these pages counts
+            // from this asking on (but a range the title wrote over above).
+            if watched && let Some((asked, _)) = crate::watch::consume(lo, hi) {
+                let mut owning = self.owning.lock().unwrap_or_else(|e| e.into_inner());
+                for r in owning.iter_mut().filter(|r| r.0 < hi && lo < r.1 && r.2 != TITLE_WROTE) {
+                    r.2 = r.2.max(asked);
+                }
+                drop(owning);
+                self.owned.lock().unwrap_or_else(|e| e.into_inner()).remark(lo, hi, asked);
+            }
+        }
+        crate::memcopy::add(crate::memcopy::M::OwnPut, written as u64);
+        written
+    }
+
+    /// The copy's bytes `[a, e)` (title addresses) into title memory, where
+    /// they differ, as a copy-back writes them: the guards and the
+    /// journal are told, so other copies of the memory copy them again.
+    /// Returns the bytes written.
+    fn put_title(&self, a: usize, e: usize) -> usize {
+        let start = self.start as usize;
+        let mut title = vec![0u8; PIECE];
+        let (mut at, mut written) = (a, 0);
+        while at < e {
+            let n = (PIECE - at % PIECE).min(e - at);
+            // SAFETY: inside the copy's mapping (`[a, e)` is owned, so in
+            // the copy); no flight writes owned bytes (`owning` is left).
+            let host = unsafe { std::slice::from_raw_parts(self.data.add(at - start), n) };
+            let title = &mut title[..n];
+            if crate::host::read_into(at as *const u8, title)
+                && let Some(first) = first_difference(host, title)
+            {
+                let last = last_difference(host, title).unwrap_or(first);
+                let (p, m) = (at + first, last + 1 - first);
+                crate::watch::writing_soft(p, m);
+                crate::host::write_mapped(p as *mut u8, host[first..].as_ptr(), m);
+                crate::watch::wrote(p, m);
+                written += m;
+            }
+            at += n;
+        }
+        written
     }
 
     /// The parts (offsets in the copy) newly declared in a flight without a
@@ -2123,10 +2522,11 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        // Testing switch: only the title's read-back buffers are copied back.
-        if !crate::readback::copy_back(address, len) {
-            return;
-        }
+        // With `VICTORY_COPY_BACK_ONLY_READBACK` the range is still
+        // declared: flights in the air hold it (readers of title memory
+        // wait for them), and refreshes leave it alone. Whether its bytes
+        // go back or stay in the copy is decided at submission
+        // ([`Shadow::writing`]).
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2143,6 +2543,24 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
+        if crate::readback::enabled() && self.card.is_none() && !crate::mem2::nosnap() {
+            // Dispatches declare the same ranges thousands of times: one
+            // owned already in a flight stays so.
+            let owning = self
+                .owning
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|&(a, e, _, _)| (a, e) == range);
+            if owning || self.own_instead(address, len) {
+                self.writing_owned(range);
+                return;
+            }
+            // Copied back: bytes of it that stayed in the copy before go
+            // into title memory now (no shader writes them yet), so that
+            // the copy-back's compare and merge see title memory current.
+            self.materialize(address, len, false);
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -2305,6 +2723,8 @@ impl Shadow {
                 Some(found) => found,
                 None => self.differing(from, to, before),
             };
+            // Ranges whose shader writes stay in the copy have no snapshot.
+            let differing = self.clip_owning(differing);
             #[cfg(feature = "diagnostics")]
             let syncing = {
                 use crate::copystat::{C, add};
@@ -2405,6 +2825,15 @@ impl Shadow {
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        // Ranges whose shader writes stay in the copy have no snapshot.
+        self.clip_owning(vec![(at, n)])
+            .into_iter()
+            .map(|(at, n)| self.relay_merge_piece(at, n, now, title))
+            .sum()
+    }
+
+    /// [`Shadow::relay_merge`] of a stretch that goes back.
+    fn relay_merge_piece(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
@@ -2516,8 +2945,10 @@ impl Shadow {
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
             pending.retain(|r| !free.contains(r));
+            self.owned_landed(&free);
         } else {
             pending.retain(|r| !ranges.contains(r));
+            self.owned_landed(ranges);
         }
         if !pending.is_empty() || self.card.is_some() {
             return;
@@ -2662,6 +3093,15 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
+        // A range whose shader writes stay in the copy has no snapshot to
+        // take the title's bytes: the flights are settled, and the title's
+        // write is taken after (`Shadow::owned_conflicts`).
+        {
+            let owning = self.owning.lock().unwrap_or_else(|e| e.into_inner());
+            if busy.iter().any(|&(a, e)| owning.iter().any(|&(p, q, _, _)| p < e && a < q)) {
+                return true;
+            }
+        }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
@@ -2774,6 +3214,18 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        // `VICTORY_COPY_BACK_ONLY_READBACK`: what shaders wrote and stayed
+        // here is newer than title memory; left alone like a range being
+        // written (a page only partly refreshed, or written by the title
+        // beside them, was copied over them every time).
+        // Taken before the title's writes are looked at: one numbered after
+        // it is seen again by the next refresh, both as a write over owned
+        // bytes and as a page to copy.
+        let mark = crate::watch::moment();
+        let owned = self.owned_held(from, to);
+        let mark = (!owned.is_empty()).then_some(mark);
+        let flying = busy.clone();
+        busy.extend(owned.iter().copied());
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -2789,9 +3241,41 @@ impl Shadow {
             if at < to {
                 bytes += self.update_free(at, to);
             }
+            if let Some(now) = mark {
+                self.taken_around_owned(from, to, &flying, &owned, now);
+            }
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// After [`Shadow::update`] of `[from, to)` around owned ranges: a page
+    /// that range holds whole, with no range a flight writes on it, has
+    /// all its bytes current now (the owned ones are the copy's own, the
+    /// rest were just brought up to date), though the refresh took it in
+    /// parts and so did not note it. Noted as taken at asking `now` (taken
+    /// before the title's writes were looked at: a write found since makes
+    /// the page look written once more, which costs one more copy of it,
+    /// never one missed); without this, every such page was copied at
+    /// every refresh.
+    fn taken_around_owned(&self, from: usize, to: usize, flying: &[(usize, usize)], owned: &[(usize, usize)], now: u64) {
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for &(a, e) in owned {
+            for page in a / PAGE..e.div_ceil(PAGE) {
+                let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+                if lo < from || hi > to || flying.iter().any(|&(p, q)| p < hi && lo < q) {
+                    continue;
+                }
+                if let Some(at) = page.checked_sub(base).and_then(|i| copied.get_mut(i)) {
+                    *at = (*at).max(now);
+                }
+            }
+        }
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -2875,6 +3359,41 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether the copy is a window of memory outside buffers.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
+    /// `VICTORY_READFIX`: whether the copy holds title memory as it is in
+    /// `[from, to)` (title addresses), apart from what its own flights'
+    /// shaders write there: every write-watch page of it taken whole and not
+    /// written by the title since. No if the memory is not write-watched.
+    pub(crate) fn took_current(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return true;
+        }
+        if self.place.is_some() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return false;
+        }
+        let Some((_, written)) = crate::watch::writes(from, to, true) else {
+            return false;
+        };
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        crate::readfix::took_current(&copied, start / PAGE, from / PAGE, (to - 1) / PAGE, &written)
+    }
+
+    /// `VICTORY_READFIX`: the card writes `[from, to)` (title addresses) of
+    /// the copy from another copy: a kept snapshot is not current there.
+    pub(crate) fn card_filled(&self, from: usize, to: usize) {
+        let start = self.start as usize;
+        let (from, to) = (from.max(start), to.min((self.start + self.len) as usize));
+        if from < to {
+            self.changed(from - start, to - start);
+        }
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the

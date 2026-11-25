@@ -754,6 +754,7 @@ fn view_shape(view: Option<&View>) -> Shape {
                 address,
                 stride: 0,
                 records: size,
+                format: 0,
             };
         }
         View::Sampler(_) | View::ConsoleSampler(_) => return Shape::None,
@@ -771,10 +772,19 @@ fn view_shape(view: Option<&View>) -> Shape {
         } else {
             (stride, bytes / u64::from(stride))
         };
+        // A typed view of three 32-bit channels: the format, for the
+        // translation's float3 addressing (`f3_words_format`).
+        let format = match words {
+            Some(w) if !raw && stride == 12 => {
+                f3_words_format(if unordered { uav_desc(&w).Format } else { srv_desc(&w).Format })
+            }
+            _ => 0,
+        };
         return Shape::Buffer {
             address,
             stride,
             records: u32::try_from(records).unwrap_or(u32::MAX),
+            format,
         };
     }
     // The texture's description, in the host's 14-dword layout, and its
@@ -986,6 +996,21 @@ mod words_tests {
         let s = view_shape(Some(&View::Constant(0x2_0000_0100, 256)));
         assert_eq!(console_words(&s)[..3], [0x0000_0100, 2, 256]);
         assert_eq!(view_shape(None), Shape::None);
+    }
+
+    /// Float3 views' words carry the 32_32_32 format while the switch is on
+    /// (off by default), other formats none; with it off every format gets none.
+    #[test]
+    fn float3_views_words_carry_their_format() {
+        if f3_view_fix() {
+            assert_eq!(f3_words_format(DXGI_FORMAT_R32G32B32_UINT), 72);
+            assert_eq!(f3_words_format(DXGI_FORMAT_R32G32B32_SINT), 73);
+            assert_eq!(f3_words_format(DXGI_FORMAT_R32G32B32_FLOAT), 74);
+        } else {
+            assert_eq!(f3_words_format(DXGI_FORMAT_R32G32B32_FLOAT), 0);
+        }
+        assert_eq!(f3_words_format(DXGI_FORMAT_R32G32B32A32_FLOAT), 0);
+        assert_eq!(f3_words_format(DXGI_FORMAT_R32_FLOAT), 0);
     }
 }
 
@@ -2637,13 +2662,28 @@ fn left_null(why: &'static str, unordered: bool, address: u64, len: u64, element
 /// Every such view takes this shape while on, on an element or not, so
 /// that what the translated program reads is decided by the format alone:
 /// element `i`, channel `k` is dword `3 * i + k` of the view. That is the
-/// translator's side of it (victory-shader `lower.rs`, typed
-/// `bufferLoad.f32`/`bufferStore.f32`, still to do): today a typed load of
-/// element `i` reads one dword at `i`, so this stays off by default until
-/// the translation reads three.
+/// translator's side of it (victory-shader `lower.rs` `f3_format`): the
+/// view's descriptor words carry the 32_32_32 format ([`view_shape`]),
+/// and translated typed loads and stores read elements `3i + k` where they
+/// find it. Both follow the one switch, `victory_shader::emit::words::
+/// f3_view_fix` (off by default; `VICTORY_F3_VIEW_FIX=1`).
 fn f3_view_fix() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_F3_VIEW_FIX").is_some_and(|v| v == "1"))
+    victory_shader::emit::words::f3_view_fix()
+}
+
+/// The GFX10 buffer format a typed view of `format` gets in its descriptor
+/// words: 32_32_32 for the three-channel formats [`f3_view_fix`] makes one
+/// channel wide (while on), else 0 (no format; the translation reads one
+/// element per index).
+fn f3_words_format(format: DXGI_FORMAT) -> u32 {
+    let (first, _) = victory_shader::emit::words::FORMAT_32_32_32;
+    match format {
+        _ if !f3_view_fix() => 0,
+        DXGI_FORMAT_R32G32B32_UINT => first,
+        DXGI_FORMAT_R32G32B32_SINT => first + 1,
+        DXGI_FORMAT_R32G32B32_FLOAT => first + 2,
+        _ => 0,
+    }
 }
 
 /// Views made by [`f3_view_fix`]'s rule and, of those, the ones that did

@@ -36,6 +36,10 @@ pub enum Shape {
         address: u64,
         stride: u32,
         records: u32,
+        /// The GFX10 buffer format field (dword 3 bits 12-18): set only
+        /// for the 32_32_32 views the host makes as one-channel views
+        /// ([`f3_view_fix`]), 0 otherwise.
+        format: u32,
     },
     /// An image view as the host makes it: its first level's size, depth
     /// (3D) or layers (arrays: faces for cubes) and its level count (or
@@ -48,6 +52,41 @@ pub enum Shape {
         levels: u32,
         address: u64,
     },
+}
+
+/// GFX10 buffer formats 32_32_32_UINT, _SINT and _FLOAT (LLVM `UfmtGFX10`):
+/// the first code, and how many.
+pub const FORMAT_32_32_32: (u32, u32) = (72, 3);
+
+/// `VICTORY_F3_VIEW_FIX` (off unless set to `1`): when on, typed buffer views of
+/// three 32-bit channels (`R32G32B32_FLOAT/UINT/SINT`)
+/// are made by the host as one-channel views of the same dwords (`R32_*`,
+/// element `i` channel `k` at dword `3 * i + k`), and their descriptor
+/// words carry the 32_32_32 format, from which translated typed loads and
+/// stores pick that addressing at run time (`Lower::f3_format`). Off: the
+/// host makes three-channel views (none off a 12-byte element), the
+/// words carry no format and the translation reads one element per
+/// index, exactly as without the switch. The translation depends on the
+/// switch (on: typed loads and stores of any heap view read the format),
+/// so the shader cache keys name it when it is on.
+pub fn f3_view_fix() -> bool {
+    #[cfg(test)]
+    if TEST_F3.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F3_VIEW_FIX").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_F3: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Turns the switch on for the calling test thread (every test has its own).
+#[cfg(test)]
+pub(crate) fn f3_view_fix_for_this_test() {
+    TEST_F3.set(true);
 }
 
 /// The identity channel selects (X, Y, Z, W) of V# and T# dword 3.
@@ -71,11 +110,12 @@ pub fn console_words(shape: &Shape) -> [u32; WORDS as usize] {
             address,
             stride,
             records,
+            format,
         } => {
             w[0] = address as u32;
             w[1] = (address >> 32) as u32 & 0xFFFF | (stride & 0x3FFF) << 16;
             w[2] = records;
-            w[3] = IDENTITY;
+            w[3] = IDENTITY | (format & 0x7F) << 12;
         }
         Shape::Image {
             ty,
@@ -131,11 +171,32 @@ mod tests {
             address: 0x0001_2345_6780,
             stride: 24,
             records: 100,
+            format: 0,
         });
         assert_eq!(w[0], 0x2345_6780);
         assert_eq!(w[1], 1 | 24 << 16);
         assert_eq!(w[2], 100);
         assert_eq!(w[3], 0xFAC);
         assert_eq!(console_words(&Shape::None), [0; 8]);
+    }
+
+    /// A float3 view's words carry its format in dword 3 bits 12-18, where
+    /// the translation reads it; the codes are the 32_32_32 ones.
+    #[test]
+    fn buffer_words_hold_the_32_32_32_format() {
+        let w = console_words(&Shape::Buffer {
+            address: 0x100,
+            stride: 12,
+            records: 4,
+            format: FORMAT_32_32_32.0 + 2,
+        });
+        assert_eq!(w[3], 0xFAC | 74 << 12);
+        use crate::emit::lower::buffer_format;
+        for k in 0..FORMAT_32_32_32.1 {
+            let (bits, _) = buffer_format((FORMAT_32_32_32.0 + k) as u8).unwrap();
+            assert_eq!(bits, &[32, 32, 32][..]);
+        }
+        assert_eq!(buffer_format(71).unwrap().0, &[16, 16, 16, 16][..]);
+        assert_eq!(buffer_format(75).unwrap().0, &[32, 32, 32, 32][..]);
     }
 }

@@ -7,7 +7,7 @@ No emulator, no streaming. The title's own x64 code runs on your CPU, and its RD
 
 ### Where it stands
 
-Developed and tested so far against one open-world title. It boots, gets through the menus, saves and legal screens, reaches the world and starts gameplay: about 4 fps in the prologue on an RTX 3060 (Series S profile), up from 2.6. A frozen tile-grid overlay still sits over gameplay and the speed is far from playable, so it is **not yet verified playable**.
+Developed and tested so far against one open-world title. It boots, gets through the menus, saves and legal screens, reaches the world and starts gameplay: about 4 fps in the prologue on an RTX 3060 (Series S profile), now GPU-bound. The tile-grid overlay is fixed; streaming freezes and the GPU cost remain, so it is **not yet verified playable**.
 
 ![progress](https://img.shields.io/badge/progress-50%25-ff2d95?style=for-the-badge)
 
@@ -78,8 +78,8 @@ All captured on an RTX 3060 under Windows 10.
 
 Measured on an RTX 3060 (Series S profile, the title's own upscaler):
 
-- **Speed:** about 4 fps in the prologue (up from 2.6). The main costs are per-frame GPU readback waits (about 150 ms) and streaming remap storms; fixes are being tested. The intro cutscene is very slow unless it is skipped.
-- **A frozen tile-grid overlay** covers the picture during gameplay. Under investigation.
+- **Speed:** about 4 fps in the prologue, now GPU-bound: the per-frame read waits are cut from about 156 to about 26 ms. What is left is the GPU cost of the frame and streaming freezes. The intro cutscene is very slow unless it is skipped.
+- **Streaming freezes:** the picture stalls while world data streams in.
 - **Shadowed areas are too dark.** The title's ray-traced lighting and shadows do not run yet; the ray-tracing work so far is described in [`runtime/victory/docs/fork-ray-tracing.md`](runtime/victory/docs/fork-ray-tracing.md).
 - **Not verified playable:** nobody has played a session end to end.
 
@@ -95,15 +95,15 @@ Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROAD
 | Intro, setup and menus | ✅ | 30 fps, audio plays |
 | Saves and legal screens | ✅ | the title saves a checkpoint and loads it again |
 | Open world loads | ✅ | world data streams in through DirectStorage |
-| Lit world renders | ✅ | about 4 fps in the prologue on an RTX 3060, Series S profile (2.6 before) |
+| Lit world renders | ✅ | about 4 fps in the prologue on an RTX 3060, Series S profile, GPU-bound (read waits cut from about 156 to about 26 ms per frame) |
 | Gameplay starts | ✅ | the prologue runs; not played end to end |
-| Pipelines prebuilt | ✅ | 25,200 of 25,471 graphics pipelines made ahead of time |
+| Pipelines prebuilt | ✅ | 25,200 of 25,471 graphics pipelines made ahead of time, and used in play |
 | Shaders translate (VIctory-based translator) | ✅ | all 26,084 translate; 26,013 pass DXIL validation on their own, the other 71 (oversized mesh shaders) validate only when linked with their pixel shader. XCL's counts differ ([`docs/STATUS.md`](docs/STATUS.md)) |
 | Keyboard and mouse | ✅ | click to capture, W walks the character |
-| Tile-grid overlay over gameplay | 🔨 | frozen overlay; under investigation |
+| Tile-grid overlay over gameplay | ✅ | fixed (rectangle-list pipelines decode right) |
 | Shadowed areas | 🔨 | too dark |
 | Intro cutscene | 🔨 | very slow unless skipped |
-| Speed work | 🔨 | per-frame GPU readback waits (about 150 ms) and streaming remap storms are the main costs; fixes are being tested |
+| Speed work | 🔨 | per-frame read waits cut from about 156 to about 26 ms; now GPU-bound, with streaming freezes |
 | Playable | ⏳ | not verified |
 | 30 fps on a mid-range PC | ⏳ | the goal |
 
@@ -121,7 +121,7 @@ The shader build uses the World engine (VIctory-based runtime, `victory warm`) b
 
 | | Expected time (12-thread CPU) | What you see |
 |---|---|---|
-| World engine (default) | about 3 min (measured 171 s for 25,889 shaders) | phase, count, the current step and its elapsed time |
+| World engine (default) | about 3 min for `victory warm` (measured 171 s for 25,889 shaders), then about 8 min for the graphics pipelines (491 s for 25,200) | phase, count, the current step and its elapsed time |
 | Classic engine (XCL, Settings → Game) | 20–30 min with "skip slow shaders" on; 45 min to several hours with it off | the same, plus "no output for N s" during the slow tail |
 
 - **It resumes.** Stop it or close the launcher at any time; pressing **Build shaders** again skips what is done (finished phases are recorded in `<cache>\build-world.json`, translated shaders are read back from the cache).
@@ -181,7 +181,7 @@ Every task is sized for **one person + one AI coding agent**. Pick one, comment 
 
 ### Performance
 
-- [ ] **#4 Frame time.** About 3-4 fps in the world. Profile the title-memory copies and the submission path.
+- [ ] **#4 Frame time.** About 4 fps in the world, GPU-bound. Profile the frame on the GPU; look at streaming freezes.
 - [ ] **#5 Intro cutscene speed.** The intro is very slow unless skipped; find out why.
 - [ ] **#6 Shader cache warm-up.** A way to fill the cache before the first run.
 

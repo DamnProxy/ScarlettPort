@@ -497,7 +497,15 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
 }
 
 /// A pipeline's name in the library: the hash of what its host
-/// description holds.
+/// description holds. That is **all** it holds: the translated shaders' code (the content
+/// of the DXIL, which is the same bytes whenever the translator makes the same
+/// translation, whichever build made it), the root signature and the graphics state. Never
+/// the build, the translator's sources or the shader cache's entries, so a translator
+/// change that leaves a shader's output alone leaves its pipeline's name, and the driver's
+/// blob under it, alone too (`shader_cache` keeps the translation that long; a changed
+/// translation names a new pipeline, and the old name stays unused in the library). The
+/// name is stored in libraries on disk: changing this function orphans every pipeline in
+/// them (the test below pins it).
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
     let mut h = blake3::Hasher::new();
     for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
@@ -738,6 +746,13 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn a_name_is_the_hash_of_content_only_and_does_not_change_between_builds() {
+        // The value a build of any date gives: a library written by an earlier build loads
+        // in this one only while this holds.
+        assert_eq!(name("graphics", b"root", &[b"vs", b"ps"], "state"), "9402d2bc73e94e1548e2a550a55f878f");
     }
 
     #[test]

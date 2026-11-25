@@ -66,6 +66,13 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked, with `VICTORY_NARROW_VIEWS=1`:
+    /// per entry of its used-resource list, whether the program may store
+    /// through it (`crate::narrow::Reflect::table_writes`; `None`: all).
+    static TABLE_WRITES: std::cell::RefCell<Option<Vec<bool>>> = const { std::cell::RefCell::new(None) };
+    /// For the one `readable` call it is set around: false if the program
+    /// never stores through the table entry being made readable.
+    static VIEW_WRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While a dispatch is bound under `VICTORY_BARRIER_HAZARD`: what it
     /// reads and writes, as the binding finds it (`None` otherwise).
     static ACCESS: std::cell::RefCell<Option<victory_core::sync::Access>> =
@@ -336,6 +343,9 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
+    /// `VICTORY_PREP_TABLES`: graphics, compute: the descriptor tables set
+    /// since `bind` last set that root signature.
+    host_tables: [victory_core::prep::TableCache; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
@@ -561,7 +571,10 @@ pub(crate) fn dispatched() -> u64 {
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+/// With `VICTORY_NARROW_ROOT=1`, `reach`: the bytes from the address every
+/// access of the program through the view stays below, if known
+/// ([`crate::narrow`]); only those are refreshed or filled.
+fn root_view(list: &HostList, address: u64, srv: bool, reach: Option<u64>) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -570,16 +583,22 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .map_or(u64::MAX, |mb| mb << 20)
     });
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
+    let wide = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
+    let len = crate::narrow::bounded(wide, reach);
+    crate::narrow::cut(crate::narrow::Cut::RootRead, wide - len);
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
+        if len > 0 {
+            shadow.refresh(list, address, len);
+        }
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    let (gpu, to) = list.scratch(len.max(16))?;
+    if len > 0 {
+        list.defer_fill(to, address as *const u8, len as usize);
+    }
     Some(gpu)
 }
 
@@ -812,6 +831,7 @@ impl State {
         self.epoch = self.epoch.wrapping_add(1);
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
+        self.host_tables.iter_mut().for_each(victory_core::prep::TableCache::root_set);
         self.host_heaps = [0; 2];
         if self.topology_set {
             self.set_topology(list, self.topology);
@@ -923,7 +943,9 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    /// `by_address`: whether the program may store by raw address
+    /// (`VICTORY_NARROW_BVH`; always true with it off).
+    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool, by_address: bool) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -936,7 +958,7 @@ impl State {
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        crate::memory::ready(list, heap, &addresses, &constants, writes, by_address)
     }
 
     /// The bound heap holding `handle`.
@@ -1050,6 +1072,35 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
+    /// Sets the descriptor table at root parameter `param`; with
+    /// `VICTORY_PREP_TABLES` not if the list has that table there since its
+    /// root signature was last set.
+    fn host_set_table(
+        &mut self,
+        list: &HostList,
+        param: u32,
+        handle: windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
+        compute: bool,
+    ) {
+        use crate::host::{P, PREP_STATS};
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::prep_tables() {
+            PREP_STATS[P::TablesIn as usize].fetch_add(1, Relaxed);
+            if !self.host_tables[usize::from(compute)].set(param, handle.ptr) {
+                return;
+            }
+            PREP_STATS[P::TablesOut as usize].fetch_add(1, Relaxed);
+        }
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
+            }
+        }
+    }
+
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
@@ -1087,6 +1138,8 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            // The list's root arguments of that kind are gone.
+            self.host_tables[usize::from(compute)].root_set();
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -1102,8 +1155,12 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            if crate::narrow::views() {
+                TABLE_WRITES.set(t.narrow.as_ref().and_then(|r| r.table_writes.clone()));
+            }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            TABLE_WRITES.set(None);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1112,11 +1169,22 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            // `VICTORY_NARROW_ROOT`: what the program does through a root
+            // view (None: not known, the view as before).
+            let narrow_root = |slot: u8| {
+                if crate::narrow::root() {
+                    t.narrow.as_ref().and_then(|r| r.root(slot))
+                } else {
+                    None
+                }
+            };
+            // `VICTORY_NARROW_BVH`: whether it can store by raw address.
+            let by_address = crate::narrow::bvh() == 0 || t.narrow.as_ref().is_none_or(|r| r.by_address);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 // Any title memory, by address.
                 note_unknown();
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, compute, writes, by_address) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1207,11 +1275,12 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
-                        if tabled && !self.root_srv_table(list, None, param, compute, false) {
+                        if tabled && !self.root_srv_table(list, None, param, compute, false, None) {
                             return false;
                         }
                         continue;
                     };
+                    let reach = narrow_root(slot).and_then(|u| u.reach);
                     note_bytes(address, None, false);
                     // The shader adds the bytes a raw view begins early by.
                     let biased = srv
@@ -1220,12 +1289,12 @@ impl State {
                                 && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
                         });
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute, biased) {
+                        if !self.root_srv_table(list, Some(address), param, compute, biased, reach) {
                             return false;
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    let Some(mut gpu) = root_view(list, address, srv, reach) else {
                         continue;
                     };
                     if biased {
@@ -1275,7 +1344,7 @@ impl State {
                 if let Some(address) = address {
                     note_bytes(address, None, true);
                 }
-                if !self.root_uav(list, address, param, compute, writes) {
+                if !self.root_uav(list, address, param, compute, writes, narrow_root(slot)) {
                     return false;
                 }
             }
@@ -1296,7 +1365,11 @@ impl State {
     /// must be dropped.
     /// shortcut: a root view has no size: the view, the refresh and the
     /// copy back cover all that is left of the title's buffer
-    /// (`VICTORY_ROOT_UAV_MB` sets a limit for all three).
+    /// (`VICTORY_ROOT_UAV_MB` sets a limit for all three). With
+    /// `VICTORY_NARROW_ROOT=1` and `narrow` (what the program does through
+    /// the view, [`crate::narrow`]) the refresh and the copy back cover what
+    /// the program reaches, and a view nothing stores through is not
+    /// declared written.
     fn root_uav(
         &mut self,
         list: &HostList,
@@ -1304,6 +1377,7 @@ impl State {
         param: u32,
         compute: bool,
         writes: bool,
+        narrow: Option<crate::narrow::RootUse>,
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1324,10 +1398,32 @@ impl State {
             Some(s)
         };
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
+            use crate::narrow::{Cut, bounded};
             let len = s.left(a).min(limit);
-            s.refresh(list, a, len);
+            let Some(u) = narrow else {
+                s.refresh(list, a, len);
+                if writes {
+                    s.gpu_writes(list, a, len);
+                }
+                return;
+            };
+            // What the program reaches (reads and writes) is refreshed; the
+            // stores' reach lies inside it.
+            let read = bounded(len, u.reach);
+            crate::narrow::cut(Cut::RootRead, len - read);
+            if read > 0 {
+                s.refresh(list, a, read);
+            }
             if writes {
-                s.gpu_writes(list, a, len);
+                let write = if u.written { bounded(len, u.write_reach).min(read) } else { 0 };
+                if write > 0 {
+                    s.gpu_writes(list, a, write);
+                }
+                // Counted as `gpu_writes` cuts it (to the copy, and not
+                // at all in place).
+                if write < len && !s.in_place() {
+                    list.note_narrowed(s, (a + write) as usize, (len - write) as usize, Cut::RootWrite);
+                }
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -1391,14 +1487,7 @@ impl State {
             ready(*a, s);
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        self.host_set_table(list, param, handle, compute);
         true
     }
 
@@ -1415,6 +1504,7 @@ impl State {
         param: u32,
         compute: bool,
         biased: bool,
+        reach: Option<u64>,
     ) -> bool {
         let heap = match self.heaps[0] {
             0 => None,
@@ -1469,19 +1559,18 @@ impl State {
         };
         // As for root descriptors (`root_view`): all that is left of the
         // buffer is brought up to date. The first 1 MiB only left what lay
-        // past it stale (most mesh vertex streams reach further).
+        // past it stale (most mesh vertex streams reach further). With
+        // `VICTORY_NARROW_ROOT=1`, `reach`: what the program reaches of it.
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a));
-        }
-        let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
+            let wide = s.left(*a);
+            let len = crate::narrow::bounded(wide, reach);
+            crate::narrow::cut(crate::narrow::Cut::RootRead, wide - len);
+            if len > 0 {
+                s.refresh(list, *a, len);
             }
         }
+        let handle = host.gpu_handle(index);
+        self.host_set_table(list, param, handle, compute);
         true
     }
 
@@ -2221,7 +2310,9 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    /// `written`: whether the program may store through the entry
+    /// ([`entry_written`]).
+    fn table_entry(&self, list: &HostList, u: &UsedResource, written: bool, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -2233,7 +2324,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable_entry(list, u, written, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2293,11 +2384,13 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
-        for u in used.iter().filter(tables) {
+        for (n, u) in used.iter().enumerate().filter(|(_, u)| tables(u)) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, entry_written(n), compute);
             }
         }
+        // The place of an entry of `used` taken from it by reference.
+        let place = |u: &UsedResource| used.iter().position(|x| std::ptr::eq(x, u)).unwrap_or(usize::MAX);
         let mut made = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
@@ -2373,7 +2466,8 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        let picked = selected.binary_search(&(u.table_offset_dwords / 8)).is_ok();
+                        readable_entry(list, u, picked || entry_written(place(u)), &view);
                     }
                 }
                 for k in selected {
@@ -2421,8 +2515,18 @@ impl State {
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
-                        if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                        match used {
+                            // An entry the program names: declared as it
+                            // stores through it. (A view also picked by a
+                            // computed index stays declared.)
+                            Some(u) if selected.binary_search(&k).is_err() => {
+                                readable_entry(list, u, entry_written(place(u)), &view);
+                            }
+                            _ => {
+                                if let Some(kind) = kind {
+                                    readable(list, kind, &view);
+                                }
+                            }
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3092,6 +3196,21 @@ fn fill_ambient(view: &View) -> bool {
     true
 }
 
+/// Whether the program whose tables are walked may store through entry
+/// `n` of its used-resource list (`VICTORY_NARROW_VIEWS=1`; true with it
+/// off or not known).
+fn entry_written(n: usize) -> bool {
+    TABLE_WRITES.with_borrow(|w| w.as_ref().is_none_or(|w| w.get(n).copied().unwrap_or(true)))
+}
+
+/// [`readable`] for the view of used-resource entry `u`; `written`: whether
+/// the program may store through it ([`entry_written`]).
+fn readable_entry(list: &HostList, u: &UsedResource, written: bool, view: &View) {
+    VIEW_WRITTEN.set(written);
+    readable(list, u.kind, view);
+    VIEW_WRITTEN.set(true);
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let filled = fill_ambient(view);
@@ -3112,7 +3231,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if (STORES.get() || !write_skip()) && !VIEW_WRITTEN.get() {
+                // `VICTORY_NARROW_VIEWS=1`: the program never stores
+                // through this entry.
+                if !shadow.in_place() {
+                    let n = len.min(shadow.left(address));
+                    list.note_narrowed(&shadow, address as usize, n as usize, crate::narrow::Cut::View);
+                }
+            } else if STORES.get() || !write_skip() {
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]

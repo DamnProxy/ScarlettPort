@@ -7,17 +7,17 @@ Both runtimes run a title from your own dump. Each currently gets further at som
 | Shader path | RDNA2 to DXIL directly | RDNA2 to HLSL to DXC to DXIL |
 | Menus and loading | 30 fps | 30 fps |
 | Open world | world reached and gameplay starts on an RTX 3060, Series S profile | world reached, survives 7+ minutes |
-| Speed in the world | about 4 fps in the prologue (RTX 3060, Series S profile; 2.6 before) | not rendering the final image |
-| Final image | lit; shadowed areas too dark; a frozen tile-grid overlay over gameplay | black |
+| Speed in the world | about 4 fps in the prologue (RTX 3060, Series S profile), GPU-bound | not rendering the final image |
+| Final image | lit; shadowed areas too dark; the tile-grid overlay is fixed | black |
 | Extras | frame capture, save slots, press file, fast boot (testing), launcher (default engine) | launcher (Classic engine), pipeline journal and offline build, profiles, achievements, crash reports |
-| Shader build | `victory warm`: about 3 min | `xcl shaders --precompile`: 45 min to hours (slow tail from 83%) |
+| Shader build | `victory warm` (about 3 min) then `victory precompile-graphics` (about 8 min) | `xcl shaders --precompile`: 45 min to hours (slow tail from 83%) |
 | Scripts | `setup-victory.ps1`, `play-victory.ps1`, launcher | `setup.ps1`, `play.ps1`, launcher |
 
 Neither is verified playable.
 
 ## VIctory-based runtime
 
-Vendored source of branch `fx-final` at `26f8afd` (the build behind the verified 4 fps settings): fxceless/victory-fork (`main` at `4e17478`, GPL-3.0) with the victory-amd fork, community pull requests, our speed branches and our changes merged in. It includes the `image_bvh_intersect_ray` / `image_bvh64_intersect_ray` emulation (`crates/victory-shader/src/emit/intersect.rs`), so ray-tracing compute programs translate. Credits and the full lineage: `runtime/victory/SCARLETTPORT.md`. Upstream is VIctory by Marvisak.
+Vendored source of branch `fx-cand` at `bce072d` (the build behind the verified settings: fx-final plus the tile-grid fix and the read-wait cuts): fxceless/victory-fork (`main` at `4e17478`, GPL-3.0) with the victory-amd fork, community pull requests, our speed branches and our changes merged in. It includes the `image_bvh_intersect_ray` / `image_bvh64_intersect_ray` emulation (`crates/victory-shader/src/emit/intersect.rs`), so ray-tracing compute programs translate. Credits and the full lineage: `runtime/victory/SCARLETTPORT.md`. Upstream is VIctory by Marvisak.
 
 ```powershell
 .\scripts\setup-victory.ps1
@@ -49,6 +49,17 @@ Every `VICTORY_*` variable can also be given as `SCARLETT_*`. The full list is i
 | `VICTORY_SHADER_OPT=on` | opt-in shader clean-up passes (off by default; they can drop walls and roofs on some cards) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | cap on translated shader loop iterations (can smear hair; unset by default) |
 
+### Verified speed settings (set by `play-victory.ps1` and the launcher; each is off in the runtime itself)
+
+Measured together on the reference machine (RTX 3060, Series S profile): the per-frame read waits drop from about 156 to about 26 ms.
+
+| Variable | Effect |
+|---|---|
+| `VICTORY_READFIX=1` | refreshes of a host copy leave the bytes shaders wrote alone |
+| `VICTORY_COPY_BACK_ONLY_READBACK=1` | copy shader writes back only for the title's read-back buffers |
+| `VICTORY_NARROW_ROOT=1`, `VICTORY_NARROW_VIEWS=1`, `VICTORY_NARROW_BVH=1` | copy and walk only the root-signature bytes, view tables and BVH addresses a program uses |
+| `VICTORY_PREP_BARRIERS=1`, `VICTORY_PREP_TABLES=1`, `VICTORY_PREP_REUSE=1` | prepare barriers and descriptor tables ahead, and keep a command list's storage when it is reset |
+
 ### Speed switches (all opt-in, off unless noted)
 
 None of these has been measured on the reference machine in this build. Try them one at a time and back out if you see artifacts or hangs (back-out order: `VICTORY_COPY_BACK_ONLY_READBACK`, `VICTORY_KNOWN_WRITES`, `VICTORY_BARRIER_LITERAL`, `VICTORY_BARRIER_HAZARD`, `VICTORY_SYNC_PRECISE`).
@@ -79,7 +90,7 @@ None of these has been measured on the reference machine in this build. Try them
 The launcher's **Build shaders** runs, from the `runtime` folder beside it:
 
 1. `victory warm "<dump>" --jobs N` with `VICTORY_GAME_DIR=<dump>` and `VICTORY_CACHE_DIR=<cache>\victory`: translates every shader into the cache and makes the compute pipelines. About 3 min (171 s for 25,889 shaders on a 12-thread CPU). It prints a line every 2,000 shaders; between lines the launcher shows the current range and its elapsed time. `N` is the logical core count minus one, capped by free RAM (512 MB per job).
-2. `victory precompile-graphics "<dump>\shaders.rpf" --skip S --limit 1000` in chunks of 1,000 records, each saved when it ends (491 s for 25,200 pipelines in one run). **Off for now**: play runs leave `VICTORY_PRECOMPILED_GRAPHICS` unset until the rectangle-list fix is in this copy (`engine::PRECOMPILED_GRAPHICS` in the launcher turns both on together).
+2. `victory precompile-graphics "<dump>\shaders.rpf" --skip S --limit 1000` in chunks of 1,000 records, each saved when it ends (491 s for 25,200 pipelines in one run). **On**: the rectangle-list fix is in this copy, so play runs set `VICTORY_PRECOMPILED_GRAPHICS=1` and the launcher runs this phase (`engine::PRECOMPILED_GRAPHICS` controls both).
 
 Resuming: finished steps and chunks are recorded in `<cache>\build-world.json`, keyed by the SHA-256 of `victory.exe`; translated shaders are read back from the cache, so a restarted build skips them. A different `victory.exe` starts the record over; the translation cache is keyed by the translator's source, so only a translator change makes every shader translate again. Play runs use the same `VICTORY_CACHE_DIR`.
 
@@ -111,4 +122,4 @@ Offline path: the runtime journals every pipeline the title creates; `xcl pipeli
 | Patch | Base |
 |---|---|
 | `xcl-stack.patch` | upstream XCL `main` |
-| `victory-stack.patch` | fxceless/victory-fork `main` at `4e17478`; the diff of `fx-final` (`26f8afd`) against it, as `git diff 4e17478 fx-final` |
+| `victory-stack.patch` | fxceless/victory-fork `main` at `4e17478`; the diff of `fx-cand` (`bce072d`) against it, as `git diff 4e17478 fx-cand` |

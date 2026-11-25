@@ -308,10 +308,13 @@ pub fn run(
 }
 
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, incremental: bool, verify_all: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    // Entries of another translator build are checked here, before use, whatever the run does
+    // by default (in the background): this is the pass that leaves the cache current.
+    victory_hle::modules::d3d12x::set_revalidation(true, verify_all);
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
@@ -377,7 +380,29 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         unmade.into_inner(),
         started.elapsed().as_secs_f64()
     );
+    if incremental {
+        incremental_report();
+    }
     Ok(())
+}
+
+/// `victory warm --incremental`'s account of what the translator's change cost.
+fn incremental_report() {
+    use victory_hle::modules::d3d12x::{pipeline_counts, shader_cache_report};
+    let r = shader_cache_report();
+    let current = r.served.saturating_sub(r.restamped + r.unchanged + r.changed + r.failed);
+    println!(
+        "incremental  {} shaders: {} changed, {} translated again with the same result, {} restamped (no rule they used changed), {} current, {} new, {} failed to translate again (old entry kept)",
+        r.served + r.translated,
+        r.changed,
+        r.unchanged,
+        r.restamped,
+        current,
+        r.translated,
+        r.failed
+    );
+    let (made, loaded) = pipeline_counts();
+    println!("             pipelines: {loaded} loaded from the library, {made} compiled (the changed shaders' and the new ones')");
 }
 
 /// `VICTORY_LINK_PAIRS=<file>`: mesh/pixel pairs, one `pair <mesh hash> <pixel hash>`

@@ -11,7 +11,7 @@ report (`src/report.rs`) opens a prefilled issue.
 - **Play**: pick the folder containing `game_scarlett_master.exe`, press BUILD SHADERS once, then PLAY.
   The header shows your own game's splash art, read from that folder at run time (nothing is shipped).
 - **Engines**: World (VIctory-based runtime, `runtime\victory.exe`, default) and Classic (XCL, `runtime\xcl.exe`, when present).
-- **Shader build** (`src/shaderbuild.rs`): World runs `victory warm` (about 3 min); Classic runs
+- **Shader build** (`src/shaderbuild.rs`): World runs `victory warm` (about 3 min) and then `victory precompile-graphics` (about 8 min); Classic runs
   `xcl shaders ... --precompile --pipelines --only cs`. Progress per phase with the current step and its
   elapsed time; parallel jobs bounded by CPU count and free RAM; resumable (`<cache>\build-*.json`);
   optional skip of slow steps (Settings, Options).

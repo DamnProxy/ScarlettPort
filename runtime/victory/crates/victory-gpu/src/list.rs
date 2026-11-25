@@ -256,6 +256,17 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 /// [`host_list`] for calls that record no work of their own (or look at
 /// their hazards themselves): a held barrier stays held.
 pub(crate) fn host_list_quiet<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = host_list_holding(this)?;
+    // Barriers held to be recorded as one call (`VICTORY_PREP_BARRIERS`)
+    // go in before whatever the title asks for now.
+    #[cfg(windows)]
+    list.flush_barriers();
+    Some(list)
+}
+
+/// [`host_list_quiet`] that leaves held barriers (`VICTORY_PREP_BARRIERS`)
+/// held: for the title's barriers, which join them.
+fn host_list_holding<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -937,7 +948,15 @@ fn held(list: &crate::host::HostList, barriers: &[Barrier], host: Vec<Barrier>) 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = host_list_rec_quiet(this)
+    let host_list = if crate::host::prep_barriers() {
+        // Held indirect calls first, then these join the held barriers.
+        flush_held(this);
+        host_list_holding(this)
+    } else {
+        host_list_rec_quiet(this)
+    };
+    #[cfg(windows)]
+    if let Some(list) = host_list
         && !barriers.is_null()
     {
         // SAFETY: the title passes `count` barriers.
@@ -960,7 +979,13 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
-        if !host.is_empty() {
+        if !host.is_empty() && crate::host::prep_barriers() {
+            const _: () = assert!(size_of::<Barrier>() == size_of::<[u64; 4]>());
+            // SAFETY: plain fields, no padding (4 + 4 + 8 + 8 + 8 bytes), in
+            // the order `D3D12_RESOURCE_BARRIER` lays them out.
+            let words = unsafe { std::slice::from_raw_parts(host.as_ptr().cast::<[u64; 4]>(), host.len()) };
+            list.hold_barriers(words);
+        } else if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
             // SAFETY: the same layout; borrowed resource pointers, never
@@ -1027,8 +1052,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.record_barriers(&[barrier]);
     }
 }
 

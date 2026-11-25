@@ -78,6 +78,13 @@ pub(crate) enum M {
     BackKept,
     BackKeptBytes,
     BackGoes,
+    /// Of what stayed on the card: ranges the title wrote over afterwards
+    /// (its bytes won, the page goes back from then on) and their bytes;
+    /// bytes put into title memory for a reader there (`crate::shadow`'s
+    /// owned ranges).
+    OwnConflicts,
+    OwnConflictBytes,
+    OwnPut,
     /// Texture change hashes: count, bytes, microseconds (all threads).
     Hashes,
     HashBytes,
@@ -90,7 +97,7 @@ pub(crate) enum M {
     OverlapUs,
     OverlapWaitUs,
 }
-const COUNTERS: usize = 13;
+const COUNTERS: usize = 16;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(m: M, n: u64) {
@@ -113,11 +120,13 @@ pub(crate) fn log(frames: f64) {
         return;
     }
     let g = |m: M| c[m as usize];
+    let (owned, owners) = crate::shadow::owned_now();
     tracing::info!(
         "memcopy per frame: title memory copies at submission {:.0} kept the asking, {:.0} ended it, \
          {:.0} late submissions not held back by them (VICTORY_KNOWN_WRITES={}); shader-written ranges \
          {:.0} kept on the card {:.1} MB, {:.0} copied back (VICTORY_COPY_BACK_ONLY_READBACK={}, {} read-back \
-         buffers); texture hashes {:.0} {:.1} MB {:.2} ms (VICTORY_FAST_HASH={}), {:.0} check hashes left \
+         buffers; {:.1} MB held in {} copies, {:.3} MB put into title memory for readers, {:.1} title writes \
+         over them {:.3} MB); texture hashes {:.0} {:.1} MB {:.2} ms (VICTORY_FAST_HASH={}), {:.0} check hashes left \
          out (VICTORY_TEXTURE_HASH_EVERY={}); texture refreshes beside the submitting thread {:.0}, \
          {:.2} ms on their threads, {:.2} ms waited for (VICTORY_TEXTURE_OVERLAP={})",
         g(M::RunsKept),
@@ -129,6 +138,11 @@ pub(crate) fn log(frames: f64) {
         g(M::BackGoes),
         u8::from(crate::readback::enabled()),
         crate::readback::tagged(),
+        owned as f64 / 1e6,
+        owners,
+        g(M::OwnPut) / 1e6,
+        g(M::OwnConflicts),
+        g(M::OwnConflictBytes) / 1e6,
         g(M::Hashes),
         g(M::HashBytes) / 1e6,
         g(M::HashUs) / 1e3,

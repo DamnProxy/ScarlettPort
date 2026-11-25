@@ -223,6 +223,12 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// The number of the latest asking: a write found from now on is numbered
+/// higher (`crate::readback`'s owned ranges are marked with it).
+pub(crate) fn moment() -> u64 {
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked
+}
+
 /// Whether `[start, end)` is all placeholder memory by the runtime's record
 /// (`crate::regions`): views of physical pages and the holes between them,
 /// which are not write-watched, so that a write-watch asking about them can
@@ -387,6 +393,52 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// [`writes`] asked of the kernel (or the guards) now, whatever asking
+/// stands for the submission: what they hold for `[start, end)` goes into
+/// the journal under a new asking. Its number and the pages' last writes.
+/// `crate::shadow` puts owned bytes into title memory between two of these:
+/// the second takes its own write out of the kernel's answer, so that no
+/// later asking reports it as the title's.
+pub(crate) fn consume(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    if first >= last {
+        return None;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    j.found.resize(count.max(j.found.len()), 0);
+    let mut granularity = 0;
+    let failed = views_only(first * PAGE, last * PAGE) || {
+        crate::regions::add(crate::regions::S::Watches, 1);
+        // SAFETY: the answer buffer holds `count` entries.
+        let r = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        r != 0
+    };
+    let pages: Vec<usize> = if failed {
+        guard(first * PAGE, last * PAGE)?
+    } else {
+        j.found[..count].iter().map(|&at| at / PAGE).collect()
+    };
+    j.asked += 1;
+    let now = j.asked;
+    for page in pages {
+        j.written.insert(page, now);
+    }
+    Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// Guarded blocks of view memory.

@@ -716,7 +716,7 @@ fn map_physical(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_v
     if batched {
         begin_notes();
     }
-    let ok = map_pages(&mut physical, base, n, pages, &mut held);
+    let ok = map_pages(&mut physical, base, n, pages, &mut held, false);
     if batched {
         end_notes(&physical);
     }
@@ -729,13 +729,16 @@ fn map_physical(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_v
 /// Maps `n` pages at `base` (`None`: unmaps), under the caller's lock.
 /// Holds the bytes whose mapping changes in `held` (taken, or extended
 /// when the caller holds a change already, `VICTORY_PAGEMAP_RUNS`) until
-/// the caller drops it. False if a page or the host fails.
+/// the caller drops it. False if a page or the host fails. With
+/// `page_views` each page gets a view of its own, as when the title maps
+/// them one at a time (`XMemMapPhysicalPagesScatter`).
 fn map_pages(
     physical: &mut Physical,
     base: usize,
     n: usize,
     pages: Option<&[usize]>,
     held: &mut Option<victory_gpu::Remapping>,
+    page_views: bool,
 ) -> bool {
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
@@ -754,16 +757,24 @@ fn map_pages(
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return false;
         };
-        // One view per run of consecutive slices of one section.
-        let run = 1 + pages[i + 1..]
-            .iter()
-            .zip(1..)
-            .take_while(|&(page, k)| {
-                physical.pages.get(page).is_some_and(|s| {
-                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
+        // One view per run of consecutive slices of one section; one per
+        // page for a Scatter batch: the title remaps a page of it alone
+        // later, and unmapping a page of a view takes the whole view away
+        // and maps the rest again, so its neighbours (which the title goes
+        // on reading) would be "reserved, never committed" meanwhile.
+        let run = if page_views {
+            1
+        } else {
+            1 + pages[i + 1..]
+                .iter()
+                .zip(1..)
+                .take_while(|&(page, k)| {
+                    physical.pages.get(page).is_some_and(|s| {
+                        Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
+                    })
                 })
-            })
-            .count();
+                .count()
+        };
         if !map(physical, base + i * PAGE, run * PAGE, first) {
             return false;
         }
@@ -876,7 +887,7 @@ fn scatter_batched(addresses: &[usize], pages: Option<&[usize]>) -> bool {
             Some(p) if !unmaps(first) => Some(&p[first..first + len]),
             _ => None,
         };
-        if !map_pages(&mut physical, addresses[first], len, group, &mut held) {
+        if !map_pages(&mut physical, addresses[first], len, group, &mut held, true) {
             ok = false;
             break;
         }
@@ -1903,6 +1914,56 @@ mod tests {
         // An unknown page fails the batch, as it fails the call.
         assert!(!scatter_batched(&[b as usize], Some(&[0x7fff_fff0])));
         assert_eq!(XMemFreePhysicalPages(8, pages.as_ptr()), 1);
+    }
+
+    /// `VICTORY_PAGEMAP_RUNS`: a Scatter batch gives each page a view of its
+    /// own, as page by page does, so remapping one page of it later never
+    /// takes its neighbours away. With one view over the run, unmapping a
+    /// page took the whole view and mapped the rest again, and the title,
+    /// reading a neighbour meanwhile, faulted on memory "reserved, never
+    /// committed" (fast-check runs R3-crash, R4-crash, R3b, 120-160 s in).
+    #[test]
+    fn a_batched_scatter_makes_a_view_per_page() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pages = allocate(3);
+        for (k, &p) in pages.iter().enumerate() {
+            assert!(write_physical(&[p], 0, &[40 + k as u8]));
+        }
+        let b = placeholder(3);
+        let at: Vec<usize> = (0..3).map(|k| b as usize + k * PAGE).collect();
+        assert!(scatter_batched(&at, Some(&pages)));
+        {
+            let physical = physical();
+            for &a in &at {
+                assert_eq!(physical.views.get(&a).map(|v| v.0), Some(PAGE), "a view of its own at {a:#x}");
+            }
+        }
+        assert_eq!(shown(b, 3), vec![Some(40), Some(41), Some(42)]);
+        // The middle page remapped again and again while a thread reads its
+        // neighbours in place, as the title does, without any lock.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            let (first, last) = (at[0], at[2]);
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: mapped throughout; only the middle page is remapped.
+                    let (x, y) = unsafe { ((first as *const u8).read_volatile(), (last as *const u8).read_volatile()) };
+                    assert_eq!((x, y), (40, 42));
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for k in 0..500 {
+            let page = if k % 2 == 0 { 0 } else { pages[1] };
+            assert!(scatter_batched(&at[1..2], Some(&[page])));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().expect("a neighbour stayed mapped") > 0);
+        assert!(scatter_batched(&at, None));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     /// `VICTORY_MEM2_GPU_ONLY_NOVIEW`: page mappings into a GPU-only

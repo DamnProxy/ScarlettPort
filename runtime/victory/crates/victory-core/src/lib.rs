@@ -11,6 +11,7 @@ pub mod batch;
 pub mod config;
 pub mod env;
 pub mod fastboot;
+pub mod gpuown;
 pub mod kbm;
 pub mod mem2;
 pub mod memmap;
@@ -20,6 +21,7 @@ pub mod readring;
 pub mod saves;
 pub mod logging;
 pub mod policy;
+pub mod prep;
 pub mod splash;
 pub mod sync;
 

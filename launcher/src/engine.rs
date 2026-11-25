@@ -16,10 +16,24 @@ pub const GRAPHICS_TOTAL: u64 = 25_471;
 /// Records per `victory precompile-graphics` run: each run saves the pipeline library when it
 /// ends, so a stop loses at most one chunk.
 pub const CHUNK: u64 = 1000;
-/// The runtime vendored here decodes rectangle-list pipelines wrong, so play runs keep
-/// VICTORY_PRECOMPILED_GRAPHICS off (as play-victory.ps1 does) and the graphics-pipeline phase is
-/// not run by default. Turn both on together once the fix is in the shipped runtime.
-pub const PRECOMPILED_GRAPHICS: bool = false;
+/// The runtime vendored here decodes rectangle-list pipelines right (the tile-grid fix), so play
+/// runs set VICTORY_PRECOMPILED_GRAPHICS=1 (as play-victory.ps1 does) and the graphics-pipeline
+/// phase of the shader build runs. Both follow this one constant.
+pub const PRECOMPILED_GRAPHICS: bool = true;
+
+/// The other verified speed settings (play-victory.ps1 sets the same ones, besides the precise
+/// syncs and settles): the read-back fix, copy-back only for read-backs, narrow root signatures,
+/// views and BVH, and the prepared barriers, tables and reuse.
+pub const SPEED_SETTINGS: [&str; 8] = [
+    "VICTORY_READFIX",
+    "VICTORY_COPY_BACK_ONLY_READBACK",
+    "VICTORY_NARROW_ROOT",
+    "VICTORY_NARROW_VIEWS",
+    "VICTORY_NARROW_BVH",
+    "VICTORY_PREP_BARRIERS",
+    "VICTORY_PREP_TABLES",
+    "VICTORY_PREP_REUSE",
+];
 
 /// True when the config selects the World engine (anything else is Classic).
 pub fn is_world(c: &Config) -> bool {
@@ -83,6 +97,7 @@ pub fn world_env(c: &Config, game: &Path, cache_dir: &str) -> Vec<(&'static str,
     if PRECOMPILED_GRAPHICS {
         v.push(("VICTORY_PRECOMPILED_GRAPHICS", "1".to_string()));
     }
+    v.extend(SPEED_SETTINGS.iter().map(|k| (*k, "1".to_string())));
     if c.debug_view {
         v.push(("VICTORY_DEBUG_PS", "1".to_string()));
         v.push(("VICTORY_SHOW_TARGET", "2560x1440-f28".to_string()));
@@ -183,6 +198,9 @@ mod tests {
         assert_eq!(get(&e, "VICTORY_RELAY").as_deref(), Some("2"));
         assert_eq!(get(&e, "VICTORY_PIPELINE_WAIT_MS").as_deref(), Some("0"));
         assert_eq!(get(&e, "VICTORY_PRECOMPILED_GRAPHICS").is_some(), PRECOMPILED_GRAPHICS);
+        for k in SPEED_SETTINGS {
+            assert_eq!(get(&e, k).as_deref(), Some("1"), "{k}");
+        }
         assert!(get(&e, "VICTORY_SHADER_LOOP_LIMIT").is_none());
         assert!(get(&e, "VICTORY_AUTO_INPUT").is_none());
         c.auto_menu = true;

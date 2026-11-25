@@ -62,7 +62,9 @@ pub fn use_shader_pack(archive: std::path::PathBuf, index: std::path::PathBuf) {
 }
 
 #[cfg(windows)]
-pub use victory_gpu::pipeline::{precompile_graphics, save_pipeline_cache, warm};
+pub use victory_gpu::pipeline::{pipeline_counts, precompile_graphics, save_pipeline_cache, warm};
+#[cfg(windows)]
+pub use victory_gpu::shader_cache::{Report as ShaderCacheReport, report as shader_cache_report, set_revalidation};
 
 pub(crate) fn module() -> HleModule {
     HleModule {

@@ -12,6 +12,8 @@
 #   VICTORY_READ_SETTLE_PRECISE=1  read-backs settle on the exact submissions they need
 #   VICTORY_PRECOMPILED_GRAPHICS=1 graphics pipelines come from the title's precompiled cache,
 #                          prebuilt by `victory precompile-graphics` (run once, below; needs a GPU)
+#   VICTORY_READFIX, VICTORY_COPY_BACK_ONLY_READBACK, VICTORY_NARROW_ROOT / _VIEWS / _BVH,
+#                          VICTORY_PREP_BARRIERS / _TABLES / _REUSE = 1: the other verified speed settings
 #   VICTORY_RELAY=2        submission relay, form 2 (needed by the two settings above)
 #   VICTORY_PIPELINE_WAIT_MS=0  do not hold a draw back waiting for a pipeline build
 #   VICTORY_FAST_BOOT=1    with -FastBoot: press through logos and menus (testing only)
@@ -55,7 +57,8 @@ if (-not $KeepWatchdog) { $env:VICTORY_NO_WATCHDOG = '1' }
 $env:VICTORY_RELAY = '2'
 $env:VICTORY_SYNC_PRECISE = '1'
 $env:VICTORY_READ_SETTLE_PRECISE = '1'
-# VICTORY_PRECOMPILED_GRAPHICS stays off for now: this runtime decodes rectangle-list pipelines wrong (a half-tile grid over the picture). Fixed upstream of this copy; it will be turned on with the next sync.
+# The rest of the verified speed settings. The grid fix is in this runtime, so precompiled graphics pipelines are on.
+foreach ($k in 'VICTORY_PRECOMPILED_GRAPHICS','VICTORY_READFIX','VICTORY_COPY_BACK_ONLY_READBACK','VICTORY_NARROW_ROOT','VICTORY_NARROW_VIEWS','VICTORY_NARROW_BVH','VICTORY_PREP_BARRIERS','VICTORY_PREP_TABLES','VICTORY_PREP_REUSE') { Set-Item "env:$k" '1' }
 $env:VICTORY_PIPELINE_WAIT_MS = '0'
 if ($FastBoot) { $env:VICTORY_FAST_BOOT = '1' }
 if ($SaveSlot) { $env:VICTORY_SAVE_SLOT = $SaveSlot }

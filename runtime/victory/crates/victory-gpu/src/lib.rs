@@ -47,10 +47,13 @@ pub mod query;
 mod mem2;
 #[cfg(windows)]
 mod memcopy;
+mod narrow;
 #[cfg(windows)]
 mod translate;
 #[cfg(windows)]
 mod readback;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod readfix;
 mod rebar;
 #[cfg(windows)]
 mod regions;

@@ -156,6 +156,9 @@ pub(crate) struct Translated {
     /// True when its code is not known. What `VICTORY_BARRIER_MERGE` asks
     /// of an op before it counts it as unordered writes to wait for.
     pub(crate) writes: bool,
+    /// What the code does through root views, raw addresses and table
+    /// entries, for the `VICTORY_NARROW_*` switches (`None` with all off).
+    pub(crate) narrow: Option<crate::narrow::Reflect>,
 }
 
 #[cfg(windows)]
@@ -289,6 +292,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let writes = stores || programs.iter().any(image_stores);
+    // Only with a switch on: it traces the program again (the translation
+    // may have come from the cache).
+    let narrow = crate::narrow::any().then(|| crate::narrow::reflect(&programs));
     let used = programs
         .into_iter()
         .find(|p| {
@@ -299,7 +305,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores, writes })
+    Ok(Translated { host, used, stores, writes, narrow })
 }
 
 /// Whether a console program has an image store or atomic (it writes a
@@ -913,6 +919,14 @@ pub(crate) fn library_removal_note() -> String {
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
+}
+
+/// Host pipelines made (compiled by the driver) and loaded from the pipeline library
+/// since the start.
+#[cfg(windows)]
+pub fn pipeline_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (library::MADE.load(Ordering::Relaxed), library::LOADED.load(Ordering::Relaxed))
 }
 
 /// Saves the pipeline cache now if anything was added (at the end of a run).

@@ -16,6 +16,7 @@ pub mod ir;
 pub mod merged;
 pub mod native;
 pub mod resource;
+pub mod rules;
 pub mod spill;
 pub mod structure;
 
@@ -26,8 +27,10 @@ pub use native::{
 };
 
 /// Deterministic BLAKE3 hex digest of `victory-shader`'s source tree, computed
-/// at build time so shader caches invalidate automatically when translator code
-/// changes without being wiped by unrelated crate rebuilds.
+/// at build time. It names this translator: a cached translation records the
+/// digest it was last verified with, and one made by another digest is checked
+/// against the per-rule fingerprints of [`rules`] (and, where those moved,
+/// translated again and compared) instead of being thrown away.
 pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

@@ -226,10 +226,24 @@ impl Memory {
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
-    /// after it.
-    fn name(&mut self, address: u64) {
+    /// after it. Returns their numbers less one (`copies` places), for
+    /// `VICTORY_NARROW_BVH=2`.
+    fn name(&mut self, address: u64) -> [Option<usize>; 2] {
+        let next = (address & !(CELL - 1)) + CELL;
         self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+        self.map(next);
+        [self.copy_at(address), self.copy_at(next)]
+    }
+
+    /// The `copies` place of the copy holding `address`'s page, if it has one.
+    fn copy_at(&self, address: u64) -> Option<usize> {
+        let page = address / PAGE;
+        if page >= u64::from(MEMORY_PAGES) - 1 {
+            return None;
+        }
+        // SAFETY: inside the directory's mapping.
+        let n = unsafe { self.directory.1.add(page as usize * 2).read() };
+        (n != 0).then(|| n as usize - 1)
     }
 }
 
@@ -239,12 +253,18 @@ impl Memory {
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted (and, with `writes`, copied back after). None if the host
 /// cannot hold it; the draw is then dropped.
+///
+/// `VICTORY_NARROW_BVH` ([`crate::narrow`]): at 1, with `by_address` false
+/// (the program has no store or atomic by raw address) no copy is declared
+/// written; at 2, a program that does store by address declares only the
+/// copies its root views and constants name.
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
     addresses: &[u64],
     constants: &[u32],
     writes: bool,
+    by_address: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -258,8 +278,9 @@ pub(crate) fn ready(
         m.take_faults();
     }
     let numbered = m.copies.len();
+    let mut named: Vec<usize> = Vec::new();
     for &address in addresses {
-        m.name(address);
+        named.extend(m.name(address).into_iter().flatten());
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -269,10 +290,10 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            named.extend(m.name(u64::from(c) | u64::from(high) << 32).into_iter().flatten());
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            named.extend(m.name(u64::from(c) << 8).into_iter().flatten());
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -296,15 +317,33 @@ pub(crate) fn ready(
     // by that list's submission, which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
     const WRITE: usize = usize::MAX - 0x6e;
+    // (`VICTORY_NARROW_BVH`: the copies left out are counted once per list
+    // too; with 2, each named copy is declared once per list.)
+    const LEFT_OUT: usize = usize::MAX - 0x6f;
+    const NAMED: usize = usize::MAX - 0x1_0000;
+    let level = crate::narrow::bvh();
+    let declare = plan(level, writes, by_address);
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
+    let first_write = declare == Declare::All && list.first_use(WRITE);
+    let first_left_out = writes && declare != Declare::All && list.first_use(LEFT_OUT);
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        let declared = match declare {
+            Declare::All => first_write || n >= numbered,
+            Declare::Named => named.contains(&n) && list.first_use(NAMED - n),
+            Declare::None => false,
+        };
+        if declared {
             shadow.gpu_writes(list, start, len);
+        } else if declare != Declare::All
+            && (first_left_out || n >= numbered)
+            && !(declare == Declare::Named && named.contains(&n))
+            && !shadow.in_place()
+        {
+            list.note_narrowed(shadow, start as usize, len as usize, crate::narrow::Cut::Bvh);
         }
     }
     if first_read {
@@ -316,6 +355,50 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+/// Which numbered copies a dispatch declares written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Declare {
+    /// All of them, once per list (and those numbered since): as before.
+    All,
+    /// Those its root views and constants name (`VICTORY_NARROW_BVH=2`).
+    Named,
+    None,
+}
+
+/// [`Declare`] for a dispatch at `VICTORY_NARROW_BVH` `level` whose shader
+/// stores (`writes`) and may store by raw address (`by_address`).
+fn plan(level: u8, writes: bool, by_address: bool) -> Declare {
+    match (writes, level, by_address) {
+        (false, ..) => Declare::None,
+        (true, 0, _) => Declare::All,
+        // The program reaches the copies only to read them.
+        (true, _, false) => Declare::None,
+        (true, 1, true) => Declare::All,
+        (true, _, true) => Declare::Named,
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::{Declare, plan};
+
+    #[test]
+    fn only_programs_that_store_by_address_declare_the_copies() {
+        // Off: as before, whatever the program does.
+        assert_eq!(plan(0, true, false), Declare::All);
+        assert_eq!(plan(0, true, true), Declare::All);
+        assert_eq!(plan(0, false, true), Declare::None);
+        // 1 (exact): a program without stores by address declares none.
+        assert_eq!(plan(1, true, false), Declare::None);
+        assert_eq!(plan(1, true, true), Declare::All);
+        assert_eq!(plan(1, false, true), Declare::None);
+        // 2: only what the dispatch names, for one that stores by address.
+        assert_eq!(plan(2, true, true), Declare::Named);
+        assert_eq!(plan(2, true, false), Declare::None);
+        assert_eq!(plan(2, false, false), Declare::None);
+    }
 }
 
 /// Evicts cached descriptor-run state for `heap` when its owning `Heap` is
@@ -357,7 +440,7 @@ mod tests {
         let host_heap = heap(h).host().expect("host view heap");
         let key = std::ptr::from_ref(host_heap) as usize;
 
-        assert!(ready(&list, host_heap, &[], &[], false).is_some());
+        assert!(ready(&list, host_heap, &[], &[], false, true).is_some());
         {
             let guard = MEMORY.lock().unwrap();
             assert!(guard.as_ref().unwrap().heaps.contains_key(&key));
