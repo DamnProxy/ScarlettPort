@@ -27,12 +27,15 @@ The title ships tens of thousands of GPU programs. Each is translated for your c
 
 **Don't panic, and don't delete your save folder.** The runtime writes saves atomically (a full new copy, then one rename), so killing the game does not leave a half-written save. Where this prompt was checked, the save files on disk were intact; the cause is still being investigated.
 
-**Where saves live:** `%LOCALAPPDATA%\XCL\<package name>\`, in the `saves` and `pls` folders (or under `%XCL_DATA_ROOT%` if you set it).
+**Where saves live:**
+
+- World engine (default, VIctory-based): `%LOCALAPPDATA%\VIctory\data\<title id>\saves\`.
+- Classic engine (XCL): `%LOCALAPPDATA%\XCL\<package name>\`, in the `saves` and `pls` folders (or under `%XCL_DATA_ROOT%` if you set it).
 
 **Back up:**
 
 - The launcher's **Saves** page backs up both folders to `<cache>\save-backups\<date>` and keeps the newest 10.
-- By hand: exit the game, then copy the whole `%LOCALAPPDATA%\XCL\<package name>` folder somewhere safe.
+- By hand: exit the game, then copy the whole save folder above somewhere safe.
 
 **If the prompt appears:** close the game, make a backup as above, and open an issue with the log. Answering the prompt in game may replace the save, so back up first.
 
