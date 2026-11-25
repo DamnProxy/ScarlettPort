@@ -162,6 +162,8 @@ That is the Classic (XCL) engine's slow tail: the last ~4,000 of 26,503 programs
 **Do I need to rebuild after updates?**
 After a launcher or runtime update the launcher marks the shaders as needing a rebuild. The shipped World engine keys its shader cache on the whole translator source, so a runtime update that changes the shader translator translates everything again (about 3 minutes); an update that does not touch the translator reuses the cache and the rebuild finishes quickly. A per-shader key that rebuilds only changed shaders exists in our fork (`fx-cachekey`) but is not in the runtime shipped here yet. The Classic engine's cache is keyed by the generated code, so it recompiles what changed.
 
+**Does the launcher go online?**
+Only for what you see: with "Updates" on (Settings → Options) it asks GitHub Releases at start whether a newer launcher exists. An update downloads only when you click it, into an `update` folder beside the launcher, is checked against the release's SHA-256 list, and is swapped in the next time you start the launcher; the replaced version is kept in `previous` for a rollback. "Send report" opens a prefilled GitHub hardware-report issue in your browser (your user name and folders are removed from the log). Discord status talks only to the Discord app on your PC.
 **How can I contribute?**
 Read [`CONTRIBUTING.md`](CONTRIBUTING.md), then pick a task below or open an issue with one of the [issue templates](https://github.com/ZigZagBoi1/ScarlettPort/issues/new/choose) (bug report, hardware report, shader failure). Testers with different GPUs and hardware reports help most right now: GPU, driver, CPU, RAM, how long the shader build took and how far the game got.
 

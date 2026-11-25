@@ -74,7 +74,9 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let titled = scarlett_title_w(parent, name);
+    let name = titled.as_ref().map_or(name, |t| t.as_ptr());
+    // SAFETY: the title's own arguments, forwarded (the size fitted, a top-level caption prefixed).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -100,7 +102,9 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let titled = scarlett_title_a(parent, name);
+    let name = titled.as_ref().map_or(name, |t| t.as_ptr());
+    // SAFETY: the title's own arguments, forwarded (the size fitted, a top-level caption prefixed).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -110,6 +114,45 @@ pub extern "system" fn CreateWindowExA(
     hwnd
 }
 
+/// ScarlettPort: a top-level window's caption starts with "ScarlettPort" (so the window and the
+/// process are recognisable as ScarlettPort's). Child windows and unnamed ones are left alone.
+const CAPTION_PREFIX: &str = "ScarlettPort";
+
+fn scarlett_title_w(parent: HWND, name: PCWSTR) -> Option<Vec<u16>> {
+    if !parent.is_null() {
+        return None;
+    }
+    let mut own: Vec<u16> = Vec::new();
+    if !name.is_null() {
+        // SAFETY: the title's NUL-terminated caption.
+        unsafe {
+            let mut i = 0;
+            while *name.add(i) != 0 && i < 4096 {
+                own.push(*name.add(i));
+                i += 1;
+            }
+        }
+    }
+    let text = if own.is_empty() { CAPTION_PREFIX.to_owned() } else { format!("{CAPTION_PREFIX} - {}", String::from_utf16_lossy(&own)) };
+    Some(text.encode_utf16().chain([0]).collect())
+}
+
+fn scarlett_title_a(parent: HWND, name: PCSTR) -> Option<Vec<u8>> {
+    if !parent.is_null() {
+        return None;
+    }
+    let mut out = CAPTION_PREFIX.as_bytes().to_vec();
+    if !name.is_null() {
+        // SAFETY: the title's NUL-terminated caption.
+        let own = unsafe { std::ffi::CStr::from_ptr(name.cast()) }.to_bytes();
+        if !own.is_empty() {
+            out.extend_from_slice(b" - ");
+            out.extend_from_slice(own);
+        }
+    }
+    out.push(0);
+    Some(out)
+}
 /// A console title sizes its window to its render target (
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping

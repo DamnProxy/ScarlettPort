@@ -2,8 +2,11 @@
 
 Native Rust launcher (eframe/egui). It embeds no runtime: it runs the engines from a `runtime`
 folder beside `ScarlettPort.exe` (the release ZIP has both), and never unpacks, downloads or
-writes executables. Settings live in `%LOCALAPPDATA%\ScarlettPort\launcher.json`. No network
-access except the links you click.
+writes executables. Settings live in `%LOCALAPPDATA%\ScarlettPort\launcher.json`. Network: an optional update
+check against GitHub Releases (`src/update.rs`; downloads only on click, verified by SHA-256,
+swapped in at the next start, previous version kept). Discord status over the local IPC pipe
+(`src/discord.rs`, `DISCORD_APP_ID`, empty until the project's app exists). One-click hardware
+report (`src/report.rs`) opens a prefilled issue.
 
 - **Play**: pick the folder containing `game_scarlett_master.exe`, press BUILD SHADERS once, then PLAY.
   The header shows your own game's splash art, read from that folder at run time (nothing is shipped).

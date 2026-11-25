@@ -50,3 +50,5 @@ Also credited: XCL by ivall and contributors (https://github.com/ivall/xcl, GPL-
 - The base already took the title's name out of its tree; this snapshot keeps it that way. Two doc comments (`readback.rs`, `descriptor/slot_map.rs`), one line of `VICKY.md` (a former repository name) and one line of `README.md` (a note on how the fork was written) differ from the working repository for that reason.
 
 Build and run: see `docs/BUILDING.md`, `scripts/setup-victory.ps1` and `scripts/play-victory.ps1`.
+
+- ScarlettPort naming (this repository): `apps/victory/build.rs` stamps a version resource (ProductName and FileDescription "ScarlettPort"), and top-level window captions start with "ScarlettPort" (`crates/victory-hle/src/modules/lifecycle.rs`). The release ships the binary as `runtime\ScarlettPort-Runtime.exe`.

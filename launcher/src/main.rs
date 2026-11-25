@@ -8,7 +8,10 @@ mod engine;
 mod flow;
 mod game;
 mod runtime;
+mod discord;
+mod report;
 mod saves;
+mod update;
 mod shaderbuild;
 mod theme;
 mod view;
@@ -101,6 +104,12 @@ pub struct Config {
     pub skip_slow: bool,
     #[serde(default = "default_slow_secs")]
     pub slow_secs: u64,
+    /// Discord Rich Presence (needs Discord running and the project's application ID).
+    #[serde(default = "yes")]
+    pub discord: bool,
+    /// Check GitHub Releases for a newer launcher at start.
+    #[serde(default = "yes")]
+    pub auto_update: bool,
 }
 
 fn default_engine() -> String {
@@ -133,6 +142,8 @@ impl Default for Config {
             engine_v2: true,
             skip_slow: true,
             slow_secs: default_slow_secs(),
+            discord: true,
+            auto_update: true,
         }
     }
 }
@@ -149,6 +160,9 @@ pub enum Message {
     /// Shader build progress and its end (a summary, or why it did not finish).
     Build(shaderbuild::Progress),
     BuildEnded(Result<String, String>),
+    UpdateFound(Result<Option<update::Release>, String>),
+    UpdateProgress(u64, u64),
+    UpdateDone(Result<String, String>),
     Picked(Option<PathBuf>),
 }
 
@@ -167,6 +181,14 @@ pub struct Launcher {
     /// The header picture from the selected game folder, and the folder it was loaded for.
     pub header: Option<egui::TextureHandle>,
     pub header_for: Option<String>,
+    pub presence: discord::Presence,
+    pub presence_last: Option<discord::Activity>,
+    pub run_started: u64,
+    pub gpu_name: String,
+    pub update: Option<update::Release>,
+    pub update_note: String,
+    pub update_busy: bool,
+    pub report_note: String,
     /// Scroll offset of the Settings, Game tab and the height of its content.
     pub game_scroll: f32,
     pub game_content: f32,
@@ -269,6 +291,14 @@ impl Launcher {
             build: None,
             header: None,
             header_for: None,
+            presence: discord::Presence::new(),
+            presence_last: None,
+            run_started: 0,
+            gpu_name: report::system().gpu,
+            update: None,
+            update_note: update::staged().map(|v| format!("{v} is downloaded and will be used the next time you start the launcher.")).unwrap_or_default(),
+            update_busy: false,
+            report_note: String::new(),
             game_scroll: 0.,
             game_content: 0.,
             game_ok,
@@ -309,6 +339,11 @@ impl Launcher {
         }
         l.unpack_runtime();
         let mut l = l;
+        if l.config.auto_update && l.update_note.is_empty() {
+            l.check_update();
+        }
+        let l = l;
+        let mut l = l;
         // `--page=settings` opens Settings on its Display tab (`--tab=game|display|options|about`)
         if std::env::args().any(|a| a == "--page=settings") {
             l.page = Page::Settings;
@@ -318,6 +353,90 @@ impl Launcher {
             l.settings_tab = ["game", "display", "options", "about"].iter().position(|n| *n == t).unwrap_or(l.settings_tab);
         }
         l
+    }
+
+    /// Checks GitHub Releases for a newer launcher (a background thread).
+    pub fn check_update(&mut self) {
+        self.update_note = "Checking for updates…".into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Message::UpdateFound(update::check()));
+        });
+    }
+
+    /// Downloads, verifies and stages the update found by check_update.
+    pub fn download_update(&mut self) {
+        let Some(rel) = self.update.clone() else { return };
+        self.update_busy = true;
+        self.update_note = "Downloading…".into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let ptx = tx.clone();
+            let r = update::download(&rel, &move |got, total| {
+                let _ = ptx.send(Message::UpdateProgress(got, total));
+            });
+            let _ = tx.send(Message::UpdateDone(r.map(|_| rel.version.clone())));
+        });
+    }
+
+    /// What Discord shows now: building, playing, or nothing.
+    fn presence_now(&mut self) -> Option<discord::Activity> {
+        if !self.config.discord {
+            return None;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let (details, state) = match self.running? {
+            RunKind::Play => {
+                let place = if self.fps.is_some() { "In game" } else { "Starting the game" };
+                (place.to_string(), format!("{} engine", if self.world_selected() { "World" } else { "Classic" }))
+            }
+            RunKind::Precompile => ("Building shaders".to_string(), "Getting ready to play".to_string()),
+            RunKind::Pipelines => ("Building pipelines".to_string(), "Getting ready to play".to_string()),
+        };
+        if self.run_started == 0 {
+            self.run_started = now;
+        }
+        Some(discord::Activity { details, state, start: self.run_started, small: discord::vendor_key(&self.gpu_name) })
+    }
+
+    fn update_presence(&mut self) {
+        let want = self.presence_now();
+        if want.is_none() {
+            self.run_started = 0;
+        }
+        if want != self.presence_last {
+            self.presence.set(want.clone());
+            self.presence_last = want;
+        }
+    }
+
+    /// Gathers the hardware report and opens a prefilled GitHub issue (or copies it).
+    pub fn hardware_report(&mut self, ctx: &egui::Context) {
+        let sys = report::system();
+        let lines: Vec<String> = self.logs.iter().map(|(t, _)| t.clone()).collect();
+        let tail = lines[lines.len().saturating_sub(200)..].join("\n");
+        let folders = [(self.config.game_path.as_str(), "<game>"), (self.config.cache_dir.as_str(), "<cache>")];
+        let engine = if self.world_selected() { format!("World engine (VIctory-based), {}", self.world_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) } else { format!("Classic engine (XCL), {}", self.runtime_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) };
+        let build = self.build.as_ref().map(|b| format!("\nLast shader build: {} in {}", b.name, flow::duration(b.started.elapsed().as_secs()))).unwrap_or_default();
+        let fields: Vec<(&str, String)> = vec![
+            ("gpu", sys.gpu.clone()),
+            ("driver", sys.driver.clone()),
+            ("system", format!("{}; {} GB RAM; {}", sys.cpu, sys.ram_gb, sys.os)),
+            ("runtime", format!("Launcher v{VERSION}; {engine}{build}")),
+            ("fps", report::fps_summary(&lines)),
+            ("notes", report::scrub(&format!("Last {} log lines:\n`\n{tail}\n`", tail.lines().count()), &folders)),
+        ];
+        let url = report::issue_url(&fields);
+        if url.len() <= report::MAX_URL {
+            ctx.open_url(egui::OpenUrl::new_tab(&url));
+            self.report_note = "Opened a prefilled hardware report in your browser. Check it, add how far the game got, then submit.".into();
+        } else {
+            ctx.copy_text(report::as_text(&fields));
+            let short: Vec<(&str, String)> = fields[..5].to_vec();
+            ctx.open_url(egui::OpenUrl::new_tab(report::issue_url(&short)));
+            self.report_note = "The report is too long for a link: the full text (with the log) is on your clipboard. Paste it into the Notes field of the issue that opened.".into();
+        }
+        self.log(self.report_note.clone(), LogKind::Info);
     }
 
     pub fn unpack_runtime(&self) {
@@ -722,6 +841,25 @@ impl Launcher {
                         self.log(self.runtime_note.clone(), LogKind::Error);
                     }
                 },
+                Message::UpdateFound(r) => match r {
+                    Ok(Some(rel)) => {
+                        self.log(format!("Update available: {} ({})", rel.version, rel.page), LogKind::Info);
+                        self.update = Some(rel);
+                    }
+                    Ok(None) => self.update_note = format!("You have the newest launcher (v{VERSION})."),
+                    Err(e) => self.update_note = format!("Could not check for updates: {e}"),
+                },
+                Message::UpdateProgress(got, total) => {
+                    self.update_note = if total > 0 { format!("Downloading… {} of {}", game::human(got), game::human(total)) } else { format!("Downloading… {}", game::human(got)) };
+                }
+                Message::UpdateDone(r) => {
+                    self.update_busy = false;
+                    self.update_note = match r {
+                        Ok(v) => format!("{v} downloaded and verified. It is used the next time you start the launcher (this version is kept for a rollback)."),
+                        Err(e) => format!("Update failed: {e}"),
+                    };
+                    self.log(self.update_note.clone(), LogKind::Info);
+                }
                 Message::Picked(p) => {
                     self.folder_busy = false;
                     if let Some(p) = p {
@@ -791,6 +929,7 @@ impl eframe::App for Launcher {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump(ctx);
         self.refresh_header(ctx);
+        self.update_presence();
         self.draw(ctx);
         self.screenshot(ctx);
     }
@@ -809,6 +948,12 @@ fn icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // A staged update (or a rollback) is swapped in at start; the new launcher then starts instead.
+    if let Some(exe) = update::apply_pending() {
+        if Command::new(&exe).args(std::env::args().skip(1)).spawn().is_ok() {
+            return Ok(());
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180., 660.])

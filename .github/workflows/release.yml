@@ -57,7 +57,7 @@ jobs:
           $rt = Join-Path $root 'runtime'
           New-Item -ItemType Directory -Force (Join-Path $rt 'D3D12') | Out-Null
           Copy-Item launcher\target\release\ScarlettPort.exe $root
-          Copy-Item runtime\victory\target\release\victory.exe $rt
+          Copy-Item runtime\victory\target\release\victory.exe (Join-Path $rt 'ScarlettPort-Runtime.exe')
           Copy-Item "$env:AGILITY_BIN\D3D12Core.dll" (Join-Path $rt 'D3D12')
           Copy-Item "$env:AGILITY_BIN\d3d12SDKLayers.dll" (Join-Path $rt 'D3D12')
           Copy-Item LICENSE.md $root
@@ -78,9 +78,9 @@ jobs:
           "$zipHash  $zip" | Set-Content SHA256SUMS.txt
           $sums | Add-Content SHA256SUMS.txt
           $exeHash = (Get-FileHash (Join-Path $root 'ScarlettPort.exe') -Algorithm SHA256).Hash.ToLower()
-          $vicHash = (Get-FileHash (Join-Path $rt 'victory.exe') -Algorithm SHA256).Hash.ToLower()
+          $vicHash = (Get-FileHash (Join-Path $rt 'ScarlettPort-Runtime.exe') -Algorithm SHA256).Hash.ToLower()
           @"
-          One ZIP: ``ScarlettPort.exe`` (the launcher) and a ``runtime\`` folder beside it holding ``victory.exe`` (the World engine) and the Microsoft D3D12 Agility SDK DLLs. Extract the whole ZIP and keep the two side by side. Nothing is downloaded, unpacked or installed at run time. You need your own dump of your own legally obtained copy; no game files are included.
+          One ZIP: ``ScarlettPort.exe`` (the launcher) and a ``runtime\`` folder beside it holding ``ScarlettPort-Runtime.exe`` (the World engine, VIctory-based) and the Microsoft D3D12 Agility SDK DLLs. Extract the whole ZIP and keep the two side by side. Nothing is downloaded, unpacked or installed at run time. You need your own dump of your own legally obtained copy; no game files are included.
 
           Built from ``${{ github.sha }}`` by the [Release workflow](https://github.com/${{ github.repository }}/actions/workflows/release.yml).
 
@@ -94,7 +94,7 @@ jobs:
           |---|---|
           | ``$zip`` | ``$zipHash`` |
           | ``ScarlettPort.exe`` | ``$exeHash`` |
-          | ``runtime/victory.exe`` | ``$vicHash`` |
+          | ``runtime/ScarlettPort-Runtime.exe`` | ``$vicHash`` |
 
           ``SHA256SUMS.txt`` lists every file. In PowerShell: ``Get-FileHash .\$zip -Algorithm SHA256``.
 

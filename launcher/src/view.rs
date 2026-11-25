@@ -20,6 +20,11 @@ const NEWS: [(&str, &str, &str, &str); 6] = [
     ("NEXT", "IN PROGRESS", "Geometry passes feed the final image", "Wave64 mesh shaders are the remaining wall. Translating them is the next big step."),
 ];
 
+/// True once an update is downloaded and waits for the next start.
+fn update_staged_label(note: &str) -> bool {
+    note.contains("next time you start")
+}
+
 fn window_controls(ui: &mut Ui, r: Rect, ctx: &egui::Context) {
     if icon_button(ui, Rect::from_min_size(pos2(r.max.x - 76., 12.), vec2(32., 32.)), "win-min", Icon::Minimize, false, "") {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -163,6 +168,23 @@ impl Launcher {
             Page::Settings => "Settings",
         };
         p.text(pos2(SIDEBAR + MARGIN, 30.), Align2::LEFT_CENTER, title, font(20., "bold"), TEXT);
+        if let Some(u) = self.update.clone() {
+            if !update_staged_label(&self.update_note) && self.fps.is_none() {
+                let label = format!("Update available {}", u.version);
+                let w = text_width(ui, &label, font(13., "semibold")) + 36.;
+                let pill = Rect::from_min_size(pos2(r.max.x - 88. - w, 12.), vec2(w, 32.));
+                let hit = ui.interact(pill, ui.id().with("upd-pill"), Sense::click());
+                p.rect_filled(pill, RADIUS_MD, BG_100);
+                p.rect_stroke(pill, RADIUS_MD, Stroke::new(1.0_f32, ACCENT), egui::StrokeKind::Inside);
+                dot(&p, pos2(pill.min.x + 15., pill.center().y), ACCENT);
+                p.text(pos2(pill.min.x + 28., pill.center().y), Align2::LEFT_CENTER, label, font(13., "semibold"), TEXT);
+                hand(ui, &hit);
+                if hit.clicked() {
+                    self.settings_tab = 2;
+                    self.go(Page::Settings);
+                }
+            }
+        }
         // Live frame rate pill, where the reference shows the signed-in player.
         if let Some(fps) = self.fps {
             let label = format!("{fps:.1} FPS");
@@ -954,6 +976,71 @@ impl Launcher {
             None => ("Free space unknown: the folder or its drive was not found.".to_string(), WARNING),
         };
         p.text(pos2(c.min.x, by + CONTROL + 12.), Align2::LEFT_TOP, text, font(12.5, "regular"), color);
+
+        // ---- updates, Discord, hardware report: one compact row each
+        let w = c.width().min(640.);
+        let mut y = by + CONTROL + 44.;
+        let mut row = |h: f32| {
+            let r = Rect::from_min_size(pos2(c.min.x, y), vec2(w, h));
+            y += h + 8.;
+            p.rect_filled(r, RADIUS_MD, BG_100);
+            p.rect_stroke(r, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
+            r
+        };
+        let r = row(58.);
+        p.text(pos2(r.min.x + 18., r.center().y - 9.), Align2::LEFT_CENTER, "Updates", font(15., "semibold"), TEXT);
+        let note = match &self.update {
+            Some(u) if self.update_note.is_empty() || self.update_note.starts_with("Checking") => format!("Update available: {}", u.version),
+            _ if !self.update_note.is_empty() => self.update_note.clone(),
+            _ => format!("Launcher v{VERSION}. Checks GitHub Releases at start when on."),
+        };
+        p.text(pos2(r.min.x + 18., r.center().y + 10.), Align2::LEFT_CENTER, fit(ui, &note, font(12., "regular"), w - 330.), font(12., "regular"), if self.update.is_some() { ACCENT } else { TEXT_MUTED });
+        let mut on = self.config.auto_update;
+        if switch(ui, Rect::from_center_size(pos2(r.max.x - 44., r.center().y), vec2(40., 24.)), "auto-update", &mut on) {
+            self.config.auto_update = on;
+            self.save();
+        }
+        let br = Rect::from_min_size(pos2(r.max.x - 84. - 120., r.center().y - 14.), vec2(116., 28.));
+        if let Some(u) = self.update.clone() {
+            if update_staged_label(&self.update_note) {
+                // staged: nothing to click
+            } else if button(ui, br, "upd-get", &format!("Get {}", u.version), Kind::Primary, !self.update_busy, Some(Icon::Download)) {
+                self.download_update();
+            }
+        } else if button(ui, br, "upd-check", "Check now", Kind::Secondary, !self.update_busy, Some(Icon::Refresh)) {
+            self.check_update();
+        }
+        if crate::update::has_previous() && link(ui, pos2(r.max.x - 84. - 120., r.max.y + 4.), Align2::LEFT_TOP, "upd-rollback", "roll back to the previous version") {
+            self.update_note = match crate::update::request_rollback() {
+                Ok(()) => "The previous version is restored the next time you start the launcher.".into(),
+                Err(e) => e,
+            };
+        }
+        y += 10.;
+
+        let r = Rect::from_min_size(pos2(c.min.x, y), vec2(w, 58.));
+        y += 66.;
+        p.rect_filled(r, RADIUS_MD, BG_100);
+        p.rect_stroke(r, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
+        p.text(pos2(r.min.x + 18., r.center().y - 9.), Align2::LEFT_CENTER, "Discord status", font(15., "semibold"), TEXT);
+        let sub = if crate::discord::DISCORD_APP_ID.is_empty() { "Shows ScarlettPort, what you are doing and for how long. Not available in this build yet." } else { "Shows ScarlettPort, what you are doing and for how long (needs Discord running)." };
+        p.text(pos2(r.min.x + 18., r.center().y + 10.), Align2::LEFT_CENTER, fit(ui, sub, font(12., "regular"), w - 100.), font(12., "regular"), TEXT_MUTED);
+        let mut on = self.config.discord;
+        if switch(ui, Rect::from_center_size(pos2(r.max.x - 44., r.center().y), vec2(40., 24.)), "discord", &mut on) {
+            self.config.discord = on;
+            self.save();
+        }
+
+        let r = Rect::from_min_size(pos2(c.min.x, y), vec2(w, 58.));
+        p.rect_filled(r, RADIUS_MD, BG_100);
+        p.rect_stroke(r, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
+        p.text(pos2(r.min.x + 18., r.center().y - 9.), Align2::LEFT_CENTER, "Hardware report", font(15., "semibold"), TEXT);
+        let sub = if self.report_note.is_empty() { "Opens a prefilled GitHub issue: GPU, driver, CPU, RAM, Windows, fps and the last 200 log lines (your name and folders removed)." } else { self.report_note.as_str() };
+        p.text(pos2(r.min.x + 18., r.center().y + 10.), Align2::LEFT_CENTER, fit(ui, sub, font(12., "regular"), w - 170.), font(12., "regular"), TEXT_MUTED);
+        if button(ui, Rect::from_min_size(pos2(r.max.x - 18. - 130., r.center().y - 14.), vec2(130., 28.)), "hw-report", "Send report", Kind::Secondary, true, Some(Icon::Info)) {
+            let ctx = ui.ctx().clone();
+            self.hardware_report(&ctx);
+        }
     }
 
     fn settings_about(&mut self, ui: &mut Ui, c: Rect) {

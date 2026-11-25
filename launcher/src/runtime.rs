@@ -1,6 +1,6 @@
 //! Where the engines live. Nothing is embedded in the launcher and nothing is unpacked or
 //! downloaded at run time: the release ZIP puts a `runtime` folder beside ScarlettPort.exe
-//! (victory.exe and its `D3D12` folder for the World engine; xcl.exe, dxcompiler.dll and
+//! (ScarlettPort-Runtime.exe, the VIctory-based runtime, and its `D3D12` folder for the World engine; xcl.exe, dxcompiler.dll and
 //! dxil.dll for the Classic engine when present), and the launcher runs them from there.
 //! `SCARLETT_RUNTIME_DIR` points at another folder (for development builds).
 use sha2::{Digest, Sha256};
@@ -27,7 +27,15 @@ pub fn xcl_exe() -> PathBuf {
     runtime_dir().join("xcl.exe")
 }
 
+/// The release's name for the VIctory-based runtime (victory.exe).
+pub const RUNTIME_EXE: &str = "ScarlettPort-Runtime.exe";
+
+/// The World engine: `ScarlettPort-Runtime.exe`, else a development build's `victory.exe`.
 pub fn victory_exe() -> PathBuf {
+    let named = runtime_dir().join(RUNTIME_EXE);
+    if named.is_file() {
+        return named;
+    }
     runtime_dir().join("victory.exe")
 }
 
