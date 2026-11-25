@@ -4,11 +4,13 @@ use crate::theme::*;
 use crate::flow::{self, Stage, World};
 use crate::game;
 use crate::saves;
-use crate::{Launcher, LogKind, Page, RunKind, GAME_EXE, KOFI_URL, PAYPAL_URL, PLAYABLE_PERCENT, REPO_URL, VERSION};
+use crate::{Launcher, Page, RunKind, GAME_EXE, KOFI_URL, PAYPAL_URL, PLAYABLE_PERCENT, REPO_URL, VERSION};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, Rect, Sense, Stroke, Ui};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 4] = ["Game", "Display", "Options", "About"];
+const TABS: [&str; 6] = ["Game", "Display", "Options", "About", "Runtime", "Features"];
+/// The order the tabs are listed in (indices into TABS, which other code uses).
+const TAB_ORDER: [usize; 6] = [0, 4, 5, 1, 2, 3];
 
 /// (kind, status, title, summary)
 const NEWS: [(&str, &str, &str, &str); 6] = [
@@ -79,7 +81,7 @@ impl Launcher {
     }
 
     pub(crate) fn draw(&mut self, ctx: &egui::Context) {
-        ctx.request_repaint_after(Duration::from_millis(if self.animating() { 16 } else { 500 }));
+        ctx.request_repaint_after(Duration::from_millis(if self.animating() { 16 } else { 250 }));
         let time = self.started.elapsed().as_secs_f32();
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
             let r = ui.max_rect();
@@ -105,6 +107,9 @@ impl Launcher {
                 Page::Logs => self.logs_page(&mut page, area),
                 Page::Links => self.links_page(&mut page, area),
                 Page::Settings => self.settings_page(&mut page, area),
+                Page::Saves => self.saves_page(&mut page, area),
+                Page::Verify => self.verify_page(&mut page, area),
+                Page::Welcome => self.welcome_page(&mut page, area, time),
             }
             window_controls(ui, r, ctx);
             p.rect_stroke(r, RADIUS_WINDOW, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
@@ -127,8 +132,10 @@ impl Launcher {
             (80., Page::Play, Icon::Play, "Play"),
             (128., Page::News, Icon::News, "Progress notes"),
             (176., Page::Setup, Icon::Download, "Setup"),
-            (224., Page::Logs, Icon::Server, "Logs"),
-            (272., Page::Links, Icon::Friends, "Links"),
+            (224., Page::Verify, Icon::Shield, "Verify game files"),
+            (272., Page::Saves, Icon::History, "Saves"),
+            (320., Page::Logs, Icon::Server, "Logs and crashes"),
+            (368., Page::Links, Icon::Friends, "Links"),
         ];
         for (y, page, icon, tip) in entries {
             if nav_item(ui, item(y), ("nav", y as i32), icon, tip, self.page == page, false) {
@@ -163,9 +170,12 @@ impl Launcher {
             Page::Play => "",
             Page::News => "Progress notes",
             Page::Setup => "Setup",
-            Page::Logs => "Logs",
+            Page::Logs => "Logs and crashes",
             Page::Links => "Links",
             Page::Settings => "Settings",
+            Page::Saves => "Saves",
+            Page::Verify => "Verify game files",
+            Page::Welcome => "Welcome to ScarlettPort",
         };
         p.text(pos2(SIDEBAR + MARGIN, 30.), Align2::LEFT_CENTER, title, font(20., "bold"), TEXT);
         if let Some(u) = self.update.clone() {
@@ -223,11 +233,11 @@ impl Launcher {
             self.go(Page::Settings);
         }
         let world_sel = self.world_selected();
-        let ready = if world_sel { self.world_dir.is_some() } else { self.runtime_dir.is_some() };
+        let ready = self.engine_ready();
         let (status, color) = if ready { ("Ready", Some(SUCCESS)) } else { ("Not found", Some(WARNING)) };
-        let note = format!("{} engine  ·  {}", if world_sel { "World" } else { "Classic" }, self.runtime_note);
+        let note = if world_sel { format!("World engine  ·  {}", self.build_label()) } else { format!("Classic engine  ·  {}", self.runtime_note) };
         if section_row(ui, row(52.), "row-runtime", Icon::Server, "Engine", &note, Status { text: status, color }, true) {
-            self.settings_tab = 3;
+            self.settings_tab = 4;
             self.go(Page::Settings);
         }
         let stage = self.stage();
@@ -262,16 +272,20 @@ impl Launcher {
         if section_row(ui, row(52.), "row-world", Icon::Server, "World pipelines", &meta, Status { text: status, color }, world == World::Available) {
             self.start(RunKind::Pipelines);
         }
-        let prog = row(52.);
-        section_row(ui, prog, "row-progress", Icon::Info, "Progress to playable", "World engine: lit world, gameplay starts at about 4 fps. Speed is next.", Status { text: &format!("{PLAYABLE_PERCENT:.0}%"), color: None }, false);
-        let track = Rect::from_min_max(pos2(prog.min.x + 14., prog.max.y - 5.), pos2(prog.max.x - 14., prog.max.y - 3.));
-        progress(&ui.painter().clone(), track, Some(PLAYABLE_PERCENT / 100.), time);
+        let _ = (PLAYABLE_PERCENT, time);
+        self.preset_row(ui, row(52.));
         let (status, color) = match self.fps {
             Some(f) => (format!("{f:.1} fps"), Some(SUCCESS)),
             None if self.running == Some(RunKind::Play) => ("running".to_string(), Some(SUCCESS)),
+            None if self.perf.is_some() => ("Last run".to_string(), None),
             None => ("Not running".to_string(), None),
         };
-        if section_row(ui, row(52.), "row-fps", Icon::History, "Frame rate", "Read live from the game log", Status { text: &status, color }, true) {
+        let meta = match self.perf.as_ref().and_then(|p| p.line()) {
+            Some(l) if self.running != Some(RunKind::Play) => l,
+            _ if self.running != Some(RunKind::Play) && self.perf.is_some() => "No frame times in the last run's log (turn on the performance readout in Settings, Features)".to_string(),
+            _ => "Read live from the game log; a readout follows each run".to_string(),
+        };
+        if section_row(ui, row(52.), "row-fps", Icon::History, "Performance", &meta, Status { text: &status, color }, true) {
             self.go(Page::Logs);
         }
     }
@@ -519,53 +533,6 @@ impl Launcher {
 
     // ------------------------------------------------------------------ logs
 
-    fn logs_page(&mut self, ui: &mut Ui, area: Rect) {
-        let p = ui.painter().clone();
-        caption(&p, pos2(area.min.x, 72.), Align2::LEFT_TOP, &format!("Live log  ·  {} lines", self.logs.len()));
-        if link(ui, pos2(area.max.x, 72.), Align2::RIGHT_TOP, "log-clear", "Clear") {
-            self.logs.clear();
-        }
-        if link(ui, pos2(area.max.x - 56., 72.), Align2::RIGHT_TOP, "log-copy", "Copy all") {
-            let all: Vec<&str> = self.logs.iter().map(|(t, _)| t.as_str()).collect();
-            ui.ctx().copy_text(all.join("\n"));
-        }
-        if link(ui, pos2(area.max.x - 128., 72.), Align2::RIGHT_TOP, "log-crashes", "Open crash reports") {
-            saves::open_folder(&saves::reports_dir());
-        }
-        let mut top = 100.;
-        if let Some(report) = self.crash_report.clone() {
-            let banner = Rect::from_min_size(pos2(area.min.x, top), vec2(area.width(), 48.));
-            p.rect_filled(banner, RADIUS_MD, BG_100);
-            p.rect_stroke(banner, RADIUS_MD, Stroke::new(1.0_f32, DANGER), egui::StrokeKind::Inside);
-            p.text(banner.left_center() + vec2(16., 0.), Align2::LEFT_CENTER, "The game crashed \u{2013} a report was saved", font(14., "semibold"), TEXT);
-            if button(ui, Rect::from_center_size(pos2(banner.max.x - 56., banner.center().y), vec2(88., CONTROL)), "crash-open", "Open", Kind::Secondary, true, None) {
-                saves::reveal(&report);
-            }
-            top += 48. + 8.;
-        }
-        let panel = Rect::from_min_max(pos2(area.min.x, top), area.max);
-        p.rect_filled(panel, RADIUS_MD, BG_100);
-        p.rect_stroke(panel, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
-        let inner = panel.shrink2(vec2(14., 10.));
-        let logs = &self.logs;
-        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
-            egui::ScrollArea::vertical().id_salt("log-scroll").stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_width(inner.width() - 12.);
-                if logs.is_empty() {
-                    ui.label(egui::RichText::new("Nothing yet. Press Play or Precompile shaders.").font(font(13., "regular")).color(TEXT_FAINT));
-                }
-                for (t, k) in logs {
-                    let c = match k {
-                        LogKind::Info => ACCENT,
-                        LogKind::Out => TEXT_MUTED,
-                        LogKind::Error => mix(DANGER, TEXT, 0.2),
-                    };
-                    ui.add(egui::Label::new(egui::RichText::new(t).font(egui::FontId::monospace(12.)).color(c)).wrap());
-                }
-            });
-        });
-    }
-
     // ------------------------------------------------------------------ links
 
     fn links_page(&mut self, ui: &mut Ui, area: Rect) {
@@ -591,8 +558,9 @@ impl Launcher {
     fn settings_page(&mut self, ui: &mut Ui, area: Rect) {
         let p = ui.painter().clone();
         let top = 60.;
-        for (i, name) in TABS.iter().enumerate() {
-            let rect = Rect::from_min_size(pos2(area.min.x, top + i as f32 * 42.), vec2(190., 36.));
+        for (row, &i) in TAB_ORDER.iter().enumerate() {
+            let name = &TABS[i];
+            let rect = Rect::from_min_size(pos2(area.min.x, top + row as f32 * 42.), vec2(190., 36.));
             let hit = ui.interact(rect, ui.id().with(("tab", i)), Sense::click());
             let h = ui.ctx().animate_bool_with_time(hit.id, hit.hovered(), QUICK);
             let sel = self.settings_tab == i;
@@ -612,6 +580,8 @@ impl Launcher {
             0 => self.settings_game(ui, c),
             1 => self.settings_display(ui, c),
             2 => self.settings_options(ui, c),
+            4 => self.settings_runtime(ui, c),
+            5 => self.settings_features(ui, c),
             _ => self.settings_about(ui, c),
         }
     }

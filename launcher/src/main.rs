@@ -3,7 +3,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod art;
+mod cli;
 mod display;
+mod pages;
+mod perf;
+mod presets;
+mod tuning;
+mod verify;
 mod engine;
 mod flow;
 mod game;
@@ -46,7 +52,14 @@ pub enum Page {
     Logs,
     Links,
     Settings,
+    Saves,
+    Verify,
+    /// The first-run wizard: game folder, verify, shaders, preset, Play.
+    Welcome,
 }
+
+pub const BUNDLED: &str = "bundled";
+pub const LOCAL: &str = "local";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RunKind {
@@ -110,6 +123,35 @@ pub struct Config {
     /// Check GitHub Releases for a newer launcher at start.
     #[serde(default = "yes")]
     pub auto_update: bool,
+    /// Play preset: "stable", "experimental" or "custom" (`presets`).
+    #[serde(default = "default_preset")]
+    pub preset: String,
+    /// "bundled" (the runtime folder beside the launcher) or "local" (a victory.exe the user
+    /// picked, e.g. their own newest build). Updates never touch a local build.
+    #[serde(default = "default_runtime")]
+    pub runtime_mode: String,
+    #[serde(default)]
+    pub local_exe: String,
+    /// The local build's cache folder (VICTORY_CACHE_DIR as is); empty: `<cache>\local`.
+    #[serde(default)]
+    pub local_cache: String,
+    /// Shader build hash for the local build (kept apart from the bundled one's).
+    #[serde(default)]
+    pub local_shaders_hash: String,
+    /// Settings, Features (`tuning`).
+    #[serde(default)]
+    pub tuning: tuning::Tuning,
+    /// The first-run wizard was finished or skipped.
+    #[serde(default)]
+    pub wizard_done: bool,
+}
+
+fn default_preset() -> String {
+    presets::STABLE.to_string()
+}
+
+fn default_runtime() -> String {
+    BUNDLED.to_string()
 }
 
 fn default_engine() -> String {
@@ -144,6 +186,13 @@ impl Default for Config {
             slow_secs: default_slow_secs(),
             discord: true,
             auto_update: true,
+            preset: default_preset(),
+            runtime_mode: default_runtime(),
+            local_exe: String::new(),
+            local_cache: String::new(),
+            local_shaders_hash: String::new(),
+            tuning: tuning::Tuning::default(),
+            wizard_done: false,
         }
     }
 }
@@ -164,6 +213,15 @@ pub enum Message {
     UpdateProgress(u64, u64),
     UpdateDone(Result<String, String>),
     Picked(Option<PathBuf>),
+    PickedExe(Option<PathBuf>),
+    PickedCache(Option<PathBuf>),
+    /// The local build's hash and description.
+    Local(Option<String>, String),
+    Verified(verify::Report),
+    Saves(Result<Vec<cli::Slot>, String>),
+    Backups(String, Result<Vec<cli::Backup>, String>),
+    SavesDone(Result<String, String>),
+    Crashes(Result<Vec<String>, String>),
 }
 
 pub struct Launcher {
@@ -228,6 +286,28 @@ pub struct Launcher {
     pub play_since: Option<std::time::SystemTime>,
     /// The crash report written by the last Play run, if it crashed.
     pub crash_report: Option<PathBuf>,
+    pub local_hash: Option<String>,
+    pub local_desc: String,
+    pub verify: Option<verify::Report>,
+    pub verify_busy: bool,
+    pub saves: Option<Result<Vec<cli::Slot>, String>>,
+    pub backups: Option<(String, Result<Vec<cli::Backup>, String>)>,
+    pub saves_busy: bool,
+    pub saves_msg: String,
+    pub crashes: Option<Result<Vec<String>, String>>,
+    pub crashes_busy: bool,
+    pub log_filter: String,
+    /// The last run's log tail (from its file) when nothing ran in this session.
+    pub last_log: Vec<String>,
+    pub run_log: Option<(PathBuf, std::fs::File)>,
+    /// Seconds of the UTC day when the current Play run started (for "time to world").
+    pub run_tod: Option<f64>,
+    pub perf: Option<perf::Perf>,
+    pub wizard_step: usize,
+    /// Features as they were when the running game started ("restart needed").
+    pub tuning_at_start: Option<tuning::Tuning>,
+    pub report_copied: Option<Instant>,
+    pub shot_wait: u32,
 }
 
 pub fn config_path() -> PathBuf {
@@ -281,7 +361,8 @@ impl Launcher {
         let game_edit = config.game_path.clone();
         let l = Launcher {
             page: Page::Play,
-            page_at: Instant::now(),
+            // in the past: the first frame is fully drawn (no fade-in), even if frames are throttled
+            page_at: Instant::now() - std::time::Duration::from_secs(1),
             started: Instant::now(),
             config,
             runtime_dir: None,
@@ -333,6 +414,25 @@ impl Launcher {
             save_note: String::new(),
             play_since: None,
             crash_report: None,
+            local_hash: None,
+            local_desc: String::new(),
+            verify: None,
+            verify_busy: false,
+            saves: None,
+            backups: None,
+            saves_busy: false,
+            saves_msg: String::new(),
+            crashes: None,
+            crashes_busy: false,
+            log_filter: String::new(),
+            last_log: perf::last_log().map(|p| perf::tail(&p, 400)).unwrap_or_default(),
+            run_log: None,
+            run_tod: None,
+            perf: perf::last_log().map(|p| perf::parse(perf::tail(&p, 20_000).iter().map(String::as_str), None)).filter(|p| p.line().is_some()),
+            wizard_step: 0,
+            tuning_at_start: None,
+            report_copied: None,
+            shot_wait: 0,
         };
         if fresh_cache {
             l.save();
@@ -350,8 +450,41 @@ impl Launcher {
             l.settings_tab = 1;
         }
         if let Some(t) = std::env::args().find_map(|a| a.strip_prefix("--tab=").map(str::to_string)) {
-            l.settings_tab = ["game", "display", "options", "about"].iter().position(|n| *n == t).unwrap_or(l.settings_tab);
+            l.settings_tab = ["game", "display", "options", "about", "runtime", "features"].iter().position(|n| *n == t).unwrap_or(l.settings_tab);
         }
+        // An existing setup skips the first-run wizard.
+        if !l.config.wizard_done && l.game_ok {
+            l.config.wizard_done = true;
+            l.save();
+        }
+        if !l.config.wizard_done && !std::env::args().any(|a| a.starts_with("--page=")) {
+            l.page = Page::Welcome;
+        }
+        // `--page=<name>` opens a page (screenshots, support); `--wizard=N` a wizard step.
+        if let Some(p) = std::env::args().find_map(|a| a.strip_prefix("--page=").map(str::to_string)) {
+            l.page = match p.as_str() {
+                "play" => Page::Play,
+                "news" => Page::News,
+                "setup" => Page::Setup,
+                "logs" => Page::Logs,
+                "links" => Page::Links,
+                "saves" => Page::Saves,
+                "verify" => Page::Verify,
+                "welcome" => Page::Welcome,
+                _ => l.page,
+            };
+            match l.page {
+                Page::Saves => l.refresh_saves(),
+                Page::Verify => l.run_verify(),
+                Page::Logs => l.refresh_crashes(),
+                _ => {}
+            }
+        }
+        if let Some(n) = std::env::args().find_map(|a| a.strip_prefix("--wizard=").and_then(|n| n.parse().ok())) {
+            l.page = Page::Welcome;
+            l.wizard_step = n;
+        }
+        l.refresh_local();
         l
     }
 
@@ -553,14 +686,26 @@ impl Launcher {
             if kind != RunKind::Play {
                 return;
             }
-            let mut cmd = Command::new(runtime::victory_exe());
-            cmd.current_dir(&rt).args(engine::world_args(&self.config, &game));
-            for (k, v) in engine::world_env(&self.config, &game, &self.config.cache_dir) {
+            let exe = self.victory_path();
+            let mut cmd = Command::new(&exe);
+            let args = self.play_args(&game);
+            cmd.current_dir(self.victory_dir()).args(&args);
+            for k in presets::CLEARED {
+                cmd.env_remove(k);
+            }
+            let env = self.play_env(&game);
+            for (k, v) in &env {
                 cmd.env(k, v);
             }
             self.fps = None;
+            self.perf = None;
             self.status = "Running".into();
-            self.log(format!("> victory.exe run \"{}\" --execute", game.join(GAME_EXE).display()), LogKind::Info);
+            self.tuning_at_start = Some(self.config.tuning.clone());
+            self.run_tod = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| (d.as_secs_f64()).rem_euclid(86400.));
+            let path = perf::new_log();
+            self.run_log = std::fs::File::create(&path).ok().map(|f| (path, f));
+            self.log(format!("> {} {}  [{} preset, {}]", exe.display(), args.join(" "), presets::label(&self.config.preset), self.build_label()), LogKind::Info);
+            self.log(format!("  env: {}", env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")), LogKind::Info);
             return self.spawn(cmd, kind);
         }
         let _ = std::fs::create_dir_all(game::dxil_dir(&self.config.cache_dir));
@@ -597,15 +742,17 @@ impl Launcher {
     /// Starts the shader build of the selected engine on its own thread (`shaderbuild`).
     fn start_build(&mut self, game: PathBuf) {
         let world = self.world_selected();
-        let hash = if world { self.world_hash.clone() } else { self.runtime_hash.clone() }.unwrap_or_default();
+        let hash = if world { self.effective_world_hash().map(str::to_string) } else { self.runtime_hash.clone() }.unwrap_or_default();
         let stop = Arc::new(AtomicBool::new(false));
+        let env = if world { self.play_env(&game) } else { Vec::new() };
         let job = shaderbuild::Job {
             world,
-            exe: if world { runtime::victory_exe() } else { runtime::xcl_exe() },
-            runtime: runtime::runtime_dir(),
+            exe: if world { self.victory_path() } else { runtime::xcl_exe() },
+            runtime: if world { self.victory_dir() } else { runtime::runtime_dir() },
             game,
             cache_dir: self.config.cache_dir.trim().to_string(),
             hash,
+            env,
             slow_secs: self.config.skip_slow.then_some(self.config.slow_secs.max(10)),
             stop: stop.clone(),
             tx: self.tx.clone(),
@@ -621,12 +768,245 @@ impl Launcher {
 
     /// True when the selected engine was found beside the launcher.
     pub fn engine_ready(&self) -> bool {
-        if self.world_selected() { self.world_dir.is_some() } else { self.runtime_dir.is_some() && self.runtime_hash.is_some() }
+        if self.world_selected() {
+            if self.local_selected() { self.local_ok() } else { self.world_dir.is_some() }
+        } else {
+            self.runtime_dir.is_some() && self.runtime_hash.is_some()
+        }
     }
 
     /// True when the World engine is selected and present (else Classic is used).
     pub fn world_selected(&self) -> bool {
-        (engine::is_world(&self.config) || self.runtime_hash.is_none()) && self.world_dir.is_some()
+        (engine::is_world(&self.config) || self.runtime_hash.is_none()) && (self.world_dir.is_some() || self.local_selected())
+    }
+
+    /// "Local build" is chosen in Settings, Runtime.
+    pub fn local_selected(&self) -> bool {
+        self.config.runtime_mode == LOCAL
+    }
+
+    pub fn local_ok(&self) -> bool {
+        let p = std::path::Path::new(self.config.local_exe.trim());
+        !self.config.local_exe.trim().is_empty() && p.is_file()
+    }
+
+    /// The World engine executable that runs: the local build, else the bundled runtime.
+    pub fn victory_path(&self) -> PathBuf {
+        if self.local_selected() { PathBuf::from(self.config.local_exe.trim()) } else { runtime::victory_exe() }
+    }
+
+    pub fn victory_dir(&self) -> PathBuf {
+        self.victory_path().parent().map(PathBuf::from).unwrap_or_else(runtime::runtime_dir)
+    }
+
+    /// VICTORY_CACHE_DIR before the preset's own: the local build's cache folder, else `<cache>\victory`.
+    pub fn victory_cache_base(&self) -> PathBuf {
+        if self.local_selected() {
+            if self.config.local_cache.trim().is_empty() { std::path::Path::new(self.config.cache_dir.trim()).join("local") } else { PathBuf::from(self.config.local_cache.trim()) }
+        } else {
+            engine::victory_cache(&self.config.cache_dir)
+        }
+    }
+
+    pub fn victory_cache(&self) -> PathBuf {
+        presets::cache_for(&self.config.preset, &self.victory_cache_base())
+    }
+
+    pub fn effective_world_hash(&self) -> Option<&str> {
+        if self.local_selected() { self.local_hash.as_deref() } else { self.world_hash.as_deref() }
+    }
+
+    /// Which runtime build a run uses, for the Play page and the log.
+    pub fn build_label(&self) -> String {
+        if self.local_selected() {
+            if !self.local_ok() {
+                return "Local build: pick a victory.exe in Settings, Runtime".into();
+            }
+            let d = if self.local_desc.is_empty() { "reading the build…".to_string() } else { self.local_desc.clone() };
+            format!("Local build ({d})")
+        } else {
+            format!("Bundled runtime ({})", presets::BUNDLED_BUILD)
+        }
+    }
+
+    /// `run "<exe>" --execute`, plus the Series S profile (always for Stable and Experimental,
+    /// like play.ps1; Custom follows the Series S option).
+    pub fn play_args(&self, game: &std::path::Path) -> Vec<String> {
+        if self.config.preset == presets::CUSTOM {
+            return engine::world_args(&self.config, game);
+        }
+        vec!["run".into(), game.join(GAME_EXE).display().to_string(), "--execute".into(), "--console".into(), "series-s".into()]
+    }
+
+    /// The World engine environment: the preset's, then Settings, Features, then the launcher's
+    /// `victory.toml` (VICTORY_CONFIG), written here.
+    pub fn play_env(&self, game: &std::path::Path) -> Vec<(&'static str, String)> {
+        let cache = self.victory_cache();
+        let mut env = match self.config.preset.as_str() {
+            presets::EXPERIMENTAL => presets::experimental_env(game, &cache),
+            presets::CUSTOM => {
+                let mut e = engine::world_env(&self.config, game, &self.config.cache_dir);
+                presets::set(&mut e, "VICTORY_CACHE_DIR", cache.display().to_string());
+                e
+            }
+            _ => presets::stable_env(game, &cache),
+        };
+        let t = &self.config.tuning;
+        let fsr = tuning::fsr_available(&self.victory_dir());
+        for (k, v) in t.env(fsr) {
+            presets::set(&mut env, k, v);
+        }
+        if t.perf_log {
+            let level = env.iter().find(|(k, _)| *k == "VICTORY_LOG").map(|(_, v)| v.clone()).unwrap_or_else(|| "info".into());
+            presets::set(&mut env, "VICTORY_LOG", format!("{level},victory_gpu::host=info"));
+        }
+        let toml = runtime::data_dir().join("victory.toml");
+        if tuning::write_toml(&toml, &t.toml_keys(fsr)).is_ok() {
+            presets::set(&mut env, "VICTORY_CONFIG", toml.display().to_string());
+        }
+        env
+    }
+
+    /// Hashes and describes the local build on a worker thread.
+    pub fn refresh_local(&mut self) {
+        self.local_hash = None;
+        self.local_desc.clear();
+        if !self.local_ok() {
+            return;
+        }
+        let exe = PathBuf::from(self.config.local_exe.trim());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Message::Local(runtime::file_hash(&exe), cli::describe(&exe)));
+        });
+    }
+
+    pub fn pick_local_exe(&mut self) {
+        let tx = self.tx.clone();
+        let start = PathBuf::from(self.config.local_exe.trim());
+        std::thread::spawn(move || {
+            let mut d = rfd::FileDialog::new().set_title("Select a victory.exe build").add_filter("victory.exe", &["exe"]);
+            if let Some(dir) = start.parent().filter(|d| d.is_dir()) {
+                d = d.set_directory(dir);
+            }
+            let _ = tx.send(Message::PickedExe(d.pick_file()));
+        });
+    }
+
+    pub fn pick_local_cache(&mut self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Message::PickedCache(rfd::FileDialog::new().set_title("Select the local build's cache folder").pick_folder()));
+        });
+    }
+
+    /// Environment for the runtime's own tools (saves, crashes): the game and the cache.
+    fn tool_env(&self) -> Vec<(&'static str, String)> {
+        let game = PathBuf::from(&self.config.game_path);
+        let mut env = presets::stable_env(&game, &self.victory_cache());
+        env.retain(|(k, _)| matches!(*k, "VICTORY_GAME_DIR" | "VICTORY_CACHE_DIR"));
+        let toml = runtime::data_dir().join("victory.toml");
+        if toml.is_file() {
+            env.push(("VICTORY_CONFIG", toml.display().to_string()));
+        }
+        env
+    }
+
+    pub fn run_verify(&mut self) {
+        if self.verify_busy || !self.game_ok {
+            return;
+        }
+        self.verify_busy = true;
+        let dir = PathBuf::from(&self.config.game_path);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Message::Verified(verify::run(&dir)));
+        });
+    }
+
+    pub fn refresh_saves(&mut self) {
+        if self.saves_busy {
+            return;
+        }
+        self.saves_busy = true;
+        let (exe, env, tx) = (self.victory_path(), self.tool_env(), self.tx.clone());
+        std::thread::spawn(move || {
+            let r = cli::run(&exe, &["saves".into(), "list".into()], &env).map(|t| cli::parse_saves(&t));
+            let _ = tx.send(Message::Saves(r));
+        });
+    }
+
+    pub fn list_backups(&mut self, slot: &str) {
+        let (exe, env, tx, slot) = (self.victory_path(), self.tool_env(), self.tx.clone(), slot.to_string());
+        std::thread::spawn(move || {
+            let r = cli::run(&exe, &["saves".into(), "restore".into(), slot.clone()], &env).map(|t| cli::parse_backups(&t));
+            let _ = tx.send(Message::Backups(slot, r));
+        });
+    }
+
+    /// `victory saves <args>` (backup = copy to a new slot, restore = a container's backup).
+    pub fn saves_command(&mut self, args: Vec<String>) {
+        if self.saves_busy {
+            return;
+        }
+        self.saves_busy = true;
+        self.saves_msg = format!("Running victory saves {}…", args.join(" "));
+        let (exe, env, tx) = (self.victory_path(), self.tool_env(), self.tx.clone());
+        std::thread::spawn(move || {
+            let mut a = vec!["saves".to_string()];
+            a.extend(args);
+            let _ = tx.send(Message::SavesDone(cli::run(&exe, &a, &env)));
+        });
+    }
+
+    pub fn refresh_crashes(&mut self) {
+        if self.crashes_busy {
+            return;
+        }
+        self.crashes_busy = true;
+        let (exe, env, tx) = (self.victory_path(), self.tool_env(), self.tx.clone());
+        std::thread::spawn(move || {
+            let r = match cli::run(&exe, &["crashes".into(), "list".into()], &env) {
+                Ok(t) => Ok(t.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect()),
+                Err(e) if cli::unknown_command(&e) => {
+                    // builds before fx-stable: read the crash folders and the old reports directly
+                    let mut v = cli::crashes_from_folder(&cli::crash_dir());
+                    if let Ok(rd) = std::fs::read_dir(saves::reports_dir()) {
+                        let mut z: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".zip")).collect();
+                        z.sort();
+                        v.extend(z.into_iter().map(|n| format!("{n}  (crash report)")));
+                    }
+                    if v.is_empty() { Err("This runtime build has no `crashes` command and no crash folders were found.".into()) } else { Ok(v) }
+                }
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(Message::Crashes(r));
+        });
+    }
+
+    /// A text bundle for an issue: versions, preset, build, verify result, the readout, the
+    /// crash list and the log tail, with personal folders removed.
+    pub fn crash_report_text(&self) -> String {
+        let mut t = format!("ScarlettPort launcher v{VERSION}\nPreset: {}\nRuntime: {}\nGPU: {}\n", presets::label(&self.config.preset), self.build_label(), self.gpu_name);
+        if let Some(v) = &self.verify {
+            t += &format!("Game files: {} problem(s){}\n", v.problems(), if v.pack_problem { ", pack\\ incomplete or split" } else { "" });
+        }
+        if let Some(p) = self.perf.as_ref().and_then(perf::Perf::line) {
+            t += &format!("Last run: {p}\n");
+        }
+        t += "\nCrashes:\n";
+        match &self.crashes {
+            Some(Ok(v)) => v.iter().for_each(|l| t += &format!("  {l}\n")),
+            Some(Err(e)) => t += &format!("  {e}\n"),
+            None => t += "  (not listed)\n",
+        }
+        t += "\nLog (last 150 lines):\n";
+        let lines: Vec<String> = if self.logs.is_empty() { self.last_log.clone() } else { self.logs.iter().map(|(l, _)| l.clone()).collect() };
+        for l in &lines[lines.len().saturating_sub(150)..] {
+            t += l;
+            t.push('\n');
+        }
+        report::scrub(&t, &[(self.config.game_path.as_str(), "<game>"), (self.config.cache_dir.as_str(), "<cache>")])
     }
 
     fn spawn(&mut self, mut cmd: Command, kind: RunKind) {
@@ -683,7 +1063,8 @@ impl Launcher {
     /// The hash the shaders were built for and the hash of the selected engine.
     fn shader_hashes(&self) -> (&str, Option<&str>) {
         if self.world_selected() {
-            (&self.config.world_shaders_hash, self.world_hash.as_deref())
+            let built = if self.local_selected() { &self.config.local_shaders_hash } else { &self.config.world_shaders_hash };
+            (built, self.effective_world_hash())
         } else {
             (&self.config.shaders_hash, self.runtime_hash.as_deref())
         }
@@ -735,9 +1116,15 @@ impl Launcher {
     /// `--screenshot=FILE` renders the window to a PNG (the launcher's own framebuffer, so
     /// nothing in front of it can end up in the picture), then exits.
     fn screenshot(&mut self, ctx: &egui::Context) {
+        let busy = self.verify_busy || self.saves_busy || self.crashes_busy || self.local_desc.is_empty() && self.local_ok();
         let Some((path, frames)) = &mut self.shot else { return };
         *frames += 1;
-        if *frames == 90 {
+        if *frames == 90 && busy {
+            *frames = 89; // wait for the page's background work (up to the cap below)
+            self.shot_wait += 1;
+        }
+        if *frames == 90 || self.shot_wait > 2400 {
+            self.shot_wait = 0;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
         let image = ctx.input(|i| {
@@ -770,6 +1157,12 @@ impl Launcher {
             match m {
                 Message::Log(t, k) => {
                     parse_line(&t, &self.tx);
+                    if self.running == Some(RunKind::Play) {
+                        if let Some((_, f)) = &mut self.run_log {
+                            use std::io::Write;
+                            let _ = writeln!(f, "{t}");
+                        }
+                    }
                     self.log(t, k);
                 }
                 Message::Fps(f) => {
@@ -798,6 +1191,19 @@ impl Launcher {
                         let since = self.play_since.unwrap_or(std::time::UNIX_EPOCH);
                         self.crash_report = saves::fresh_report(&saves::reports_dir(), since);
                     }
+                    if kind == RunKind::Play {
+                        self.tuning_at_start = None;
+                        if let Some((path, f)) = self.run_log.take() {
+                            drop(f);
+                            let lines = perf::tail(&path, 200_000);
+                            let p = perf::parse(lines.iter().map(String::as_str), self.run_tod);
+                            self.last_log = lines[lines.len().saturating_sub(400)..].to_vec();
+                            if let Some(l) = p.line() {
+                                self.log(format!("Performance: {l}"), LogKind::Info);
+                            }
+                            self.perf = Some(p);
+                        }
+                    }
                     let note = match code {
                         Some(0) => "Finished.".to_string(),
                         Some(c) => format!("Stopped (exit code {c})."),
@@ -813,7 +1219,9 @@ impl Launcher {
                     self.stop = None;
                     match r {
                         Ok(note) => {
-                            if self.world_selected() {
+                            if self.world_selected() && self.local_selected() {
+                                self.config.local_shaders_hash = self.local_hash.clone().unwrap_or_default();
+                            } else if self.world_selected() {
                                 self.config.world_shaders_hash = self.world_hash.clone().unwrap_or_default();
                             } else {
                                 self.config.shaders_hash = self.runtime_hash.clone().unwrap_or_default();
@@ -864,7 +1272,56 @@ impl Launcher {
                     self.folder_busy = false;
                     if let Some(p) = p {
                         self.use_folder(p);
+                        if self.page == Page::Welcome && self.game_ok {
+                            self.wizard_step = 1;
+                            self.run_verify();
+                        }
                     }
+                }
+                Message::PickedExe(p) => {
+                    if let Some(p) = p {
+                        self.config.local_exe = p.display().to_string();
+                        self.config.runtime_mode = LOCAL.into();
+                        self.save();
+                        self.refresh_local();
+                    }
+                }
+                Message::PickedCache(p) => {
+                    if let Some(p) = p {
+                        self.config.local_cache = p.display().to_string();
+                        self.save();
+                    }
+                }
+                Message::Local(hash, desc) => {
+                    self.local_hash = hash;
+                    self.local_desc = desc;
+                }
+                Message::Verified(r) => {
+                    self.verify_busy = false;
+                    self.log(format!("Verify game files: {} problem(s){}", r.problems(), if r.pack_problem { "; pack\\ is incomplete or split" } else { "" }), if r.problems() > 0 { LogKind::Error } else { LogKind::Info });
+                    self.verify = Some(r);
+                }
+                Message::Saves(r) => {
+                    self.saves_busy = false;
+                    self.saves = Some(r);
+                }
+                Message::Backups(slot, r) => self.backups = Some((slot, r)),
+                Message::SavesDone(r) => {
+                    self.saves_busy = false;
+                    self.saves_msg = match r {
+                        Ok(t) => t.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("Done.").trim().to_string(),
+                        Err(e) => format!("Failed: {e}"),
+                    };
+                    self.log(format!("Saves: {}", self.saves_msg), LogKind::Info);
+                    let slot = self.backups.as_ref().map(|(s, _)| s.clone());
+                    self.refresh_saves();
+                    if let Some(s) = slot {
+                        self.list_backups(&s);
+                    }
+                }
+                Message::Crashes(r) => {
+                    self.crashes_busy = false;
+                    self.crashes = Some(r);
                 }
             }
             ctx.request_repaint();
@@ -923,7 +1380,9 @@ fn parse_line(line: &str, tx: &Sender<Message>) {
 
 impl eframe::App for Launcher {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0., 0., 0., 0.]
+        // opaque: a transparent window showed whatever was behind it when frames were late
+        // (another D3D12 app holding the GPU); BG_000
+        [14. / 255., 15. / 255., 18. / 255., 1.]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -960,7 +1419,7 @@ fn main() -> eframe::Result {
             .with_icon(icon())
             .with_resizable(false)
             .with_decorations(false)
-            .with_transparent(true),
+            .with_transparent(false),
         ..Default::default()
     };
     eframe::run_native("ScarlettPort", options, Box::new(|cc| Ok(Box::new(Launcher::new(cc)))))

@@ -88,6 +88,9 @@ pub struct Job {
     pub game: PathBuf,
     pub cache_dir: String,
     pub hash: String,
+    /// The World engine's environment: the selected preset's, so translated shaders land in the
+    /// cache the play runs use, under the same switches.
+    pub env: Vec<(&'static str, String)>,
     /// Some(N): stop a step that prints nothing for N seconds; its shaders compile in game.
     pub slow_secs: Option<u64>,
     pub stop: Arc<AtomicBool>,
@@ -213,7 +216,7 @@ fn world(job: &Job) -> Result<String, String> {
     };
     let base = |c: &mut Command| {
         c.current_dir(&job.runtime);
-        for (k, v) in engine::base_env(&job.game, &job.cache_dir) {
+        for (k, v) in &job.env {
             c.env(k, v);
         }
     };

@@ -15,7 +15,17 @@ report (`src/report.rs`) opens a prefilled issue.
   `xcl shaders ... --precompile --pipelines --only cs`. Progress per phase with the current step and its
   elapsed time; parallel jobs bounded by CPU count and free RAM; resumable (`<cache>\build-*.json`);
   optional skip of slow steps (Settings, Options).
-- **Logs**, **Progress notes**, **Links**, **Settings**.
+- **Presets** (`src/presets.rs`): Stable (the verified C1 environment), Experimental (C1 plus the
+  safe fx-cand2 switches, its own cache) and Custom. **Runtime**: Bundled, or a Local build (any
+  `victory.exe`; updates never touch it).
+- **Settings, Features** (`src/tuning.rs`): full textures, HDR, PlayStation pads, rumble, keyboard
+  hints, frame cap, upscaler/FSR/frame generation, Discord. Set as `VICTORY_*` variables and
+  written to `%LOCALAPPDATA%\ScarlettPort\victory.toml` (passed as `VICTORY_CONFIG`).
+- **Verify game files** (`src/verify.rs`): archives, a complete `pack\` (flags a missing or split
+  one), `dump-manifest.log`, links, empty files. Read-only.
+- **Saves** (`victory saves`), **Logs and crashes** (`victory crashes list`, copy report), a
+  performance readout after each run (`src/perf.rs`), and a first-run wizard.
+- **Progress notes**, **Links**.
 
 ## Build
 
@@ -25,5 +35,6 @@ cargo build --release --locked      # -> target\release\ScarlettPort.exe
 ```
 
 Put `victory.exe` and its `D3D12\` folder in `target\release\runtime\`, or set `SCARLETT_RUNTIME_DIR`.
-`ScarlettPort.exe --screenshot=FILE.png` renders the window to a PNG and exits.
+`ScarlettPort.exe --screenshot=FILE.png` renders the window to a PNG and exits; `--page=play|verify|saves|logs|settings`,
+`--tab=runtime|features|...` and `--wizard=0..4` pick what it shows.
 Releases: `.github/workflows/release.yml` (tag `v*`).

@@ -47,7 +47,7 @@ pub struct Found {
     pub classic: Option<String>,
 }
 
-fn file_hash(p: &Path) -> Option<String> {
+pub fn file_hash(p: &Path) -> Option<String> {
     let bytes = std::fs::read(p).ok().filter(|b| !b.is_empty())?;
     Some(Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect())
 }
