@@ -322,6 +322,19 @@ pub fn config_path() -> PathBuf {
     runtime::data_dir().join("launcher.json")
 }
 
+/// The settings file, or the defaults. A file that does not parse is kept as
+/// `launcher.json.bad` (the next save would otherwise overwrite it) and the defaults are used.
+pub fn load_config(path: &std::path::Path) -> Config {
+    let Ok(bytes) = std::fs::read(path) else { return Config::default() };
+    match serde_json::from_slice(&bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = std::fs::rename(path, path.with_extension("json.bad"));
+            Config::default()
+        }
+    }
+}
+
 pub fn valid_game(dir: &std::path::Path) -> bool {
     dir.join(GAME_EXE).is_file()
 }
@@ -350,10 +363,13 @@ impl Launcher {
             cc.egui_ctx.load_texture("mark", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR)
         };
         let art = cc.egui_ctx.load_texture("art", art::fallback(), egui::TextureOptions::LINEAR);
-        let mut config: Config = std::fs::read(config_path())
-            .ok()
-            .and_then(|v| serde_json::from_slice(&v).ok())
-            .unwrap_or_default();
+        let mut config = load_config(&config_path());
+        if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            // Settings moved over from the former data folder still point into it.
+            for p in [&mut config.cache_dir, &mut config.local_cache] {
+                *p = runtime::migrate_data_path(p, &base);
+            }
+        }
         if !config.engine_v2 {
             // The World engine is the default now: its shader build takes minutes, not hours.
             config.engine = engine::WORLD.to_string();
@@ -1509,6 +1525,31 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_settings_are_kept_and_defaults_used() {
+        let d = std::env::temp_dir().join(format!("sp-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("launcher.json");
+        let fresh = load_config(&p);
+        assert_eq!(fresh.preset, presets::STABLE, "fresh install: defaults");
+        assert!(fresh.auto_update && fresh.console_s && !fresh.wizard_done);
+        std::fs::write(&p, br#"{"game_path": "D:/g", "preset": 3"#).unwrap();
+        let c = load_config(&p);
+        assert!(c.game_path.is_empty() && c.console_s);
+        assert!(d.join("launcher.json.bad").is_file(), "the broken file is kept");
+        let mut c = Config::default();
+        c.game_path = "D:/Spiele/Zoë's game".into();
+        c.preset = presets::LOOK.into();
+        c.tuning.overlay = true;
+        std::fs::write(&p, serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        let back = load_config(&p);
+        assert_eq!((back.game_path.as_str(), back.preset.as_str(), back.tuning.overlay), ("D:/Spiele/Zoë's game", presets::LOOK, true));
+        std::fs::write(&p, b"{}").unwrap();
+        assert!(load_config(&p).fallback_light, "missing fields take their defaults");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn parse(s: &str) -> Vec<String> {
         let (tx, rx) = channel();
