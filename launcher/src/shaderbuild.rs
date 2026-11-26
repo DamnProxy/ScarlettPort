@@ -415,14 +415,19 @@ fn world_split(job: &Job) -> Result<String, String> {
             }
         })?;
         match out {
-            Outcome::Exit(Some(0)) if p.done == 0 && untranslated == 0 => {
-                return Err(format!("No shaders found in {}: is it the right game folder? Nothing was marked as built.", job.game.display()));
+            Outcome::Exit(Some(0)) if engine::too_few_shaders(p.done) => {
+                return Err(format!(
+                    "Preparation translated only {} shaders (about {} expected) from {}: wrong game folder, or the engine cannot read it. Nothing was marked as prepared; see Logs.",
+                    p.done,
+                    engine::SHADERS_TOTAL,
+                    job.game.display()
+                ));
             }
             Outcome::Exit(Some(0)) => {
                 st.warm = true;
                 st.save(&path);
             }
-            Outcome::Exit(c) => return Err(format!("scarlett shaders failed (exit code {c:?}); see Logs")),
+            Outcome::Exit(c) => return Err(format!("scarlett shaders failed (exit code {c:?}){}; see Logs", agility_note(&job.exe))),
             Outcome::Stopped | Outcome::Idle => return Err("Stopped. Press Build shaders again to resume.".into()),
         }
     }
@@ -458,6 +463,15 @@ fn world_split(job: &Job) -> Result<String, String> {
     } else {
         format!("Shaders built in {took}; {untranslated} do not translate yet (see Logs).")
     })
+}
+
+/// A hint when the D3D12 Agility folder is missing beside the engine (D3D12 then fails to start,
+/// 0x887E0003); the release ZIP has it in runtime\D3D12.
+fn agility_note(exe: &Path) -> String {
+    match exe.parent() {
+        Some(d) if !d.join("D3D12").join("D3D12Core.dll").is_file() => format!(". No D3D12/D3D12Core.dll beside {}: keep the D3D12 folder from the release next to it", exe.display()),
+        _ => String::new(),
+    }
 }
 
 /// Phase 2: `scarlett <step> --jobs N` (`warm`, or a command that builds every pipeline).
