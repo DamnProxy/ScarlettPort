@@ -87,7 +87,7 @@ jobs:
           Built from ``${{ github.sha }}`` by the [Release workflow](https://github.com/${{ github.repository }}/actions/workflows/release.yml).
 
           ### Shader build
-          The launcher builds the shader cache with the World engine (``scarlett shaders``, a few minutes, then ``scarlett warm`` for the pipelines earlier runs recorded), shown phase by phase with the current step and its elapsed time, and resumable. See the README FAQ if a build looks stuck.
+          Play prepares the shader cache once by itself (``scarlett shaders``, a few minutes after a scan of the game files, then the engine's pipeline step), for each engine build, graphics driver and preset; it shows the phase, the time left and a "skip this time" link, and is not repeated while nothing changed. Prepare shaders (Settings) still runs it by hand. See the README FAQ if a build looks stuck.
 
           ### Verify the download
           These files are **not code-signed**, so Windows SmartScreen may warn on first run ("More info", then "Run anyway"). Compare the SHA-256 before running:
