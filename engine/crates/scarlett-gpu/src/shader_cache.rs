@@ -436,3 +436,7 @@ mod tests {
         assert_eq!(decode(b"VSH0"), None);
     }
 }
+
+/// The shader translator's fingerprint (a hash of its sources, from build.rs),
+/// part of every cache key; `scarlett fingerprint` prints it.
+pub const TRANSLATOR: &str = env!("SCARLETT_TRANSLATOR");

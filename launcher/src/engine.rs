@@ -101,6 +101,13 @@ pub fn parse_warm_plan(line: &str) -> Option<u64> {
     rest.split_once(" to make")?.0.trim().parse().ok()
 }
 
+/// `scarlett prepare` progress: `prepare progress library 1000 5200` -> (1000, 5200).
+pub fn parse_prepare_progress(line: &str) -> Option<(u64, u64)> {
+    let mut w = line.trim().strip_prefix("prepare progress ")?.split_whitespace();
+    let (_, done, total) = (w.next()?, w.next()?, w.next()?);
+    Some((done.parse().ok()?, total.parse().ok()?))
+}
+
 /// `scarlett warm` progress: `1000 of 5200, 40 s` -> 1000.
 pub fn parse_warm_made(line: &str) -> Option<u64> {
     let (n, rest) = line.trim().split_once(" of ")?;
@@ -299,6 +306,8 @@ mod tests {
         assert_eq!(parse_warm_made("1000 of 5200, 40 s"), Some(1000));
         assert_eq!(parse_warm_made("pipeline 7 0123abcd: compiler ended of itself s"), None);
         assert_eq!(parse_warm_made("100 made in 12 s (0 have no host pipeline, 0 ended their process); ms each: median 1.0"), None);
+        assert_eq!(parse_prepare_progress("prepare progress library 1000 5200"), Some((1000, 5200)));
+        assert_eq!(parse_prepare_progress("prepare step 2/3 library"), None);
     }
 
     #[test]

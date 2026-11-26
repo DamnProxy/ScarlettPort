@@ -509,6 +509,15 @@ fn pipelines(job: &Job, base: &dyn Fn(&mut Command), p: &mut Progress, share: f3
         if let Some(n) = engine::parse_warm_made(l) {
             p.done = n.min(p.total);
         }
+        if let Some((n, t)) = engine::parse_prepare_progress(l) {
+            if *planned != Some(t) {
+                *planned = Some(t);
+                p.total = t;
+                p.current = if t == 0 { "no recorded pipelines to make".into() } else { format!("{t} pipelines") };
+                p.current_since = Instant::now();
+            }
+            p.done = n.min(t);
+        }
         if !l.is_empty() {
             p.last_output = Instant::now();
         }

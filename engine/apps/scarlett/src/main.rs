@@ -155,6 +155,10 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Print the shader translator's fingerprint (`translator <hex>`): the
+    /// shader cache is valid for one fingerprint, so a launcher re-prepares
+    /// only when it changes.
+    Fingerprint,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -248,6 +252,10 @@ fn main() -> Result<()> {
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         #[cfg(windows)]
         Command::Prepare { jobs, all } => warm::prepare(jobs, all),
+        Command::Fingerprint => {
+            println!("translator {}", scarlett_hle::SHADER_TRANSLATOR);
+            Ok(())
+        }
         Command::Run {
             exe,
             unimplemented,
