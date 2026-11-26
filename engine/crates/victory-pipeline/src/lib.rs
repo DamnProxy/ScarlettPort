@@ -10,7 +10,6 @@
 //! a game update or a converter fix only redoes what changed.
 
 mod cache;
-pub mod stamped;
 
 pub use cache::{Cache, CacheKey};
 

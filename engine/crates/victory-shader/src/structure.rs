@@ -142,52 +142,6 @@ impl Bools {
         vars.into_iter().map(|v| self.atoms[v as usize]).collect()
     }
 
-    /// Whether `m` is the same in every lane where `r` holds, lanes being alike in the atoms
-    /// `same` accepts (values every lane shares): no two such lanes where `r` holds, one
-    /// with `m` and one without. `false` when the search grows past its budget.
-    pub fn uniform_within(&self, m: Bool, r: Bool, same: &dyn Fn(Atom) -> bool) -> bool {
-        let mut seen = std::collections::HashSet::new();
-        let mut budget = 200_000usize;
-        !self.differ([r, m, r, m], same, &mut seen, &mut budget)
-    }
-
-    /// (r1, m1, r2, m2): whether lane 1 can have `r` and `m`, and lane 2 `r` and not `m`.
-    fn differ(
-        &self,
-        s: [Bool; 4],
-        same: &dyn Fn(Atom) -> bool,
-        seen: &mut std::collections::HashSet<[Bool; 4]>,
-        budget: &mut usize,
-    ) -> bool {
-        let [r1, m1, r2, m2] = s;
-        if r1 == Bool::FALSE || m1 == Bool::FALSE || r2 == Bool::FALSE || m2 == Bool::TRUE {
-            return false;
-        }
-        if r1 == Bool::TRUE && m1 == Bool::TRUE && r2 == Bool::TRUE && m2 == Bool::FALSE {
-            return true;
-        }
-        if *budget == 0 {
-            return true;
-        }
-        *budget -= 1;
-        if !seen.insert(s) {
-            return false;
-        }
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = s.iter().map(|&b| top(b)).min().unwrap_or(TERMINAL);
-        let c: Vec<(Bool, Bool)> = s.iter().map(|&b| self.split(b, v)).collect();
-        let pick = |x: (Bool, Bool), one: bool| if one { x.1 } else { x.0 };
-        if same(self.atoms[v as usize]) {
-            [false, true]
-                .into_iter()
-                .any(|x| self.differ([pick(c[0], x), pick(c[1], x), pick(c[2], x), pick(c[3], x)], same, seen, budget))
-        } else {
-            [(false, false), (false, true), (true, false), (true, true)].into_iter().any(|(a, b)| {
-                self.differ([pick(c[0], a), pick(c[1], a), pick(c[2], b), pick(c[3], b)], same, seen, budget)
-            })
-        }
-    }
-
     fn vars(&self, b: Bool) -> Vec<u32> {
         let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
@@ -838,6 +792,9 @@ impl<'a> Lanes<'a> {
             .iter()
             .enumerate()
             .map(|(n, block)| {
+                // Reachability is fixed within the block. Vector instructions
+                // with the same EXEC therefore need the same guard.
+                let mut last_guard = None;
                 block
                     .insts
                     .iter()
@@ -847,8 +804,16 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
-                        (&Some(e), _) if b.implies(cond[n], e) => None,
-                        (&Some(e), _) => Some(b.given(e, cond[n])),
+                        (&Some(e), _) => {
+                            if let Some((prev, guard)) = last_guard
+                                && prev == e
+                            {
+                                return guard;
+                            }
+                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
+                            last_guard = Some((e, guard));
+                            guard
+                        }
                     })
                     .collect()
             })
@@ -1621,6 +1586,37 @@ mod tests {
         assert_eq!(s.guards[0][0], None, "the compare runs in every lane");
         let g = s.guards[0][1].expect("guard");
         assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
+    }
+
+    #[test]
+    fn guards_follow_exec_and_block_reachability() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBF88_0005, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7DA4_0880, // v_cmpx_eq_u32 exec, 0, v4
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let lane = |block: usize, i: usize| {
+            Atom::Lane(p.blocks[block].insts[i].write(Reg::S(EXEC)).unwrap())
+        };
+        let a = s.guards[0][1].unwrap();
+        let b = s.guards[1][2].unwrap();
+        assert_eq!(s.bools.node(a), Some((lane(0, 0), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[0], [None, Some(a), Some(a), None]);
+        // The fallthrough already implies the first compare. Only the second
+        // compare needs testing, and the scalar move never needs a guard.
+        assert_eq!(s.bools.node(b), Some((lane(1, 1), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[1], [None, None, Some(b), None, Some(b)]);
     }
 
     #[test]

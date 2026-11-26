@@ -13,10 +13,8 @@ pub mod emit;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
-pub mod merged;
 pub mod native;
 pub mod resource;
-pub mod rules;
 pub mod spill;
 pub mod structure;
 
@@ -25,17 +23,6 @@ pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
-
-/// Deterministic BLAKE3 hex digest of `victory-shader`'s source tree, computed
-/// at build time. It names this translator: a cached translation records the
-/// digest it was last verified with, and one made by another digest is checked
-/// against the per-rule fingerprints of [`rules`] (and, where those moved,
-/// translated again and compared) instead of being thrown away.
-pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
-
-/// Every `VICTORY_*` switch this crate's source names, comma-separated
-/// (`build.rs`, after fxceless 8dd30ab): the shader cache keys on their values.
-pub const SWITCHES: &str = env!("VICTORY_SHADER_SWITCHES");
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {

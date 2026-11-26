@@ -1,8 +1,9 @@
 //! The title's life cycle. A console title is never told it is closing:
-//! quitting it or launching a new game first suspends it (its suspend
-//! routines run, and it has a second to save) and then ends the process.
-//! Closing the title's window does the same here; a new launch then starts
-//! `victory` again, which waits for this process to be gone.
+//! quitting it or launching a new game first constrains it (its
+//! constrained-change routines run), then suspends it (its suspend routines
+//! run, and it has a second to save) and then ends the process. Closing the
+//! title's window does the same here; a new launch then starts `victory`
+//! again, which waits for this process to be gone.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -19,13 +20,25 @@ use windows_sys::core::{PCSTR, PCWSTR, w};
 
 use crate::{HleModule, hle_export};
 
-type Routine = extern "system" fn(quiesced: u8, context: *mut c_void);
+/// A suspend routine (`quiesced`) or a constrained-change routine
+/// (`constrained`): both take a flag and the title's context.
+type Routine = extern "system" fn(flag: u8, context: *mut c_void);
 
-/// Registration id, routine and context of each suspend routine.
-static ROUTINES: Mutex<Vec<(usize, Routine, usize)>> = Mutex::new(Vec::new());
+/// Registration id, routine and context.
+type Registration = (usize, Routine, usize);
 
-fn routines() -> MutexGuard<'static, Vec<(usize, Routine, usize)>> {
+/// Each suspend routine.
+static ROUTINES: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
+
+/// Each constrained-change routine.
+static CONSTRAINED: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
+
+fn routines() -> MutexGuard<'static, Vec<Registration>> {
     ROUTINES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn constrained() -> MutexGuard<'static, Vec<Registration>> {
+    CONSTRAINED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// How long the console lets suspend routines run before it ends the title.
@@ -33,7 +46,9 @@ const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
-pub extern "system" fn RegisterAppStateChangeNotification(
+/// Adds `routine` to `list` and writes its registration id.
+fn register(
+    mut list: MutexGuard<'static, Vec<Registration>>,
     routine: Option<Routine>,
     context: *mut c_void,
     registration: *mut usize,
@@ -46,14 +61,36 @@ pub extern "system" fn RegisterAppStateChangeNotification(
     }
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    routines().push((id, routine, context as usize));
+    list.push((id, routine, context as usize));
     // SAFETY: checked non-null; the title passes room for its registration.
     unsafe { registration.write(id) };
     0
 }
 
+pub extern "system" fn RegisterAppStateChangeNotification(
+    routine: Option<Routine>,
+    context: *mut c_void,
+    registration: *mut usize,
+) -> u32 {
+    register(routines(), routine, context, registration)
+}
+
 pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize) {
     routines().retain(|&(id, ..)| id != registration);
+}
+
+/// The host's own version never calls the routine (a desktop app is never
+/// constrained), so a title waiting for it would never suspend.
+pub extern "system" fn RegisterAppConstrainedChangeNotification(
+    routine: Option<Routine>,
+    context: *mut c_void,
+    registration: *mut usize,
+) -> u32 {
+    register(constrained(), routine, context, registration)
+}
+
+pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: usize) {
+    constrained().retain(|&(id, ..)| id != registration);
 }
 
 /// The window procedure a title window had before ours.
@@ -74,9 +111,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
-    let titled = scarlett_title_w(parent, name);
-    let name = titled.as_ref().map_or(name, |t| t.as_ptr());
-    // SAFETY: the title's own arguments, forwarded (the size fitted, a top-level caption prefixed).
+    // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -102,9 +137,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
-    let titled = scarlett_title_a(parent, name);
-    let name = titled.as_ref().map_or(name, |t| t.as_ptr());
-    // SAFETY: the title's own arguments, forwarded (the size fitted, a top-level caption prefixed).
+    // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -114,64 +147,66 @@ pub extern "system" fn CreateWindowExA(
     hwnd
 }
 
-/// ScarlettPort: a top-level window's caption starts with "ScarlettPort" (so the window and the
-/// process are recognisable as ScarlettPort's). Child windows and unnamed ones are left alone.
-const CAPTION_PREFIX: &str = "ScarlettPort";
-
-fn scarlett_title_w(parent: HWND, name: PCWSTR) -> Option<Vec<u16>> {
-    if !parent.is_null() {
-        return None;
-    }
-    let mut own: Vec<u16> = Vec::new();
-    if !name.is_null() {
-        // SAFETY: the title's NUL-terminated caption.
-        unsafe {
-            let mut i = 0;
-            while *name.add(i) != 0 && i < 4096 {
-                own.push(*name.add(i));
-                i += 1;
-            }
-        }
-    }
-    let text = if own.is_empty() { CAPTION_PREFIX.to_owned() } else { format!("{CAPTION_PREFIX} - {}", String::from_utf16_lossy(&own)) };
-    Some(text.encode_utf16().chain([0]).collect())
-}
-
-fn scarlett_title_a(parent: HWND, name: PCSTR) -> Option<Vec<u8>> {
-    if !parent.is_null() {
-        return None;
-    }
-    let mut out = CAPTION_PREFIX.as_bytes().to_vec();
-    if !name.is_null() {
-        // SAFETY: the title's NUL-terminated caption.
-        let own = unsafe { std::ffi::CStr::from_ptr(name.cast()) }.to_bytes();
-        if !own.is_empty() {
-            out.extend_from_slice(b" - ");
-            out.extend_from_slice(own);
-        }
-    }
-    out.push(0);
-    Some(out)
-}
 /// A console title sizes its window to its render target (
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
-/// chain stretches).
+/// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
+/// limit without changing the title's render targets.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
-    let fitted = fit_into(&area, width, height);
+    let limit = window_limit();
+    let fitted = fit_with_limit(&area, width, height, limit);
     if !parent.is_null() || known == 0 || fitted == (width, height) {
         return (x, y, width, height);
     }
-    tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
+    tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
     let (w, h) = fitted;
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
+    let (width, height) = value.trim().split_once(['x', 'X'])?;
+    let (width, height) = (width.trim().parse().ok()?, height.trim().parse().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn window_limit() -> Option<(i32, i32)> {
+    static LIMIT: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var_os("VICTORY_WINDOW_MAX")?;
+        let parsed = value.to_str().and_then(parse_window_limit);
+        if parsed.is_none() {
+            tracing::warn!(
+                ?value,
+                "ignoring invalid VICTORY_WINDOW_MAX; expected positive WIDTHxHEIGHT"
+            );
+        }
+        parsed
+    })
+}
+
+fn fit_with_limit(
+    area: &RECT,
+    width: i32,
+    height: i32,
+    limit: Option<(i32, i32)>,
+) -> (i32, i32) {
+    let Some((max_width, max_height)) = limit else {
+        return fit_into(area, width, height);
+    };
+    let bounded = RECT {
+        left: 0,
+        top: 0,
+        right: (area.right - area.left).min(max_width),
+        bottom: (area.bottom - area.top).min(max_height),
+    };
+    fit_into(&bounded, width, height)
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
@@ -212,11 +247,8 @@ extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     // A user close (close button, Alt+F4, window or taskbar menu); a
-    // console title never sees one, nor a WM_CLOSE from it. A WM_CLOSE
-    // without the menu command (`taskkill` without /F, a tool closing the
-    // window) too: the title's procedure hands it to DefWindowProc, which
-    // destroys the window, and the title went on running with none.
-    if is_user_close(message, wparam) {
+    // console title never sees one, nor a WM_CLOSE from it.
+    if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -229,47 +261,6 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
-    // The mouse cursor for keyboard and mouse play (`gameinput::cursor`):
-    // hidden over the window while captured, captured by a click, freed when
-    // the window loses focus. The title still sees every message.
-    match message {
-        // (The settings overlay draws its own pointer: no system cursor then either.)
-        wm::WM_SETCURSOR
-            if (super::gameinput::cursor::captured() || victory_core::overlay::is_open())
-                && lparam as u32 & 0xFFFF == wm::HTCLIENT =>
-        {
-            // SAFETY: no cursor while it is over our client area.
-            unsafe { wm::SetCursor(std::ptr::null_mut()) };
-            return 1;
-        }
-        wm::WM_LBUTTONDOWN | wm::WM_RBUTTONDOWN | wm::WM_MBUTTONDOWN => {
-            super::gameinput::cursor::note_window(hwnd as usize);
-            super::gameinput::cursor::click();
-        }
-        wm::WM_SETFOCUS => super::gameinput::cursor::note_window(hwnd as usize),
-        // Focus moving to a window of ours (the splash, an overlay, a
-        // dialog) or to none is not a loss; the host poll frees the cursor
-        // when another program is in front.
-        wm::WM_KILLFOCUS => super::gameinput::cursor::focus_moved(wparam, "WM_KILLFOCUS"),
-        wm::WM_ACTIVATE => {
-            if wparam & 0xFFFF == wm::WA_INACTIVE as usize {
-                super::gameinput::cursor::focus_moved(lparam as usize, "WM_ACTIVATE");
-            } else {
-                super::gameinput::cursor::note_window(hwnd as usize);
-            }
-            if super::gameinput::cursor::captured() {
-                super::gameinput::cursor::clip(super::gameinput::cursor::target());
-            }
-        }
-        // The system lets go of the clip when windows move; hold it again.
-        wm::WM_MOVE | wm::WM_SIZE | wm::WM_WINDOWPOSCHANGED
-            if super::gameinput::cursor::captured() =>
-        {
-            super::gameinput::cursor::clip(super::gameinput::cursor::target());
-        }
-        wm::WM_CAPTURECHANGED => tracing::debug!("WM_CAPTURECHANGED"),
-        _ => {}
-    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
@@ -281,12 +272,6 @@ extern "system" fn window_proc(
     }
 }
 
-/// Whether a window message asks to close the window (see `window_proc`).
-fn is_user_close(message: u32, wparam: WPARAM) -> bool {
-    message == wm::WM_CLOSE
-        || message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize
-}
-
 /// Suspends the title as the console does when it ends it, runs `then`
 /// (once), then ends the process. Returns at once; later calls do nothing.
 pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
@@ -294,8 +279,13 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
     }
+    let constrain = constrained().clone();
     let suspend = routines().clone();
-    tracing::info!(routines = suspend.len(), "{why}: suspending the title");
+    tracing::info!(
+        constrained = constrain.len(),
+        routines = suspend.len(),
+        "{why}: suspending the title"
+    );
     // Whoever comes first (the routines or the deadline) runs `then`; the
     // other waits for it, so the process never ends halfway through.
     let then = std::sync::Arc::new(Mutex::new(Some(then)));
@@ -311,15 +301,23 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     // Not on the calling thread: titles hand the suspend to their window
     // thread and wait for it inside the routine.
     std::thread::spawn(move || {
-        for (_, routine, context) in suspend {
-            routine(1, context as *mut c_void);
-        }
+        constrain_then_suspend(&constrain, &suspend);
         finish("title suspended");
     });
     std::thread::spawn(move || {
         std::thread::sleep(SUSPEND_DEADLINE);
         late("title did not finish suspending in time");
     });
+}
+
+/// Runs the constrained-change routines (constrained), then the suspend
+/// routines (quiesced), as the console does when it suspends a title.
+/// Grand Theft Auto VI's suspend routine waits for a state that only its
+/// constrained routine brings about; called alone it never returns.
+fn constrain_then_suspend(constrain: &[Registration], suspend: &[Registration]) {
+    for &(_, routine, context) in constrain.iter().chain(suspend) {
+        routine(1, context as *mut c_void);
+    }
 }
 
 /// Set in the environment of a relaunched `victory`: an inherited handle
@@ -396,6 +394,8 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(RegisterAppStateChangeNotification),
             hle_export!(UnregisterAppStateChangeNotification),
+            hle_export!(RegisterAppConstrainedChangeNotification),
+            hle_export!(UnregisterAppConstrainedChangeNotification),
             hle_export!(CreateWindowExW),
             hle_export!(CreateWindowExA),
         ],
@@ -405,18 +405,6 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn close_messages_end_the_title_and_other_commands_do_not() {
-        // The close button and Alt+F4 (the menu command, with the low
-        // bits the system may set), and a plain WM_CLOSE.
-        assert!(is_user_close(wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize));
-        assert!(is_user_close(wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize | 2));
-        assert!(is_user_close(wm::WM_CLOSE, 0));
-        assert!(!is_user_close(wm::WM_SYSCOMMAND, wm::SC_KEYMENU as usize));
-        assert!(!is_user_close(wm::WM_SYSCOMMAND, wm::SC_MINIMIZE as usize));
-        assert!(!is_user_close(wm::WM_DESTROY, 0));
-    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 
@@ -437,6 +425,40 @@ mod tests {
     }
 
     #[test]
+    fn constrained_registrations_come_and_go() {
+        let (mut a, mut b) = (0, 0);
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut a),
+            0
+        );
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut b),
+            0
+        );
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(None, std::ptr::null_mut(), &mut a),
+            ERROR_INVALID_PARAMETER
+        );
+        UnregisterAppConstrainedChangeNotification(a);
+        let left: Vec<_> = constrained().iter().map(|r| r.0).collect();
+        assert_eq!(left, [b]);
+    }
+
+    /// What `recording_routine` saw: (context, flag) per call, in order.
+    static CALLS: Mutex<Vec<(usize, u8)>> = Mutex::new(Vec::new());
+
+    extern "system" fn recording_routine(flag: u8, context: *mut c_void) {
+        CALLS.lock().unwrap().push((context as usize, flag));
+    }
+
+    #[test]
+    fn constrained_routines_run_before_suspend_routines() {
+        let r: Routine = recording_routine;
+        constrain_then_suspend(&[(1, r, 10), (2, r, 11)], &[(3, r, 20), (4, r, 21)]);
+        assert_eq!(*CALLS.lock().unwrap(), [(10, 1), (11, 1), (20, 1), (21, 1)]);
+    }
+
+    #[test]
     fn oversized_windows_shrink_to_the_screen() {
         let area = RECT {
             left: 0,
@@ -450,6 +472,63 @@ mod tests {
             fit_into(&area, wm::CW_USEDEFAULT, 0),
             (wm::CW_USEDEFAULT, 0)
         );
+    }
+
+    #[test]
+    fn configured_window_limit_fits_4k_into_1080p() {
+        let area = RECT {
+            left: 100,
+            top: 50,
+            right: 2660,
+            bottom: 1490,
+        };
+        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((1920, 1080))), (1920, 1080));
+        assert_eq!(fit_with_limit(&area, 640, 480, Some((1920, 1080))), (640, 480));
+        assert_eq!(fit_with_limit(&area, 3840, 2160, None), (2560, 1440));
+    }
+
+    #[test]
+    fn configured_window_limit_still_respects_the_work_area() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((2560, 1440))), (1848, 1040));
+        assert_eq!(
+            fit_with_limit(&area, wm::CW_USEDEFAULT, 0, Some((1920, 1080))),
+            (wm::CW_USEDEFAULT, 0)
+        );
+    }
+
+    #[test]
+    fn configured_window_limit_preserves_non_widescreen_proportions() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
+    }
+
+    #[test]
+    fn window_limit_requires_two_positive_dimensions() {
+        assert_eq!(parse_window_limit("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_window_limit(" 1920 X 1080 "), Some((1920, 1080)));
+        for bad in [
+            "",
+            "1920",
+            "0x1080",
+            "1920x0",
+            "-1x1080",
+            "1920x-1",
+            "1920x1080x2",
+            "2147483648x1080",
+        ] {
+            assert_eq!(parse_window_limit(bad), None, "{bad}");
+        }
     }
 
     #[test]

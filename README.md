@@ -1,5 +1,8 @@
-<p align="center"><a href="https://github.com/ZigZagBoi1/ScarlettPort/stargazers"><img src="https://img.shields.io/github/stars/ZigZagBoi1/ScarlettPort?style=for-the-badge&logo=github&label=Star%20ScarlettPort&color=ffd700" alt="Star ScarlettPort on GitHub"></a></p>
-<p align="center"><b>⭐ If ScarlettPort helps you, please star the repo — it helps more people find it.</b></p>
+<p align="center"><a href="https://github.com/ZigZagBoi1/ScarlettPort"><img src="https://img.shields.io/github/stars/ZigZagBoi1/ScarlettPort?style=for-the-badge&logo=github&label=Star%20ScarlettPort&color=ffd700" alt="Star ScarlettPort on GitHub"></a></p>
+<p align="center"><b>⭐ If ScarlettPort helps you, please star the repo, it helps more people find it.</b></p>
+
+> **New in 0.4.6:** the engine's renderer was rebuilt on a new base for a much more complete picture: lit rooms without ray tracing, ambient and sky light, textures shown complete, correct faces and clothing. On an RTX 3060 this picture currently runs at about 1 fps in the world, slower than 0.4.5's darker picture (about 5 fps); frame rate is the next focus. Run **Prepare shaders** in the launcher before the first play.
+
 
 <div align="center">
 

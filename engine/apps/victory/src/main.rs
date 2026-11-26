@@ -3,21 +3,8 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
-mod census;
-mod inspect;
-mod prewarm;
-mod run;
-mod saves;
-mod shader;
-mod translate;
 
-use std::path::PathBuf;
-
-use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
-
-// Agility SDK opt-in: Windows 10 loads D3D12Core.dll 1.614 from .\D3D12\
-// next to the executable (the inbox runtime refuses HEAP_DIRECTLY_INDEXED).
+// Agility SDK opt-in: Windows 10 needs the D3D12 runtime from .\D3D12\ next to the executable
 #[repr(transparent)]
 pub struct SdkPath(*const u8);
 unsafe impl Sync for SdkPath {}
@@ -31,10 +18,24 @@ pub static D3D12SDKVersion: u32 = 614;
 #[unsafe(no_mangle)]
 #[allow(non_upper_case_globals)]
 pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr().cast());
+mod census;
+mod inspect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod replay;
+mod run;
+mod shader;
+mod translate;
+#[cfg(windows)]
+mod warm;
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
-    name = "scarlett",
+    name = "victory",
     version,
     about = "Run an Xbox Series title natively on Windows"
 )]
@@ -105,58 +106,41 @@ enum Command {
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
-        /// cache and nothing else is done. Set `VICTORY_HOST_MAX_WAVE` and
+        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
     },
-    /// Translate the shaders of a title's archives into the cache and make
-    /// their compute pipelines, so that a run finds them there.
-    Warm {
+    /// Translate every shader found (as `translate` finds them) into the
+    /// shader cache, so that no run has to: a few minutes, once per change
+    /// of the translator.
+    Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Only translate: no host pipelines.
-        #[arg(long)]
-        no_pipelines: bool,
-        /// Bring the cache up to date with this build's translator and say how much of it
-        /// changed: entries of another translator build whose rules did not change are
-        /// restamped, the others translated again and compared; a shader whose output is
-        /// the same keeps its entry and its compiled pipelines.
-        #[arg(long)]
-        incremental: bool,
-        /// With --incremental: translate every shader again whatever its entry's rule stamp
-        /// says (the check on the stamps).
-        #[arg(long, requires = "incremental")]
-        verify_all: bool,
     },
-    /// Make the host pipelines of the graphics records of the title's
-    /// precompiled pipeline cache (in its shaders.rpf) into the pipeline
-    /// library, at low priority, so that a run with
-    /// VICTORY_PRECOMPILED_GRAPHICS=1 compiles none of them. Needs a GPU.
-    PrecompileGraphics {
-        /// The title's shaders.rpf (default: shaders.rpf of the configured
-        /// game folder).
-        archive: Option<PathBuf>,
-        /// Worker threads (default: half the logical cores).
+    /// Make the host pipelines of every pipeline the title ever created
+    /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
+    /// driver's cache on disk has them before a run needs one: once per change
+    /// of the translator or the driver. Goes on where it was stopped.
+    #[cfg(windows)]
+    Warm {
+        /// Processes at once (default: two thirds of the logical cores).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Only the first N records (after --skip).
+        /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
-        /// Leave out the first N records (of those chosen).
-        #[arg(long, default_value_t = 0)]
-        skip: usize,
-        /// Only records with a mesh shader.
+        /// Those made before too.
         #[arg(long)]
-        mesh: bool,
-    },
-    /// First-boot prewarm: a manifest (hashes only) of what a warm cache holds, and making it
-    /// into this machine's caches from its own game files.
-    Prewarm {
-        #[command(subcommand)]
-        action: Prewarm,
+        again: bool,
+        /// Only the pipelines earlier runs drew with.
+        #[arg(long)]
+        used: bool,
+        /// (What the processes it starts are given.)
+        #[arg(long, hide = true)]
+        these: Option<String>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -178,50 +162,12 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Run a captured frame's GPU work again (diagnostics builds; see
+    /// docs/replay.md).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
-    /// Manage save slots (`VICTORY_SAVE_SLOT=<name>` picks one when running).
-    Saves {
-        /// Title id (8 hex digits); default: every title with data.
-        #[arg(long)]
-        title: Option<String>,
-        #[command(subcommand)]
-        action: saves::Saves,
-    },
-}
-
-#[derive(Subcommand)]
-enum Prewarm {
-    /// Write the manifest of the configured cache (it must be warm): the hashes of the
-    /// containers of the game files it holds translations of, and the pipeline keys its runs
-    /// asked for. Needs the host GPU the cache was warmed on (the keys depend on it).
-    Manifest {
-        /// Game files (default: the configured game folder's shaders.rpf).
-        paths: Vec<PathBuf>,
-        #[arg(long, short)]
-        out: PathBuf,
-        /// Worker threads (default: every logical core but one).
-        #[arg(long)]
-        jobs: Option<usize>,
-        /// The cache was warmed by fx-cand, whose key names only its eight switches (fx-cand2
-        /// names every switch of the translator, so it finds none of those entries).
-        #[arg(long)]
-        cand_key: bool,
-    },
-    /// Translate and compile what the manifest lists into the configured cache, at background
-    /// priority; prints `PREWARM <phase> <done> <total>`. Stopping it keeps what was done.
-    Run {
-        /// Game files (default: the configured game folder's shaders.rpf).
-        paths: Vec<PathBuf>,
-        #[arg(long)]
-        manifest: PathBuf,
-        /// Worker threads (default: every logical core but one).
-        #[arg(long)]
-        jobs: Option<usize>,
-        /// Make nothing: say what share of the manifest the next boot finds in the caches.
-        #[arg(long)]
-        check: bool,
-    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -238,7 +184,7 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::env::alias_scarlett();
-    victory_core::logging::init("warn");
+    victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -274,42 +220,32 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // `VICTORY_HOST_MAX_WAVE=32`: one name, read in one place (`translate::apply_host_max_wave`),
-            // for the warm-up and the walk alike (adapted from Zettrox/ztrx#120)
-            translate::apply_host_max_wave();
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_max_wave(n);
+            }
             if let Some(file) = warm {
-                return translate::warm_listed(paths, &file, jobs);
+                return translate::warm(paths, &file, jobs);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::PrecompileGraphics {
-            archive,
-            jobs,
-            limit,
-            skip,
-            mesh,
-        } => translate::precompile_graphics(archive, jobs, limit, skip, mesh),
-        Command::Warm {
-            paths,
-            jobs,
-            no_pipelines,
-            incremental,
-            verify_all,
-        } => translate::warm(paths, jobs, !no_pipelines, incremental, verify_all),
-        Command::Prewarm { action } => match action {
-            Prewarm::Manifest { paths, out, jobs, cand_key } => prewarm::manifest(paths, &out, jobs, cand_key),
-            Prewarm::Run { paths, manifest, jobs, check } => prewarm::run(paths, &manifest, jobs, check),
-        },
+        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        #[cfg(windows)]
+        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
             console,
-            title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+            title_args,
+        } => {
+            victory_hle::runtime::set_title_args(title_args);
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
-        Command::Saves { title, action } => saves::run(action, title),
     }
 }
 

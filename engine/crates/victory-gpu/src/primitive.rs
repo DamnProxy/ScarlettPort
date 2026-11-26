@@ -18,15 +18,19 @@
 //! direct, indexed and indirect draws alike. This expansion is what is
 //! left for a pipeline that could not get that stage.
 
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM;
-
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    if stride == 0 {
+        return;
+    }
+    let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
+        return;
+    };
     for (rect, out) in src
-        .chunks_exact(3 * stride)
-        .zip(dst.chunks_exact_mut(6 * stride))
+        .chunks_exact(in_rect)
+        .zip(dst.chunks_exact_mut(out_rect))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
@@ -36,40 +40,19 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
         fourth.copy_from_slice(v(0));
         for &(offset, format) in elements {
             let at = offset as usize;
-            let inside = stride.saturating_sub(at);
-            if format == DXGI_FORMAT_R10G10B10A2_UNORM.0 as u32 {
-                if inside >= 4 {
-                    let field = at..at + 4;
-                    let colors = [0, 1, 2]
-                        .map(|i| u32::from_le_bytes(v(i)[field.clone()].try_into().unwrap()));
-                    fourth[field].copy_from_slice(&packed_unorm_corner(colors).to_le_bytes());
-                }
-                continue;
-            }
             let Some((n, kind)) = components(format) else {
                 continue;
             };
             // Only the components inside the vertex: the rest belong to the
             // next one.
-            for c in 0..n.min(inside / kind.bytes()) {
+            let inside = stride.saturating_sub(at) / kind.bytes();
+            for c in 0..n.min(inside) {
                 let get = |i: usize| kind.read(&v(i)[at..], c);
                 let value = get(0) + get(2) - get(1);
                 kind.write(&mut fourth[at..], c, value);
             }
         }
     }
-}
-
-/// Reconstructs the fourth packed UNORM color one channel at a time.
-/// Each channel has the same scale at all corners, so work in integer units.
-fn packed_unorm_corner([first, middle, last]: [u32; 3]) -> u32 {
-    let mut corner = 0;
-    for (shift, mask) in [(0, 1023), (10, 1023), (20, 1023), (30, 3)] {
-        let channel = |value: u32| (value >> shift) & mask;
-        let value = (channel(first) + channel(last)).saturating_sub(channel(middle));
-        corner |= value.min(mask) << shift;
-    }
-    corner
 }
 
 #[derive(Clone, Copy)]
@@ -94,19 +77,16 @@ fn components(format: u32) -> Option<(usize, Kind)> {
         54 => (1, Kind::F16),
         11 => (4, Kind::Unorm16),
         35 => (2, Kind::Unorm16),
+        56 => (1, Kind::Unorm16),
         28 | 29 | 87 | 91 => (4, Kind::Unorm8),
-        // Normalized kinds of one and two components, and signed ones
-        // (`VICTORY_STATE_FIXES`; before, such rectangles were left as
-        // they came).
-        56 if crate::cflook::state_fixes() => (1, Kind::Unorm16),
-        49 if crate::cflook::state_fixes() => (2, Kind::Unorm8),
-        61 if crate::cflook::state_fixes() => (1, Kind::Unorm8),
-        13 if crate::cflook::state_fixes() => (4, Kind::Snorm16),
-        37 if crate::cflook::state_fixes() => (2, Kind::Snorm16),
-        58 if crate::cflook::state_fixes() => (1, Kind::Snorm16),
-        31 if crate::cflook::state_fixes() => (4, Kind::Snorm8),
-        51 if crate::cflook::state_fixes() => (2, Kind::Snorm8),
-        63 if crate::cflook::state_fixes() => (1, Kind::Snorm8),
+        49 => (2, Kind::Unorm8),
+        61 => (1, Kind::Unorm8),
+        13 => (4, Kind::Snorm16),
+        37 => (2, Kind::Snorm16),
+        58 => (1, Kind::Snorm16),
+        31 => (4, Kind::Snorm8),
+        51 => (2, Kind::Snorm8),
+        63 => (1, Kind::Snorm8),
         _ => return None,
     })
 }
@@ -200,30 +180,6 @@ fn f32_to_half(v: f32) -> u16 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_packed_unorm_color_is_reconstructed_at_the_missing_corner() {
-        let pack = |r: u32, g: u32, b: u32, a: u32| r | g << 10 | b << 20 | a << 30;
-        let vertex = |color: u32| {
-            let mut bytes = [0; 8];
-            bytes[4..8].copy_from_slice(&color.to_le_bytes());
-            bytes
-        };
-        let src = [
-            vertex(pack(960, 220, 16, 1)),
-            vertex(pack(60, 150, 300, 0)),
-            vertex(pack(300, 200, 75, 3)),
-        ]
-        .concat();
-        let mut out = [0; 6 * 8];
-        let format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM.0 as u32;
-        expand_rects(&src, &mut out, 8, &[(4, format)]);
-        assert_eq!(out[5 * 8 + 4..], pack(1023, 270, 0, 3).to_le_bytes());
-
-        // A packed element needs its entire word inside the vertex.
-        expand_rects(&src, &mut out, 8, &[(6, format)]);
-        assert_eq!(out[5 * 8..], src[..8]);
-    }
-
     /// A rectangle of float2 positions and RGBA8 colors, given as top
     /// left, bottom left, bottom right: the fourth corner completes the
     /// parallelogram at the top right.
@@ -285,6 +241,33 @@ mod tests {
         assert_eq!(dst[40..], vertex(4.0, 6.0)[..]);
     }
 
+    #[test]
+    fn normalized_attributes_are_interpolated_in_their_own_range() {
+        let vertex = |rg: [u8; 2], u16_value: u16, u8_value: u8, snorm8: i8, snorm16: i16| {
+            [
+                &rg[..],
+                &u16_value.to_le_bytes(),
+                &[u8_value, snorm8 as u8],
+                &snorm16.to_le_bytes(),
+            ]
+            .concat()
+        };
+        let src = [
+            vertex([3, 250], 1000, 10, i8::MIN, -23000),
+            vertex([8, 200], 500, 3, -120, -18000),
+            vertex([20, 253], 10000, 100, -120, -32000),
+        ]
+        .concat();
+        let mut dst = [0; 6 * 8];
+        expand_rects(
+            &src,
+            &mut dst,
+            8,
+            &[(0, 49), (2, 56), (4, 61), (5, 63), (6, 58)],
+        );
+        assert_eq!(dst[40..], vertex([15, 255], 10500, 107, -127, -32767));
+    }
+
     /// `half_to_f32` reads subnormals, so an f16 rectangle output must be
     /// able to write them back instead of flushing every one to zero.
     #[test]
@@ -300,5 +283,84 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    #[test]
+    fn zero_or_overflowing_stride_is_ignored_without_panicking() {
+        let mut dst = [0xAAu8; 16];
+        expand_rects(&[1, 2, 3], &mut dst, 0, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
+        expand_rects(&[1, 2, 3], &mut dst, usize::MAX / 2, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
+    }
+
+    #[test]
+    fn unorm16_unorm8_clamping_and_unknown_formats_expand_correctly() {
+        // Vertex layout (12 bytes):
+        //   0..4: R16G16_UNORM (format 35)
+        //   4..8: R8G8B8A8_UNORM (format 28) — tests clamping below 0 and above 1
+        //   8..12: unknown format (999) — must keep v0's bytes verbatim
+        let v = |u0: u16, u1: u16, c: [u8; 4], raw: [u8; 4]| {
+            let mut b = Vec::with_capacity(12);
+            b.extend(u0.to_le_bytes());
+            b.extend(u1.to_le_bytes());
+            b.extend(c);
+            b.extend(raw);
+            b
+        };
+        let src = [
+            v(
+                10_000,
+                50_000,
+                [10, 200, 100, 255],
+                [0xDE, 0xAD, 0xBE, 0xEF],
+            ),
+            v(20_000, 10_000, [100, 50, 100, 255], [1, 2, 3, 4]),
+            v(30_000, 20_000, [20, 200, 100, 255], [5, 6, 7, 8]),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 6 * 12];
+        expand_rects(&src, &mut dst, 12, &[(0, 35), (4, 28), (8, 999)]);
+        let fourth = &dst[60..72];
+        // u0: 10000 + 30000 - 20000 = 20000; u1: 50000 + 20000 - 10000 = 60000
+        assert_eq!(u16::from_le_bytes([fourth[0], fourth[1]]), 20_000);
+        assert_eq!(u16::from_le_bytes([fourth[2], fourth[3]]), 60_000);
+        // c0: 10 + 20 - 100 -> clamped to 0; c1: 200 + 200 - 50 -> clamped to 255
+        assert_eq!(&fourth[4..8], &[0, 255, 100, 255]);
+        // Unknown format keeps v0 bytes
+        assert_eq!(&fourth[8..12], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn multiple_rectangles_and_f32_f16_vector_formats_expand_in_sequence() {
+        // Two rectangles of R32G32B32_FLOAT (format 6, 12 bytes) + R16G16_FLOAT (format 34, 4 bytes) = 16 bytes
+        let v = |p: [f32; 3], uv: [f32; 2]| {
+            let mut b = Vec::with_capacity(16);
+            for x in p {
+                b.extend(x.to_le_bytes());
+            }
+            for x in uv {
+                b.extend(f32_to_half(x).to_le_bytes());
+            }
+            b
+        };
+        let src = [
+            // Rect 0
+            v([0.0, 1.0, 0.5], [0.0, 0.0]),
+            v([0.0, 0.0, 0.5], [0.0, 1.0]),
+            v([2.0, 0.0, 0.5], [1.0, 1.0]),
+            // Rect 1
+            v([10.0, 20.0, 1.0], [0.25, 0.5]),
+            v([10.0, 10.0, 1.0], [0.25, 1.0]),
+            v([14.0, 10.0, 1.0], [0.75, 1.0]),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 12 * 16];
+        expand_rects(&src, &mut dst, 16, &[(0, 6), (12, 34)]);
+        assert_eq!(&dst[5 * 16..6 * 16], &v([2.0, 1.0, 0.5], [1.0, 0.0])[..]);
+        assert_eq!(
+            &dst[11 * 16..12 * 16],
+            &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
+        );
     }
 }

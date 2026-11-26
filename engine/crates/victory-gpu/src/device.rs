@@ -75,10 +75,10 @@ const LEVEL_IIDS: [Iid; 9] = [
         [0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b],
     ),
     guid(
-        0x9218_e6bb,
-        0xf944,
-        0x4f7e,
-        [0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3],
+        0x728f1fa2,
+        0xea11,
+        0x4a9f,
+        [0x9b, 0x52, 0x9b, 0x42, 0xa4, 0x84, 0xd5, 0xc9],
     ),
     guid(
         0x5405c344,
@@ -273,14 +273,12 @@ extern "system" fn check_feature_support(
     const FEATURE_LEVELS: u32 = 2;
     const FORMAT_SUPPORT: u32 = 3;
     const MULTISAMPLE: u32 = 4;
-    const OPTIONS5: u32 = 27;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
-        OPTIONS5 if raytracing_off() => 12,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -290,13 +288,6 @@ extern "system" fn check_feature_support(
         return E_INVALIDARG;
     }
     match feature {
-        OPTIONS5 => {
-            // SRV-only tiled tier, render passes tier, ray-tracing tier: all
-            // none (`VICTORY_RAYTRACING=off`, ported from ef80b32).
-            // SAFETY: checked size and non-null.
-            unsafe { data.cast::<[u32; 3]>().write_unaligned([0, 0, 0]) };
-            S_OK
-        }
         OPTIONS_QUERY => {
             // SAFETY: checked size and non-null.
             unsafe { data.cast::<[u32; 16]>().write_unaligned(OPTIONS) };
@@ -333,21 +324,6 @@ extern "system" fn check_feature_support(
     }
 }
 
-/// `VICTORY_RAYTRACING=off`: the title's OPTIONS5 query is answered "no ray
-/// tracing" (tier 0) instead of E_NOTIMPL, so it may take a path without it.
-/// Unset or anything else: E_NOTIMPL as before.
-fn raytracing_off() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| {
-        let off = std::env::var("VICTORY_RAYTRACING")
-            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"));
-        if off {
-            tracing::warn!("VICTORY_RAYTRACING=off: OPTIONS5 reports no ray tracing");
-        }
-        off
-    })
-}
-
 fn feature_levels(data: *mut c_void) -> HRESULT {
     // SAFETY: the caller checked size and non-null.
     let query = unsafe { &mut *data.cast::<FeatureLevels>() };
@@ -368,6 +344,72 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
         }
         None => UNSUPPORTED,
     }
+}
+
+/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
+/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
+/// object `out` names and draws with it; on failure it goes without that
+/// pipeline, silently. What the descriptions hold is not known: the calls
+/// fail as they always did, with `out` null, and the first ones log the
+/// description's words and what its first word points at, so that the two
+/// methods can be written.
+/// shortcut: not implemented. Answering `S_OK` here without making the
+/// pipeline would hand the title whatever its stack held as an object.
+extern "system" fn unknown_pipeline<const SLOT: usize>(
+    _: This,
+    desc: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    if !out.is_null() {
+        // SAFETY: the title's out pointer (a local of its own).
+        unsafe { *out = std::ptr::null() };
+    }
+    if calls <= 4 || calls.is_power_of_two() {
+        // Sixteen 64-bit words at `at`, read through the kernel: neither
+        // pointer is known to be mapped.
+        #[cfg(windows)]
+        let words = |at: usize| -> Option<Vec<u64>> {
+            let mut bytes = [0u8; 128];
+            (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
+                bytes
+                    .as_chunks::<8>().0.iter()
+                    .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
+                    .collect()
+            })
+        };
+        #[cfg(not(windows))]
+        let words = |_: usize| None::<Vec<u64>>;
+        let description = words(desc as usize);
+        let first = description
+            .as_ref()
+            .and_then(|w| words(w[0] as usize));
+        tracing::warn!(
+            slot = format_args!("{:#x}", SLOT),
+            calls,
+            description = format_args!("{description:x?}"),
+            first_points_at = format_args!("{first:x?}"),
+            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+        );
+    }
+    E_NOTIMPL
+}
+
+/// The host device's state: the console's device is removed when the host's is
+/// (VIctory 13185f5: the default answer, E_NOTIMPL, reads as a lost device).
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a plain query.
+        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return e.code().0;
+        }
+    }
+    S_OK
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
@@ -402,14 +444,15 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = pipeline::create_precompiled::<0x1c8> as *const (); // 0x1c8
+    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = pipeline::create_precompiled::<0x218> as *const (); // 0x218
+    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -457,21 +500,6 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
-    }
-
-    #[test]
-    fn device8_uses_the_released_sdk_iid() {
-        let device8 = guid(
-            0x9218_e6bb,
-            0xf944,
-            0x4f7e,
-            [0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3],
-        );
-        assert_eq!(
-            guid_text(&LEVEL_IIDS[7]),
-            "9218e6bb-f944-4f7e-a75c-b1b2c7b701f3"
-        );
-        assert_eq!(create_as(&device8), (S_OK, super::device()));
     }
 
     #[test]

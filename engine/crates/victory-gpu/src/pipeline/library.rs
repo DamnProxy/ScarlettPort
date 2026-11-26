@@ -62,16 +62,15 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder the library is kept in.
+pub(super) fn folder() -> Option<PathBuf> {
+    DIR.get().cloned()
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
-/// Pipelines made whose store the library refused (a name already stored
-/// with another description).
-pub(crate) static STORE_REFUSED: AtomicU64 = AtomicU64::new(0);
-/// Stores refused because the same description was stored under the name
-/// meanwhile (harmless).
-pub(crate) static DUPLICATE_STORES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -441,7 +440,7 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
-const EARLY_MAX: usize = 8192;
+const EARLY_MAX: usize = 100_000;
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -503,15 +502,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
 }
 
 /// A pipeline's name in the library: the hash of what its host
-/// description holds. That is **all** it holds: the translated shaders' code (the content
-/// of the DXIL, which is the same bytes whenever the translator makes the same
-/// translation, whichever build made it), the root signature and the graphics state. Never
-/// the build, the translator's sources or the shader cache's entries, so a translator
-/// change that leaves a shader's output alone leaves its pipeline's name, and the driver's
-/// blob under it, alone too (`shader_cache` keeps the translation that long; a changed
-/// translation names a new pipeline, and the old name stays unused in the library). The
-/// name is stored in libraries on disk: changing this function orphans every pipeline in
-/// them (the test below pins it).
+/// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
     let mut h = blake3::Hasher::new();
     for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
@@ -525,15 +516,11 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    let load_only = LOAD_ONLY.load(Ordering::Relaxed);
     let Some(library) = library() else {
-        if load_only {
-            return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
-        }
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
@@ -558,30 +545,16 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    if load_only {
-        return Err(refused);
-    }
-    // Compiled outside any lock: compiles take up to seconds. A second
-    // request for the same name while the first compiles waits for it
-    // (`VICTORY_PSO_SHARE=1`, after Zettrox/ztrx#25's note that misses of
-    // one description could compile twice) instead of compiling again.
-    let shared = share_on().then(|| inflight::begin(name));
-    if let Some(inflight::Turn::Wait(slot)) = &shared {
-        return inflight::wait(slot);
-    }
-    let made = {
+    // Compiled outside any lock: compiles take up to seconds.
+    let pso = {
         let _call = call("make", name);
-        create()
+        create()?
     };
-    if let Some(inflight::Turn::Make(slot)) = &shared {
-        inflight::finish(name, slot, &made);
-    }
-    let pso = made?;
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
-            "pipeline library: made {label} in {:.1} ms (not in the library under this name: {refused})",
+            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
             began.elapsed().as_secs_f64() * 1e3
         )
     });
@@ -590,35 +563,10 @@ pub(crate) fn pipeline(
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    match unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) } {
-        Ok(()) => {
-            library.added.fetch_add(1, Ordering::Relaxed);
-        }
-        // The name is in the library with another description: the load
-        // above refused it (E_INVALIDARG, as for a name not there) and
-        // this one is never kept, so it is made again every run. Said,
-        // not left silent: the name misses something of the description.
-        // Another thread made and stored the same description first (two
-        // misses of one name at once, as the precompile's workers have):
-        // the name loads with this description, nothing is lost.
-        Err(_) if load(&library.library, PCWSTR(wide.as_ptr())).is_ok() => {
-            DUPLICATE_STORES.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(e) => {
-            STORE_REFUSED.fetch_add(1, Ordering::Relaxed);
-            let label = LABEL.with(|l| l.borrow().clone());
-            tracing::warn!(name, %label, error = %e, "pipeline library: stored under this name with another description; made again every run");
-        }
+    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+        library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
-}
-
-/// `victory prewarm run --check`: pipelines are only loaded from the library, never made (a
-/// miss is an error), so the check compiles nothing and changes nothing.
-static LOAD_ONLY: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn set_load_only(on: bool) {
-    LOAD_ONLY.store(on, Ordering::Relaxed);
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -667,9 +615,8 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    // With what earlier runs listed: a run that asks for no title pipeline
-    // (`victory warm`) wrote an empty list over theirs, and the next world
-    // began with every pipeline still to be asked for.
+    // Through `used`: a process that asked for none yet (`victory shaders`)
+    // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
@@ -686,7 +633,9 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
+    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
     let written = library_written
+        .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
@@ -694,8 +643,6 @@ pub(crate) fn save(now: bool) {
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
-            store_refused = STORE_REFUSED.load(Ordering::Relaxed),
-            duplicate_stores = DUPLICATE_STORES.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
@@ -733,11 +680,64 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part.
+/// `path`: a reader never sees a part. Serialised so concurrent worker and
+/// shutdown saves do not race on the same staging file or target rename.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    use std::sync::atomic::AtomicU64;
+    static WRITING: Mutex<()> = Mutex::new(());
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}-{n}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// How long each title pipeline that took long to make took, in ms (beside
+/// the early list; a key may be there more than once).
+const SLOW_FILE: &str = "slow-pipelines.txt";
+/// A pipeline that takes this long is one ([`slow`]).
+pub(crate) const SLOW_MS: u64 = 1000;
+static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+
+fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
+    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    if slow.is_none() {
+        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
+        *slow = Some(
+            listed
+                .lines()
+                .filter_map(|l| l.split_once(' '))
+                .filter_map(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?)))
+                .collect(),
+        );
+    }
+    slow
+}
+
+/// Whether making the title pipeline with `key` took [`SLOW_MS`] in this or
+/// an earlier run.
+pub(crate) fn slow(key: &str) -> bool {
+    slow_ones().as_ref().is_some_and(|s| s.contains_key(key))
+}
+
+/// The title pipeline with `key` took `ms` to make.
+pub(crate) fn note_time(key: &str, ms: u64) {
+    if ms < SLOW_MS {
+        return;
+    }
+    let mut slow = slow_ones();
+    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
+    if ms > *known {
+        *known = ms;
+        // With the next save of the early list.
+        USED_CHANGED.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -759,7 +759,15 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
+///
+/// `VICTORY_EARLY_ALL=1`: every title pipeline is started at creation,
+/// requested before or not, so that the driver's own cache holds it for
+/// later runs.
 pub(crate) fn wanted_early(key: &str) -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    if *ALL.get_or_init(|| std::env::var_os("VICTORY_EARLY_ALL").is_some_and(|v| v == "1")) {
+        return true;
+    }
     used().as_ref().is_some_and(|s| s.contains(key))
 }
 
@@ -786,13 +794,6 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
-    }
-
-    #[test]
-    fn a_name_is_the_hash_of_content_only_and_does_not_change_between_builds() {
-        // The value a build of any date gives: a library written by an earlier build loads
-        // in this one only while this holds.
-        assert_eq!(name("graphics", b"root", &[b"vs", b"ps"], "state"), "9402d2bc73e94e1548e2a550a55f878f");
     }
 
     #[test]
@@ -907,60 +908,27 @@ mod tests {
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
     }
-}
 
-/// `VICTORY_PSO_SHARE=1`: concurrent misses of one library name share one compile.
-fn share_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PSO_SHARE").is_some_and(|v| v == "1"))
-}
-
-/// Compiles under way, by library name, that other requests may wait for.
-mod inflight {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Condvar, Mutex};
-    use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
-
-    type Made = windows::core::Result<ID3D12PipelineState>;
-    pub(super) type Slot = Arc<(Mutex<Option<Made>>, Condvar)>;
-
-    pub(super) enum Turn {
-        Make(Slot),
-        Wait(Slot),
-    }
-
-    static ALL: Mutex<Option<HashMap<String, Slot>>> = Mutex::new(None);
-    /// Compiles another request's compile spared.
-    static SPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    pub(super) fn begin(name: &str) -> Turn {
-        let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
-        let all = all.get_or_insert_with(HashMap::new);
-        if let Some(slot) = all.get(name) {
-            let n = SPARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n.is_power_of_two() {
-                tracing::info!(n, "pipeline library: compiles spared by waiting for the same one under way");
-            }
-            return Turn::Wait(slot.clone());
+    #[test]
+    fn concurrent_write_atomically_never_fails_or_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("host-pipelines.bin");
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    let payload = vec![b'a' + t as u8; 4096];
+                    for _ in 0..30 {
+                        write_atomically(&target, &payload).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
         }
-        let slot: Slot = Arc::new((Mutex::new(None), Condvar::new()));
-        all.insert(name.to_owned(), slot.clone());
-        Turn::Make(slot)
-    }
-
-    pub(super) fn finish(name: &str, slot: &Slot, made: &Made) {
-        *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(made.clone());
-        slot.1.notify_all();
-        if let Some(all) = ALL.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            all.remove(name);
-        }
-    }
-
-    pub(super) fn wait(slot: &Slot) -> Made {
-        let mut done = slot.0.lock().unwrap_or_else(|e| e.into_inner());
-        while done.is_none() {
-            done = slot.1.wait(done).unwrap_or_else(|e| e.into_inner());
-        }
-        done.clone().expect("set above")
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), 4096);
+        assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
     }
 }

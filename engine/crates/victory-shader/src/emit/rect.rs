@@ -56,37 +56,16 @@ pub fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderError
         }
     };
     let outputs = sig(vs, FourCC::OSG1)?;
-    // (mgunes1311-lab, Marvisak #1907) The channels the vertex shader
-    // writes: OSG1's mask less its never-written bits. A channel it leaves
-    // unwritten is not an input or output here either (the host refused
-    // the pipeline: E_INVALIDARG).
-    let written = {
-        let c = Container::parse(vs)?;
-        match c.part(FourCC::OSG1) {
-            Some(part) => {
-                let base = crate::dxbc::u32_at(part.data, 4)? as usize;
-                let mut masks = Vec::with_capacity(outputs.len());
-                for (i, e) in outputs.iter().enumerate() {
-                    let at = base + 32 * i;
-                    let rw = part.data.get(at + 24..at + 26).ok_or(ShaderError::Malformed("truncated"))?;
-                    masks.push(((rw[0] & !rw[1] & 0xf) >> e.col) & (((1u32 << e.cols) - 1) as u8));
-                }
-                Some(masks)
-            }
-            None => None,
-        }
-    };
     let wanted = match ps {
         Some(ps) => sig(ps, FourCC::ISG1)?,
         None => Vec::new(),
     };
-    build(outputs, &wanted, written.as_deref())
+    build(outputs, &wanted)
 }
 
 /// [`rect_list_gs`] from the vertex shader's outputs and the pixel
 /// shader's inputs.
-/// `written`: per output, the columns the vertex shader writes (`None`: all).
-fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement], written: Option<&[u8]>) -> Result<Vec<u8>, ShaderError> {
+fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u8>, ShaderError> {
     let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
     if outputs.iter().any(|e| e.row.is_none()) {
         return Err(unsupported("a rectangle list output without a register"));
@@ -107,11 +86,6 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement], written: Option
             _ => 0,
         };
         e.usage = (1 << e.cols) - 1;
-    }
-    if let Some(written) = written {
-        for (e, &w) in outputs.iter_mut().zip(written) {
-            e.usage = w;
-        }
     }
     let mut s = Shader::new(false);
     s.geometry = Some(Geometry {
@@ -158,12 +132,6 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement], written: Option
     for id in 0..s.inputs.len() {
         let mut columns = Vec::new();
         for col in 0..s.inputs[id].cols {
-            if s.inputs[id].usage >> col & 1 == 0 {
-                // Unwritten: neither read nor stored (a stand-in value).
-                let zero = if s.inputs[id].comp == 9 { s.m.f32(0) } else { s.m.i32(0) };
-                columns.push([zero; 3]);
-                continue;
-            }
             columns.push([0, 1, 2].map(|vertex| load(&mut s, id, col, vertex)));
         }
         corners.push(columns);
@@ -250,9 +218,6 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement], written: Option
                 "storeOutput.i32"
             };
             for (col, values) in columns.iter().enumerate() {
-                if s.outputs[id].usage >> col & 1 == 0 {
-                    continue;
-                }
                 let args = [
                     s.m.i32(id as u32),
                     s.m.i32(0),
@@ -349,7 +314,7 @@ mod tests {
     #[test]
     fn the_rectangle_stage_is_a_geometry_shader() {
         let wanted = [element("SV_PrimitiveID", 0, 10, 5, 3, 1)];
-        let gs = build(outputs(), &wanted, None).unwrap();
+        let gs = build(outputs(), &wanted).unwrap();
         let c = Container::parse(&gs).unwrap();
         // Program version: geometry (2), shader model 6.6.
         assert_eq!(c.part(FourCC::DXIL).unwrap().data[..4], [0x66, 0, 2, 0]);
@@ -372,7 +337,7 @@ mod tests {
             super::super::validator::Validator::default_path().as_deref(),
         ) {
             v.validate(&mut gs.clone()).unwrap();
-            let plain = build(outputs(), &[], None).unwrap();
+            let plain = build(outputs(), &[]).unwrap();
             v.validate(&mut plain.clone()).unwrap();
         }
     }
@@ -381,12 +346,12 @@ mod tests {
     /// vertex output has, more components than six vertices may carry.
     #[test]
     fn rectangle_stages_that_cannot_be_made_are_refused() {
-        assert!(build(outputs()[1..].to_vec(), &[], None).is_err());
+        assert!(build(outputs()[1..].to_vec(), &[]).is_err());
         let taken = [element("SV_PrimitiveID", 0, 10, 5, 1, 1)];
-        assert!(build(outputs(), &taken, None).is_err());
+        assert!(build(outputs(), &taken).is_err());
         let mut many = vec![element("SV_Position", 0, 3, 9, 0, 4)];
         many.extend((1..=43).map(|row| element("TEXCOORD", row - 1, 0, 9, row, 4)));
-        assert!(build(many, &[], None).is_err());
+        assert!(build(many, &[]).is_err());
     }
 
     /// A vertex shader that passes a position and a float4 through, and a
@@ -450,7 +415,6 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
-            half_views: Vec::new(),
         };
         (
             host(crate::native::HwStage::Vs, vs),

@@ -83,8 +83,15 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own).
+/// keeps its own). An empty root is the current directory, as it is to a
+/// path joined to it: it is the title's folder when the title is run by its
+/// file name alone (`victory run GTA6.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
@@ -385,102 +392,11 @@ pub extern "system" fn GetFileAttributesExW(
     info: *mut c_void,
 ) -> i32 {
     let p = wide(path);
-    let ok = host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
+    host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
         p.ptr(),
         level,
         info,
-    );
-    // WIN32_FILE_ATTRIBUTE_DATA: attributes at 0, size high at 28, low at 32.
-    if ok != 0 && level == 0 && !info.is_null() {
-        // SAFETY: the host filled the title's structure.
-        unsafe { follow_link(&wide_path(p.ptr()), info.cast(), 28) };
-    }
-    ok
-}
-
-/// A NUL-terminated wide string as a path.
-fn wide_path(p: *const u16) -> std::path::PathBuf {
-    use std::os::windows::ffi::OsStringExt;
-    // SAFETY: a NUL-terminated string.
-    let s = unsafe {
-        let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-        std::slice::from_raw_parts(p, len)
-    };
-    std::ffi::OsString::from_wide(s).into()
-}
-
-/// A game file that is a symbolic link (part of the game folder moved to another drive): the host
-/// reports the link itself, size 0 with the reparse-point attribute. The title gets the target's
-/// size and attributes instead. `data` starts with the attributes; the size (high, low) is at
-/// `size_at`.
-unsafe fn follow_link(path: &Path, data: *mut u8, size_at: usize) {
-    const REPARSE_POINT: u32 = 0x400;
-    // SAFETY: the caller's structure holds the attributes and the size.
-    unsafe {
-        let attrs = data.cast::<u32>().read_unaligned();
-        if attrs & REPARSE_POINT == 0 {
-            return;
-        }
-        let Ok(meta) = std::fs::metadata(path) else { return };
-        use std::os::windows::fs::MetadataExt;
-        data.cast::<u32>().write_unaligned(meta.file_attributes() & !REPARSE_POINT);
-        let len = meta.len();
-        data.add(size_at).cast::<u32>().write_unaligned((len >> 32) as u32);
-        data.add(size_at + 4).cast::<u32>().write_unaligned(len as u32);
-    }
-}
-
-/// The folder each open search looks in, for [`FindNextFileW`].
-static SEARCHES: Mutex<Vec<(usize, std::path::PathBuf)>> = Mutex::new(Vec::new());
-
-/// WIN32_FIND_DATAW: attributes at 0, size high at 28, low at 32, the name at 44.
-unsafe fn follow_found(folder: &Path, data: *mut c_void) {
-    if data.is_null() {
-        return;
-    }
-    // SAFETY: a filled WIN32_FIND_DATAW.
-    unsafe {
-        let name = wide_path(data.cast::<u8>().add(44).cast());
-        follow_link(&folder.join(name), data.cast(), 28);
-    }
-}
-
-fn found_first(pattern: *const u16, handle: Handle, data: *mut c_void) -> Handle {
-    if handle as isize == -1 || pattern.is_null() {
-        return handle;
-    }
-    let folder = wide_path(pattern).parent().map(Path::to_path_buf).unwrap_or_default();
-    // SAFETY: the host filled `data`.
-    unsafe { follow_found(&folder, data) };
-    let mut s = SEARCHES.lock().unwrap_or_else(|e| e.into_inner());
-    s.retain(|(h, _)| *h != handle as usize);
-    if s.len() > 256 {
-        s.remove(0);
-    }
-    s.push((handle as usize, folder));
-    handle
-}
-
-pub extern "system" fn FindNextFileW(handle: Handle, data: *mut c_void) -> i32 {
-    let ok = host!("kernel32.dll", "FindNextFileW": extern "system" fn(Handle, *mut c_void) -> i32)(handle, data);
-    if ok != 0 {
-        let folder = SEARCHES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .find(|(h, _)| *h == handle as usize)
-            .map(|(_, f)| f.clone());
-        if let Some(folder) = folder {
-            // SAFETY: the host filled `data`.
-            unsafe { follow_found(&folder, data) };
-        }
-    }
-    ok
-}
-
-pub extern "system" fn FindClose(handle: Handle) -> i32 {
-    SEARCHES.lock().unwrap_or_else(|e| e.into_inner()).retain(|(h, _)| *h != handle as usize);
-    host!("kernel32.dll", "FindClose": extern "system" fn(Handle) -> i32)(handle)
+    )
 }
 
 pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
@@ -531,11 +447,10 @@ pub extern "system" fn GetDiskFreeSpaceW(
 
 pub extern "system" fn FindFirstFileW(path: *const u16, data: *mut c_void) -> Handle {
     let p = wide(path);
-    let h = host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)(
+    host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)(
         p.ptr(),
         data,
-    );
-    found_first(p.ptr(), h, data)
+    )
 }
 
 pub extern "system" fn FindFirstFileExW(
@@ -547,16 +462,14 @@ pub extern "system" fn FindFirstFileExW(
     flags: u32,
 ) -> Handle {
     let p = wide(path);
-    let h = host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
+    host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
         p.ptr(),
         level,
         data,
         search,
         filter,
         flags,
-    );
-    // Both info levels fill the same leading fields.
-    found_first(p.ptr(), h, data)
+    )
 }
 
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
@@ -613,10 +526,7 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first. A block guarded again before the kernel writes it (the
-// guard over all the views of a page protects other views from other
-// threads) fails that `ReadFile`, and the title's retry opens it again;
-// `fread` has no such retry and reads beside instead (see there).
+// is opened first, and not guarded again before the call is done.
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -625,24 +535,31 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let read_file = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
-    // A synchronous read into pages lazily mapped (`VICTORY_REMAP_LAZY`):
-    // read beside and written through the table, no view made for it.
-    if overlapped.is_null() && !buffer.is_null() && victory_gpu::title_memory_in_table(buffer as usize, len as usize) {
-        let mut beside = vec![0u8; len as usize];
-        let mut got = 0u32;
-        let ok = read_file(file, beside.as_mut_ptr(), len, &mut got, overlapped);
-        if ok != 0 {
-            victory_gpu::title_memory_write_through(buffer as usize, &beside[..got as usize]);
-        }
-        if !read.is_null() {
-            // SAFETY: the caller's out pointer.
-            unsafe { read.write(got) };
-        }
-        return ok;
+    let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+        file, buffer, len, read, overlapped,
+    );
+    // The call's error is the title's to ask for.
+    // SAFETY: plain calls.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    // shortcut: a read that goes on after the call (overlapped) is written
+    // into pages the kernel has locked by now: it lands all the same, but a
+    // refresh that guards its blocks before it does will not see it.
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
     }
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    read_file(file, buffer, len, read, overlapped)
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_NOACCESS {
+        static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(n, buffer = format_args!("{buffer:p}"), len, "ReadFile: the title's buffer could not be written");
+        }
+    }
+    drop(writing);
+    // SAFETY: as above.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    done
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
@@ -653,34 +570,10 @@ pub extern "system" fn ReadFile(
 /// own writes. Returns the items read, as the CRT does; the bytes of a
 /// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
-    let total = size.saturating_mul(count);
-    if buffer.is_null() || total == 0 {
-        // The CRT's own checks and answer (EINVAL, or nothing to read).
-        return read(buffer, size, count, stream);
-    }
-    const CHUNK: usize = 1 << 20;
-    let mut beside = vec![0u8; total.min(CHUNK)];
-    let mut done = 0;
-    while done < total {
-        let want = (total - done).min(CHUNK);
-        let n = read(beside.as_mut_ptr(), 1, want, stream);
-        if n > 0 {
-            if victory_gpu::title_memory_in_table(buffer as usize + done, n) {
-                victory_gpu::title_memory_write_through(buffer as usize + done, &beside[..n]);
-            } else {
-                victory_gpu::kernel_will_write(buffer as usize + done, n);
-                // SAFETY: the caller's buffer holds `size * count` bytes, and
-                // `done + n` is at most that.
-                unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
-            }
-            done += n;
-        }
-        if n < want {
-            break;
-        }
-    }
-    done / size
+    let _writing = victory_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
+    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+        buffer, size, count, stream,
+    )
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -845,8 +738,6 @@ pub(crate) fn module() -> HleModule {
             hle_export!(GetDiskFreeSpaceW),
             hle_export!(FindFirstFileW),
             hle_export!(FindFirstFileExW),
-            hle_export!(FindNextFileW),
-            hle_export!(FindClose),
             hle_export!(MoveFileExW),
             hle_export!(SetCurrentDirectoryA),
             hle_export!(_wfopen),
@@ -979,6 +870,17 @@ mod tests {
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
         );
+    }
+
+    /// A title run by its file name alone has an empty folder: the drive
+    /// over it is the current directory, not the current drive's root.
+    #[test]
+    fn an_empty_root_is_the_current_directory() {
+        let letter = mount(Path::new("")).unwrap();
+        let path = format!(r"{letter}:\a.rpf");
+        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
     }
 
     #[test]

@@ -19,11 +19,7 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
-    victory_gpu::use_title_memory(super::xmem::title_own_bytes);
-    victory_gpu::use_cpu_free(super::xmem::cpu_free);
-    if super::xmem::pagemap_runs() || super::xmem::remap_lazy() {
-        victory_gpu::resource::use_page_batch_mapper(super::xmem::map_alias_batch);
-    }
+    victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
@@ -41,11 +37,26 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
-/// The offline warm-up: see `victory_gpu::shader_cache::warm`.
+/// Translates `container` into the cache ([`use_shader_cache`]) ahead of
+/// any run: whether it was there already, or why it does not translate.
+pub fn precompile(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::precompile(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no host".into())
+    }
+}
+
+/// The fork's offline warm-up (`victory translate --warm`), by
+/// [`precompile`]: whether it was translated now.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        victory_gpu::shader_cache::warm(container)
+        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
     }
     #[cfg(not(windows))]
     {
@@ -66,18 +77,6 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(not(windows))]
     let _ = dir;
 }
-
-/// The title's shader archive (`shaders.rpf` of the package), which its
-/// precompiled pipelines name their shaders in; indexed in the background,
-/// the index kept at `index` across runs.
-pub fn use_shader_pack(archive: std::path::PathBuf, index: std::path::PathBuf) {
-    victory_gpu::pipeline::use_shader_pack(archive, Some(index));
-}
-
-#[cfg(windows)]
-pub use victory_gpu::pipeline::{pipeline_counts, precompile_graphics, prewarm, save_pipeline_cache, warm};
-#[cfg(windows)]
-pub use victory_gpu::shader_cache::{Report as ShaderCacheReport, report as shader_cache_report, set_revalidation};
 
 pub(crate) fn module() -> HleModule {
     HleModule {

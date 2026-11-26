@@ -15,86 +15,58 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(all(test, windows))]
-mod agility;
-#[cfg(windows)]
-mod ab;
 #[cfg(windows)]
 mod ambient;
-#[cfg_attr(not(windows), allow(dead_code))]
-mod cflook;
-#[cfg(windows)]
-mod texback;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
-mod cardmeter;
-#[cfg(windows)]
-mod gpuprof;
+mod compose;
 pub mod console;
-pub mod cores;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
-pub mod descriptor;
-pub mod device;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod faultbook;
 #[cfg(windows)]
-mod drvwatch;
+mod cores;
+pub mod descriptor;
+pub mod fastboot;
+pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
-#[cfg(windows)]
-pub mod framelog;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod book;
 #[cfg(windows)]
 mod host;
-#[cfg(windows)]
-pub mod fsr;
-#[cfg(windows)]
-mod over;
-mod overlay;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod land;
 pub mod list;
-pub mod native;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
-mod plaincopy;
+mod picked;
 #[cfg(windows)]
-mod ranges;
+mod pool;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod popwatch;
 #[cfg(windows)]
 mod primitive;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod fxprof;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod profile;
 pub mod query;
-#[cfg(windows)]
-mod mem2;
-#[cfg(windows)]
-mod memcopy;
-mod memopt;
-mod narrow;
-#[cfg(windows)]
-mod translate;
-#[cfg(windows)]
-mod readback;
-#[cfg_attr(not(windows), allow(dead_code))]
-mod readfix;
-mod rebar;
-#[cfg(windows)]
-mod regions;
-mod residency;
 pub mod queue;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod replay;
 #[cfg(windows)]
-mod queue2;
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
-mod census;
+mod safecopy;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -104,64 +76,45 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
-mod safe_copy;
-#[cfg(windows)]
 mod tiles;
 pub mod signature;
+mod switch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod ab;
 #[cfg(windows)]
-pub mod splash;
+mod tdr;
 #[cfg(windows)]
 mod texture;
+pub mod timeline;
+#[cfg(windows)]
+pub mod titlewrite;
+#[cfg(windows)]
+mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
-mod zerocopy;
-mod vram;
+mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
+/// off while the title runs (`ab`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn switched(switch: &str) -> Option<bool> {
+    ab::pick(switch)
+}
+
+/// What the frame is at (`copystat::phase`), for the sampling profiler.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn frame_phase() -> u32 {
+    copystat::phase()
+}
 #[cfg(windows)]
-pub use census::title_memory_reserved;
-#[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
-#[cfg(windows)]
-pub use zerocopy::sections as zero_copy_sections;
-#[cfg(windows)]
-pub use regions::{title_memory_not_placeholder, title_memory_placeholder};
-#[cfg(windows)]
-pub use mem2::use_cpu_free;
-#[cfg(windows)]
-pub use shadow::gpu_only_exposed;
-#[cfg(windows)]
-pub use translate::{
-    enabled as mem2_gpu_only_noview, flush_unmaps as translate_flush_unmaps, lazy as remap_lazy, lazy_call, title_memory_translated,
-    title_memory_untranslated, shown as title_memory_in_table, write_through as title_memory_write_through, parking as remap_park,
-};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    count_remap, physical_written, title_memory_gpu_only, title_memory_reading, use_title_memory, title_memory_remapped,
-    title_memory_remapping, title_memory_remapping_is_global, title_memory_remapping_many, title_memory_remapped_many,
-    writing as kernel_will_write, title_memory_written, Remapping,
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
+    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
+    writing as kernel_will_write,
 };
-
-/// Whether `VICTORY_MEM2_GPU_ONLY_NOSNAP` is on (xmem then keeps the record
-/// of which pages the CPU can reach).
-#[cfg(windows)]
-pub fn mem2_nosnap() -> bool {
-    mem2::nosnap()
-}
-
-/// Total installed physical RAM in bytes, queried once from the OS.
-#[cfg(windows)]
-pub(crate) fn total_system_ram_bytes() -> Option<u64> {
-    static TOTAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *TOTAL.get_or_init(|| {
-        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        // SAFETY: plain data the call fills in.
-        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        // SAFETY: a sized structure.
-        let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-        (ok && m.ullTotalPhys > 0).then_some(m.ullTotalPhys)
-    })
-}

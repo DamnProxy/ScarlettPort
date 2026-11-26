@@ -5,33 +5,11 @@
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
 
-pub mod ab;
-pub mod atomic;
-pub mod backup;
-pub mod batch;
 pub mod config;
 pub mod env;
-pub mod fastboot;
-pub mod friendly;
-pub mod gpuown;
-pub mod hints;
-pub mod kbm;
-pub mod live;
-pub mod mem2;
-pub mod memmap;
-pub mod overlay;
-pub mod pace;
-pub mod pagemap;
-pub mod readring;
-pub mod savecheck;
-pub mod rumble;
-pub mod upscale;
-pub mod saves;
 pub mod logging;
 pub mod policy;
-pub mod prep;
-pub mod splash;
-pub mod sync;
+pub mod saves;
 
 pub use config::Config;
 pub use policy::{PolicyError, ensure_outside_repo};

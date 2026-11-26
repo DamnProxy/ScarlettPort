@@ -26,14 +26,6 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    // `VICTORY_CAPTURE_EVERY=<n>`: every n-th frame as well.
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let every = *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_EVERY")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    });
     let named = LIST
         .get_or_init(|| {
             let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
@@ -61,8 +53,7 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    (every > 0 && n % every == 0)
-        || named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -135,22 +126,6 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
-/// Every how many world frames a picture is saved with
-/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless said).
-///
-/// A saved frame is read back at once and written as a PNG inside the
-/// present: run 225's frame log has every saved frame of the cell at 371 ms
-/// against a usual 136 (the present's own copy and show 137 ms instead of
-/// 2, and 123 ms more waiting for the card). At every 8th frame that was
-/// the regular dip of every test run, and a fifth of its time. A run that
-/// measures speed asks for 64 or more.
-fn world_every() -> u64 {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
-    })
-}
-
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -177,20 +152,14 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    // Two frames in a row each time: the title draws to two buffers in turn,
-    // and every 8th or 16th frame alone only ever showed one of them.
-    // Before the world, with `VICTORY_CAPTURE_WORLD` and
-    // `VICTORY_CAPTURE_MENUS=1`: every 16th frame too (small pictures of
-    // menus, loading screens and title cards). Asked for apart: saving them
-    // makes the menus and their music stutter.
-    static MENUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let menus = *MENUS.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_MENUS").is_some_and(|v| v == "1"));
-    let before_world = menus && world_on() && n % 16 < 2 && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
+    // (small pictures of menus, loading screens and title cards).
+    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first) % world_every() < 2;
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
@@ -220,18 +189,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
-    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut header = Vec::new();
-    header.extend(w.to_be_bytes());
-    header.extend(h.to_be_bytes());
-    header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
-    chunk(&mut png, b"IHDR", &header);
-    chunk(
-        &mut png,
-        b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
-    );
-    chunk(&mut png, b"IEND", &[]);
+    let png = encode(w, h, &raw);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
@@ -241,6 +199,33 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
         }
     }
     true
+}
+
+/// A PNG of `width * height` pixels of 8-bit RGB.
+pub(crate) fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let row = width as usize * 3;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgb.chunks_exact(row.max(1)) {
+        raw.push(0);
+        raw.extend_from_slice(line);
+    }
+    encode(width, height, &raw)
+}
+
+/// A PNG of rows of RGB, each behind its filter byte.
+fn encode(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = Vec::new();
+    header.extend(w.to_be_bytes());
+    header.extend(h.to_be_bytes());
+    header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
+    chunk(&mut png, b"IHDR", &header);
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, raw, zlib_rs::DeflateConfig::new(3));
+    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    chunk(&mut png, b"IDAT", idat);
+    chunk(&mut png, b"IEND", &[]);
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -386,27 +371,14 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// `VICTORY_DUMP_FRAMES=<list>` limits target dumps to those frames (others stay captured).
-fn dumpable(n: u64) -> bool {
-    static L: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
-    match L.get_or_init(|| {
-        std::env::var("VICTORY_DUMP_FRAMES")
-            .ok()
-            .map(|v| v.split(',').filter_map(|f| f.trim().parse().ok()).collect())
-    }) {
-        Some(l) => l.contains(&n),
-        None => listed(n),
-    }
-}
-
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !dumpable(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());

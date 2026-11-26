@@ -1,14 +1,10 @@
-//! Which cores of a hybrid processor our threads ask for (fxceless
-//! victory-fork 0b0074e). Off by default here: `VICTORY_FAST_CORES=1` keeps
-//! the submit, relay, late-wait and copy-back threads on the fast cores;
-//! `VICTORY_DISK_CORES=slow` keeps the DirectStorage workers on the slow
-//! ones. A set of processors selected for a thread is a preference the
-//! scheduler keeps unless nothing of it is free.
+//! Which processors our own threads run on, where a processor has two kinds
+//! of cores. `cpu_sets` and `keep_on_fast_cores` are fxceless/victory-fork's
+//! (`framelog.rs`, commit 0b0074e0, GPL-3.0-or-later, as this).
 
-/// The system's processor sets of group 0: each one's id, its logical
-/// processor and its efficiency class (higher is faster).
-#[cfg(windows)]
-fn cpu_sets() -> Vec<(u32, u8, u8)> {
+/// The system's processor sets of group 0: each one's id and its efficiency
+/// class (higher is faster).
+fn cpu_sets() -> Vec<(u32, u8)> {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
@@ -28,102 +24,84 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
         // SAFETY: the record's type is CpuSet (the only one there is).
         let set = unsafe { &info.Anonymous.CpuSet };
         if set.Group == 0 {
-            sets.push((set.Id, set.LogicalProcessorIndex, set.EfficiencyClass));
+            sets.push((set.Id, set.EfficiencyClass));
         }
         at += info.Size as usize;
     }
     sets
 }
 
-/// The set ids of the fastest class, or of every slower one; empty where
-/// all are alike.
-fn pick(sets: &[(u32, u8, u8)], fast: bool) -> Vec<u32> {
-    let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
-    let picked: Vec<u32> = sets
-        .iter()
-        .filter(|c| (c.2 == best) == fast)
-        .map(|c| c.0)
-        .collect();
-    if picked.len() == sets.len() {
-        return Vec::new();
-    }
-    picked
+/// The sets of the fastest class, if there are slower ones too.
+fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
+    let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
+    let fast: Vec<u32> = sets.iter().filter(|c| c.1 == best).map(|c| c.0).collect();
+    if fast.len() == sets.len() { Vec::new() } else { fast }
 }
 
-/// Whether `VICTORY_FAST_CORES=1` (off by default; fx 0b0074e has it on
-/// and `=0` for off).
-pub fn fast_cores_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_CORES").is_some_and(|v| v == "1"))
+/// `VICTORY_FAST_CORES`: 0: no thread asks; 1: the threads a frame waits for
+/// one by one; 2 (the default): the threads they share their work with too;
+/// 3: those that work beside the rest as well (lists translated, descriptors
+/// made): more threads by then than the fast cores run at a time, while the
+/// slow ones stood idle.
+fn stage() -> u32 {
+    static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STAGE.get_or_init(|| std::env::var("VICTORY_FAST_CORES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
 }
 
-/// Asks the system to run the calling thread on the fast cores only, where
-/// the processor has two kinds and `VICTORY_FAST_CORES=1`.
-pub fn keep_on_fast_cores(what: &str) {
-    if !fast_cores_on() {
+/// Asks the system to run the calling thread, which a frame waits for, on
+/// the fast cores only, where the processor has two kinds. That fork's submit
+/// thread was found on a slow one in 1,529 looks of 24,021. (A selection of
+/// processors is a preference the scheduler keeps unless nothing of it is
+/// free.) The title's threads are not asked for.
+pub(crate) fn keep_on_fast_cores(what: &str) {
+    ask(what, 1);
+}
+
+/// [`keep_on_fast_cores`] for one of the threads a submission's preparing or
+/// a landing shares its work with.
+pub(crate) fn keep_helper_on_fast_cores(what: &str) {
+    ask(what, 2);
+}
+
+/// [`keep_on_fast_cores`] for one of many threads whose work is ahead of what
+/// a frame waits for.
+pub(crate) fn keep_many_on_fast_cores(what: &str) {
+    ask(what, 3);
+}
+
+fn ask(what: &str, from: u32) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    if stage() < from {
         return;
     }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    static FAST: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
+    let (fast, of) = FAST.get_or_init(|| {
         let sets = cpu_sets();
-        let fast = pick(&sets, true);
-        if fast.is_empty() {
-            return;
-        }
-        // SAFETY: our own thread and a list of the system's own set ids.
-        let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
-        if ok == 0 {
-            tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
-        } else {
-            tracing::info!(what, fast = fast.len(), of = sets.len(), "the thread is kept on the fast cores (VICTORY_FAST_CORES=1)");
-        }
+        (fast_of(&sets), sets.len())
+    });
+    // All alike (or nothing known): nothing to ask for.
+    if fast.is_empty() {
+        return;
     }
-    #[cfg(not(windows))]
-    let _ = what;
-}
-
-/// Asks the system to run the calling thread on the slow cores only, where
-/// the processor has two kinds and at least eight slow logical processors.
-/// True if it was asked. The caller checks `VICTORY_DISK_CORES=slow`.
-pub fn keep_on_slow_cores(what: &str) -> bool {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
-        let sets = cpu_sets();
-        let slow = pick(&sets, false);
-        if slow.len() < 8 {
-            return false;
-        }
-        // SAFETY: our own thread and a list of the system's own set ids.
-        let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) } != 0;
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::info!(what, slow = slow.len(), of = sets.len(), ok, "helper threads are kept on the slow cores: the first one");
-        });
-        ok
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = what;
-        false
+    // SAFETY: our own thread and a list of the system's own set ids.
+    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
+    if ok == 0 {
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
+    } else {
+        tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pick;
+    use super::*;
 
     #[test]
-    fn picks_by_efficiency_class() {
-        // 8 fast (class 1) and 12 slow (class 0).
-        let sets: Vec<(u32, u8, u8)> = (0..20).map(|i| (256 + i, i as u8, u8::from(i < 8))).collect();
-        assert_eq!(pick(&sets, true), (256..264).collect::<Vec<_>>());
-        assert_eq!(pick(&sets, false).len(), 12);
-        // All alike: nothing to ask for.
-        let alike: Vec<(u32, u8, u8)> = (0..8).map(|i| (i, i as u8, 0)).collect();
-        assert!(pick(&alike, true).is_empty());
-        assert!(pick(&alike, false).is_empty());
-        assert!(!super::fast_cores_on() || std::env::var_os("VICTORY_FAST_CORES").is_some());
+    fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
+        assert_eq!(fast_of(&[(256, 1), (257, 1), (258, 0)]), [256, 257]);
+        assert!(fast_of(&[(256, 0), (257, 0)]).is_empty());
+        assert!(fast_of(&[]).is_empty());
+        assert!(!cpu_sets().is_empty());
+        std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
     }
 }

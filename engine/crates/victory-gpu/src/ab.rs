@@ -1,134 +1,131 @@
-//! Drives the in-session A/B schedule (`VICTORY_AB`, [`victory_core::ab`])
-//! from the present path: frame times per present, the frame-rate meter's
-//! per-second sums, device removal; and changes variant at a frame boundary
-//! with every flight settled.
+//! Diagnostics: switches that change while the title runs, so that one run
+//! measures both sides in the same scene. `VICTORY_AB=<seconds>,<switch>[,<switch>..]`:
+//! every so many seconds, at a present, the next phase begins; switch number
+//! n is on in the phases whose number has bit n, so that all combinations
+//! come one after another, again and again. Each phase's frame times are
+//! logged at its end (the frames of its first second left out). A switch
+//! named here does not go by its own variable any more.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::{Mutex, OnceLock};
 
-use victory_core::ab::{Scheduler, Step, Timing, apply, parse_schedule};
-
-pub(crate) use victory_core::ab::Second;
-
-static STATE: Mutex<Option<Option<Scheduler>>> = Mutex::new(None);
-static REMOVED: AtomicBool = AtomicBool::new(false);
-
-fn with<R>(f: impl FnOnce(&mut Scheduler) -> R) -> Option<R> {
-    let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let s = g.get_or_insert_with(|| {
-        let text = std::env::var("VICTORY_AB").ok().filter(|t| !t.trim().is_empty())?;
-        match parse_schedule(&text) {
-            Ok(v) => {
-                let t = Timing::from_env();
-                tracing::warn!(
-                    "ab: {} variants, windows of {:.0} s (first {:.1} s not measured), warm-up {:.0} s, cycles {} ({text})",
-                    v.len(),
-                    t.window as f64 / 1e9,
-                    t.settle as f64 / 1e9,
-                    t.warmup as f64 / 1e9,
-                    if t.cycles == 0 { "until exit".to_string() } else { t.cycles.to_string() }
-                );
-                // SAFETY: registers a function with the host CRT's exit table.
-                unsafe { atexit(at_exit) };
-                Some(Scheduler::new(v, t))
-            }
-            Err(e) => {
-                tracing::error!("ab: VICTORY_AB refused, no A/B this run: {e}");
-                None
-            }
-        }
-    });
-    s.as_mut().map(f)
+struct Asked {
+    seconds: f64,
+    switches: Vec<String>,
 }
 
-fn now_ns() -> u64 {
-    victory_core::pace::now_ns()
+fn parse(text: &str) -> Option<Asked> {
+    let mut parts = text.split(',').map(str::trim);
+    let seconds = parts.next()?.parse::<f64>().ok().filter(|s| *s > 1.0)?;
+    let switches: Vec<String> = parts.filter(|s| !s.is_empty()).map(str::to_string).collect();
+    (!switches.is_empty() && switches.len() <= 8).then_some(Asked { seconds, switches })
 }
 
-/// Settles every flight and what the queues hold, then applies variant `i`.
-fn change(s: &Scheduler, i: usize) {
-    crate::queue::kick_flush();
-    crate::host::settle_for_present();
-    apply(&s.variants, &s.variants[i]);
-    let sets: Vec<String> = s.variants[i].sets.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    tracing::warn!("ab: variant {} now ({})", s.variants[i].name, if sets.is_empty() { "boot values".into() } else { sets.join(",") });
+fn asked() -> Option<&'static Asked> {
+    static ASKED: OnceLock<Option<Asked>> = OnceLock::new();
+    ASKED.get_or_init(|| parse(&std::env::var("VICTORY_AB").ok()?)).as_ref()
 }
 
-/// Without fast boot's detector: [`WORLD_DRAWS`] draws or more a frame for
-/// [`WORLD_FRAMES`] frames in a row (menus draw 40-100, the world 1,500+:
-/// the bench's own rule, by the second).
-const WORLD_DRAWS: u64 = 1500;
-const WORLD_FRAMES: u32 = 60;
+/// The switches that are on now, a bit each.
+static BITS: AtomicU32 = AtomicU32::new(0);
 
-fn world_by_draws() -> bool {
-    use std::sync::atomic::{AtomicU32, AtomicU64};
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    static RUN: AtomicU32 = AtomicU32::new(0);
-    let now = crate::draw::drawn();
-    let d = now.saturating_sub(LAST.swap(now, Ordering::Relaxed));
-    let run = if d >= WORLD_DRAWS { RUN.load(Ordering::Relaxed) + 1 } else { 0 };
-    RUN.store(run, Ordering::Relaxed);
-    run >= WORLD_FRAMES
+/// Whether `switch` is on now, if it is one of those that change.
+pub(crate) fn pick(switch: &str) -> Option<bool> {
+    bit(switch).map(on)
 }
 
-/// A frame was presented (after its settle).
-pub(crate) fn presented() {
-    if REMOVED.swap(false, Ordering::Relaxed) {
-        with(Scheduler::device_removed);
+/// The number of `switch` among those that change.
+pub(crate) fn bit(switch: &str) -> Option<u32> {
+    Some(asked()?.switches.iter().position(|s| s == switch)? as u32)
+}
+
+/// Whether the switch of that number is on now.
+pub(crate) fn on(bit: u32) -> bool {
+    BITS.load(Relaxed) >> bit & 1 != 0
+}
+
+/// What the run has seen of the phase under way.
+struct Phase {
+    started: std::time::Instant,
+    number: u64,
+    began: std::time::Instant,
+    last: std::time::Instant,
+    drawn: u64,
+    frames: Vec<f32>,
+    draws: u64,
+}
+
+/// The frames' mean, median and nine tenths.
+fn summary(frames: &mut [f32]) -> (f32, f32, f32) {
+    if frames.is_empty() {
+        return (0.0, 0.0, 0.0);
     }
-    let in_world = victory_core::fastboot::in_world() || world_by_draws();
-    with(|s| match s.frame(now_ns(), in_world) {
-        Step::Nothing => {}
-        Step::Apply(i) => change(s, i),
-        Step::Closed { line, summary, next } => {
-            tracing::warn!("{line}");
-            if let Some(t) = summary {
-                for l in t.lines() {
-                    tracing::warn!("{l}");
-                }
-            }
-            if s.done() {
-                tracing::warn!("ab: schedule done");
-            }
-            if let Some(i) = next {
-                change(s, i);
-            }
-        }
+    let mean = frames.iter().sum::<f32>() / frames.len() as f32;
+    frames.sort_by(f32::total_cmp);
+    (mean, frames[frames.len() / 2], frames[frames.len() * 9 / 10])
+}
+
+/// The title's present ends on this thread. `change`: called when another
+/// phase begins, before any switch changes, with what `switch` is and what it
+/// will be.
+pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
+    let Some(asked) = asked() else {
+        return;
+    };
+    static PHASE: Mutex<Option<Phase>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    let drawn = crate::draw::drawn();
+    let mut phase = PHASE.lock().unwrap_or_else(|e| e.into_inner());
+    let p = phase.get_or_insert_with(|| Phase {
+        started: now,
+        number: 0,
+        began: now,
+        last: now,
+        drawn,
+        frames: Vec::new(),
+        draws: 0,
     });
-}
-
-/// The frame-rate meter's second just ended.
-pub(crate) fn second(s: Second) {
-    let now = now_ns();
-    with(|sch| sch.second(now, s));
-}
-
-/// The host device was removed (taken at the next present, if any).
-pub(crate) fn device_removed() {
-    REMOVED.store(true, Ordering::Relaxed);
-    // No present may come: log what there is now.
-    if let Ok(g) = STATE.try_lock()
-        && let Some(Some(s)) = g.as_ref()
-    {
-        for l in s.summary().lines() {
-            tracing::warn!("{l} (at device removal)");
-        }
+    if (now - p.began).as_secs_f64() > 1.0 {
+        p.frames.push((now - p.last).as_secs_f32() * 1000.0);
+        p.draws += drawn.saturating_sub(p.drawn);
     }
+    (p.last, p.drawn) = (now, drawn);
+    let number = ((now - p.started).as_secs_f64() / asked.seconds) as u64;
+    if number == p.number {
+        return;
+    }
+    let bits = |number: u64| (number % (1 << asked.switches.len())) as u32;
+    let (was, will) = (bits(p.number), bits(number));
+    let (mean, median, most) = summary(&mut p.frames);
+    let on: Vec<&str> = asked.switches.iter().enumerate().filter(|(n, _)| was >> n & 1 != 0).map(|(_, s)| s.as_str()).collect();
+    tracing::info!(
+        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame",
+        p.number,
+        on.join(" "),
+        p.frames.len(),
+        p.draws as f64 / p.frames.len().max(1) as f64
+    );
+    for (n, switch) in asked.switches.iter().enumerate() {
+        change(switch, was >> n & 1 != 0, will >> n & 1 != 0);
+    }
+    BITS.store(will, Relaxed);
+    (p.number, p.began, p.draws) = (number, now, 0);
+    p.frames.clear();
 }
 
-unsafe extern "C" {
-    fn atexit(f: extern "C" fn()) -> i32;
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// At process exit: the summary of every window measured.
-extern "C" fn at_exit() {
-    if let Ok(g) = STATE.try_lock()
-        && let Some(Some(s)) = g.as_ref()
-    {
-        let t = s.summary();
-        for l in t.lines() {
-            tracing::warn!("{l} (at exit)");
-        }
-        eprint!("{t}");
+    #[test]
+    fn switches_and_seconds_are_read_and_frames_summed_up() {
+        let a = parse("10, VICTORY_A,VICTORY_B").unwrap();
+        assert_eq!((a.seconds, a.switches), (10.0, vec!["VICTORY_A".to_string(), "VICTORY_B".to_string()]));
+        assert!(parse("10").is_none());
+        assert!(parse("x,VICTORY_A").is_none());
+        assert!(parse("0,VICTORY_A").is_none());
+        assert_eq!(summary(&mut [30.0, 10.0, 20.0]), (20.0, 20.0, 30.0));
+        assert_eq!(summary(&mut []), (0.0, 0.0, 0.0));
+        assert_eq!(pick("VICTORY_NONE_SUCH"), None);
     }
 }

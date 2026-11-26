@@ -4,23 +4,20 @@
 //! in the texture's host copy. The title's ocean is one: its wave passes write
 //! a 256x256 height map (R32_FLOAT) and a displacement map (R32G32_FLOAT), and
 //! its CPU code samples both, which is what boats float on; it read memory
-//! nothing had written, and boats sank.
+//! nothing had written (run rw1, `VICTORY_READ_WATCH=1`: about 30 places in
+//! the title read those two kinds), and boats sank.
 //!
 //! For textures of the kinds in `VICTORY_TEXTURE_BACK` (comma-separated
-//! `<width>x<height>f<format>`; `1`: the four water formats found by the
-//! upstream trace; unset or `0`: none, unless `VICTORY_LOOK=1`, which is
-//! `1`), a list in which shaders write one copies it into a read-back buffer
-//! of ours when it closes, and once the list has run the texels are tiled
-//! into the texture's title memory in the console's layout, as the console's
-//! GPU would have left them.
+//! `<width>x<height>f<format>`; unset or `1`: the four water formats found by
+//! the upstream trace; `0`: none), a list in which shaders write one copies it
+//! into a read-back buffer of ours when it closes, and once the list has run
+//! the texels are tiled into the texture's title memory in the console's
+//! layout, as the console's GPU would have left them.
 //!
 //! shortcut: by kind, not by texture: textures of those kinds the title never
 //! reads are copied back too (about a megabyte per such list). The copy shows
 //! what the list's last write left; a title read in between sees the frame
 //! before, as it would before the console's GPU has run.
-//!
-//! Ported from cool_fox (fx-coolfox 23925a4a; fxceless f5c03f3b, pull request
-//! 999: Geckomacabre 895c0b8f, 04df4350).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -34,10 +31,9 @@ fn kinds() -> &'static [(u64, u32, u32)] {
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
-        let list = match crate::cflook::var("TEXTURE_BACK", "1").as_deref() {
-            None | Some("0") => return Vec::new(),
-            Some("1") => DEFAULT.to_owned(),
-            Some(spec) => spec.to_owned(),
+        let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
+            Ok("1") | Err(_) => DEFAULT.to_owned(),
+            Ok(spec) => spec.to_owned(),
         };
         let kinds: Vec<(u64, u32, u32)> = list
             .split(',')
@@ -57,7 +53,8 @@ fn kinds() -> &'static [(u64, u32, u32)] {
 /// Whether title texture `resource` is of a kind copied back.
 pub(crate) fn wanted(resource: This) -> bool {
     let kinds = kinds();
-    !kinds.is_empty() && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+    !kinds.is_empty()
+        && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
 }
 
 /// An outstanding write to a specific allocation. Mapping and resource
@@ -94,40 +91,37 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
     });
 }
 
-/// The title released the texture at `owner`.
 pub(crate) fn released(owner: usize) {
     invalidate(|ticket| ticket.owner == owner);
 }
 
-/// A texture was placed at title memory `at`.
 pub(crate) fn replaced(at: usize) {
     invalidate(|ticket| ticket.at == at);
 }
 
-/// The runtime mapped, unmapped or remapped `[at, at + len)`.
 pub(crate) fn remapped(at: usize, len: usize) {
     let end = at.saturating_add(len);
     invalidate(|ticket| at < ticket.end && ticket.at < end);
 }
 
-/// A texture a list's shaders write, to be copied when it closes.
 pub(crate) struct Target {
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
 }
 
 impl Target {
     pub(crate) fn new(resource: This) -> Option<Self> {
-        crate::resource::host_copy(resource)?;
+        // Keep the host copy independently of the title's resource lifetime.
+        let copy = crate::resource::host_copy(resource)?;
+        let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
-        Some(Self { layout, ticket })
+        Some(Self { copy, layout, ticket })
     }
 
-    pub(crate) fn owner(&self) -> usize {
-        self.ticket.owner
-    }
+    pub(crate) fn owner(&self) -> usize { self.ticket.owner }
 }
 
 /// The readback resources and the allocation the pixels belong to.
@@ -146,16 +140,14 @@ impl Back {
     }
 }
 
-/// Records a copy of `target`'s host copy, which is in the copy source
-/// state, into a read-back buffer of ours.
+/// Records a host copy from a texture already in COPY_SOURCE.
 pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
     if !target.ticket.valid.load(Ordering::Acquire) {
         return None;
     }
     let host = crate::host::host()?;
-    let copy = crate::resource::host_copy(target.ticket.owner as This)?;
-    let texture = &copy.texture;
-    // SAFETY: a live texture.
+    let texture = &target.copy.texture;
+    // SAFETY: a live texture kept through the command list's state tracking.
     let desc = unsafe { texture.GetDesc() };
     let mips = u32::from(desc.MipLevels.max(1));
     let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
@@ -209,8 +201,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
-    let (at, end) = back.range();
-    let size = end - at;
+    let _mapping = crate::watch::title_memory_reading();
     let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -219,6 +210,8 @@ pub(crate) fn land(back: &Back) {
         }
         return;
     }
+    let (at, end) = back.range();
+    let size = end - at;
     let mut tiled = vec![0u8; size];
     // Keep title bytes the subresources do not cover.
     if !crate::host::read_into(at as *const u8, &mut tiled) {
@@ -248,13 +241,13 @@ pub(crate) fn land(back: &Back) {
     }
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
-    crate::shadow::title_will_change(at, size);
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(copied, bytes = size, "texture readback landed");
     }
 }
+
 
 #[cfg(test)]
 mod tests {

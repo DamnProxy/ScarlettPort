@@ -1,5 +1,7 @@
-use std::io::Write;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -55,104 +57,46 @@ impl Cache {
         let output = converter
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
-        publish(&path, &output)?;
-        Ok(path)
-    }
-
-    /// Reclaims partial writes from terminated processes in this key's cache directory.
-    /// Called before reading a large entry so a cache hit also cleans up interrupted writes.
-    #[cfg(windows)]
-    pub fn reclaim_staging_files(&self, key: &CacheKey) {
-        let path = self.path_for(key);
-        let Ok(entries) = std::fs::read_dir(path.parent().expect("hashed path has a parent")) else { return };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some((pid, seq)) = name.to_str().and_then(|s| s.strip_prefix(".tmp-")).and_then(|s| s.split_once('-')) else {
-                continue;
-            };
-            let (Ok(owner), Ok(counter)) = (pid.parse::<u32>(), seq.parse::<u64>()) else { continue };
-            if owner != 0 && name == format!(".tmp-{owner}-{counter}").as_str()
-                && entry.file_type().is_ok_and(|t| t.is_file()) && writer_exited(owner)
-            {
-                remove_abandoned_stage(&entry.path(), owner);
-            }
+        let dir = path.parent().expect("hashed path has a parent");
+        std::fs::create_dir_all(dir)?;
+        // Write-then-rename so readers never see partial output.
+        let (tmp, mut file) = tempfile_in(dir)?;
+        let written = file.write_all(&output);
+        drop(file);
+        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
+        if published.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-    }
-
-    /// The stored bytes of `key`, if there are any.
-    pub fn read(&self, key: &CacheKey) -> Option<Vec<u8>> {
-        std::fs::read(self.path_for(key)).ok()
-    }
-
-    /// Stores `bytes` as `key`'s output, replacing what was there (written aside and
-    /// renamed over it: a reader sees the old bytes or the new, never a mix).
-    pub fn write(&self, key: &CacheKey, bytes: &[u8]) -> Result<PathBuf> {
-        let path = self.path_for(key);
-        publish(&path, bytes)?;
+        published?;
         Ok(path)
     }
 }
 
-/// Writes `output` to `path` through a staging file in its folder.
-fn publish(path: &Path, output: &[u8]) -> Result<()> {
-    let dir = path.parent().expect("hashed path has a parent");
-    std::fs::create_dir_all(dir)?;
-    // Write-then-rename so readers never see partial output.
-    let tmp = tempfile_in(dir);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-    let written = file.write_all(output);
-    drop(file);
-    let published = written.and_then(|()| std::fs::rename(&tmp, path));
-    if published.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    Ok(published?)
-}
-
-fn tempfile_in(dir: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
+fn tempfile_in(dir: &Path) -> io::Result<(PathBuf, File)> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!(".tmp-{}-{n}", std::process::id()))
+    create_tempfile_in(dir, &COUNTER)
 }
 
-#[cfg(windows)]
-fn writer_exited(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
-    // SAFETY: we only query the process and close the handle returned by OpenProcess.
-    unsafe {
-        let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-        if process.is_null() {
-            return GetLastError() == ERROR_INVALID_PARAMETER;
-        }
-        let exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
-        CloseHandle(process);
-        exited
-    }
-}
-
-#[cfg(windows)]
-fn remove_abandoned_stage(path: &Path, pid: u32) {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FileDispositionInfo, SetFileInformationByHandle,
-    };
-    // Pin this directory entry before rechecking the PID. A concurrent cleaner or a
-    // process reusing the PID must not replace the file between the check and deletion.
-    let Ok(file) = std::fs::OpenOptions::new().access_mode(DELETE).share_mode(0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path) else { return };
-    if writer_exited(pid) {
-        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-        // SAFETY: file owns the handle and info has the layout required by FileDispositionInfo.
-        unsafe {
-            SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfo,
-                (&raw const info).cast(), size_of::<FILE_DISPOSITION_INFO>() as u32);
+fn create_tempfile_in(dir: &Path, counter: &AtomicU64) -> io::Result<(PathBuf, File)> {
+    // An interrupted writer can leave a file behind, and process IDs are
+    // reused. Keep it intact and try a new name rather than failing a miss.
+    for _ in 0..128 {
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(".tmp-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a unique cache staging file after 128 attempts",
+    ))
 }
 
 #[cfg(test)]
@@ -194,25 +138,6 @@ mod tests {
     }
 
     #[test]
-    fn a_written_key_is_replaced_whole() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = Cache::open(tmp.path().join("cache")).unwrap();
-        let conv = Upper {
-            version: 1,
-            runs: AtomicUsize::new(0),
-        };
-        let key = CacheKey::new(&conv, b"abc");
-        assert_eq!(cache.read(&key), None);
-        cache.write(&key, b"one").unwrap();
-        assert_eq!(cache.read(&key).as_deref(), Some(&b"one"[..]));
-        cache.write(&key, b"second").unwrap();
-        assert_eq!(cache.read(&key).as_deref(), Some(&b"second"[..]));
-        // no staging file is left beside it
-        let path = cache.path_for(&key);
-        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
-    }
-
-    #[test]
     fn failed_publication_removes_the_staging_file() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
@@ -231,31 +156,63 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn a_retry_reclaims_only_a_dead_writers_stages() {
-        use std::process::{Command, Stdio};
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = Cache::open(tmp.path()).unwrap();
-        let conv = Upper { version: 1, runs: AtomicUsize::new(0) };
-        let key = CacheKey::new(&conv, b"table");
-        let path = cache.write(&key, b"published").unwrap();
-        let shard = path.parent().unwrap();
-        let mut child = Command::new("cmd.exe").args(["/d", "/q"])
-            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
-        let stage = shard.join(format!(".tmp-{}-7", child.id()));
-        let unrelated = stage.with_extension("backup");
-        std::fs::write(&stage, b"partial table").unwrap();
-        std::fs::write(&unrelated, b"keep").unwrap();
-        cache.reclaim_staging_files(&key);
-        let live_stage = stage.is_file();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(live_stage);
-        cache.reclaim_staging_files(&key);
-        assert!(!stage.exists());
-        assert_eq!(cache.read(&key).unwrap(), b"published");
-        assert_eq!(std::fs::read(unrelated).unwrap(), b"keep");
+    fn staging_retries_collisions_without_changing_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        for n in 0..2 {
+            std::fs::write(
+                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
+                b"stale",
+            )
+            .unwrap();
+        }
+
+        let (path, mut file) = create_tempfile_in(dir.path(), &counter).unwrap();
+        file.write_all(b"fresh").unwrap();
+        drop(file);
+        assert_eq!(
+            path.file_name().unwrap(),
+            format!(".tmp-{}-2", std::process::id()).as_str()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        for n in 0..2 {
+            assert_eq!(
+                std::fs::read(dir.path().join(format!(".tmp-{}-{n}", std::process::id()))).unwrap(),
+                b"stale"
+            );
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn staging_collision_retries_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        for n in 0..128 {
+            std::fs::write(
+                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
+                b"stale",
+            )
+            .unwrap();
+        }
+
+        let error = create_tempfile_in(dir.path(), &counter).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(counter.load(Ordering::Relaxed), 128);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 128);
+    }
+
+    #[test]
+    fn staging_does_not_retry_other_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        let missing = dir.path().join("missing");
+
+        let error = create_tempfile_in(&missing, &counter).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert!(!missing.exists());
     }
 
     #[test]

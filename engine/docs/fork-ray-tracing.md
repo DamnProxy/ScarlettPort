@@ -1,17 +1,17 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-The opening cell on an RX 7900 XTX exercises the title's structure builder,
-screen probes, irradiance cache and distant-shadow tracer. All three tracers
-hit scene triangles. A frame capture showed that the packed screen-probe
-output reached its sampled texture with the same bits. The bunk, shelves
-and papers in the cell became visible when the runtime waited for the six
-draws that populate the lighting tables. Ray tracing is opt-in.
+Status, 2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
+indirect light** (runs light-10, light-11, n19), for some 40 ms more of the
+card's time a frame (the dorm: 75 of 90 ms busy against 34 of 64). Off by
+default. **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place
+for next to nothing (below).
 
 ## What the title does
 
-In the opening cell, the Series S profile traces screen probes and distant
-shadows. For local lights it dispatches the checkerboard and hair shadow-mask
-programs. A shadow on a wall can come from either lighting path.
+The title's indirect light (probes, bounce, reflections) and the
+shadows of its lamps and sun are ray traced. Without them, anything the sun
+does not hit directly is black: interiors, the shadowed side of a face, rooms
+lit only by lamps.
 
 The title does not use a ray-tracing API:
 
@@ -37,18 +37,16 @@ shaders and emulates the one instruction.
 
 ## What this fork adds
 
-1. **The builder programs translate.** On the RX 7900 XTX (64-lane waves) all
-   52 did, and the opening scene created 53 builder pipelines. They pass
-   buffer addresses in a spilled parameter table
+1. **The builder programs translate** (all 52, with host pipelines on the RX
+   7900 XTX; the title creates 53 such pipelines). They pass buffer addresses in a spilled parameter table
    rather than in descriptors. Added: the spilled user-data table, root
    unordered-access views (translator and host binding), byte and 16-bit buffer
    accesses, and several control-flow shapes.
 2. **Title memory by raw address from shaders.** A directory with one entry per
    64 KiB of title address space leads a shader to the layer's host copy of
    that memory; loads, stores, atomic add/sub and float min/max go through it.
-   Each host view heap allocates descriptors as the title streams new regions.
-   Submission also maps the destinations of the title's late-filled
-   `InitHeaders` records before the GPU runs the builder.
+   Before a dispatch the host makes ready the memory its root views and root
+   constants name.
 3. **The ray test, emulated in DXIL.** Four slab tests and a sorting network
    for box nodes; a watertight ray/triangle test for triangle nodes; both forms
    of the instruction. A plain Rust reference lives in
@@ -58,90 +56,111 @@ shaders and emulates the one instruction.
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
    64-lane waves running on a GPU with 32-lane waves.
-5. **The host runs the builder as a unit.** Each registered stage must have
-   a host pipeline. The first root UAV that writes a structure header maps
-   its GPU buffer into the address directory. Later rays read the same
-   buffer even when the title has another view of that page. The title
-   receives compacted sizes and counters on the CPU.
-6. **Recorded passes keep their acceleration-structure address.** With ray
-   tracing on, each descriptor-table snapshot stores the title's address
-   alongside the host descriptor. The screen probes and shadow passes use it
-   to reach their scene root. Before this change, they read the header at
-   byte 48. On GPUs that cap view heaps (NVIDIA), these words go to a bank of
-   their own; that path was not run in game.
+5. **A safety rule on the host side.** The builder's stages run only while
+   every builder pipeline the title has created has a host pipeline; otherwise
+   none run (`VICTORY_BVH_BUILDER=1` asks for it; `VICTORY_BVH_QUARANTINE=1`
+   also keeps the builder's stores out of title memory, for a first test). A
+   partly working builder wrote garbage bounds into title memory and crashed
+   the title.
 
-## Opening-cell comparison
+## The structures (from dumps of the arenas, `VICTORY_MEMORY_DUMP`)
 
-On a Radeon RX 7900 XTX (driver 32.0.32029.2010), Ryzen 7 7800X3D and
-Windows 11 build 26300, the Series S profile reached the cell with ray
-tracing on and the shader wait set to zero. The game draws the environment
-BRDF, area-light and scattering tables once at world entry. Previously,
-the runtime could skip these draws while their pipelines compiled.
+- Header, 64 bytes: dword 0 the version 6 in the low half and marks in the high
+  (0x8000 bottom level, 0x4 compacted, 0x2 rehydrated, 0x100 still packed),
+  dword 1 the size in 64-byte nodes, 3 the number of elements, 4-9 the bounds,
+  10 the offset of the box nodes, 12 the root's node pointer, 13 the offset of
+  the elements, 14 the offset of the parent table (from the header; the static
+  ones' index counts the leaves too, so it is negative).
+- An instance is 128 bytes at the top level's offset 13: a 3x4 matrix in dwords
+  0-11, id and mask, flags, the root pointer (bit 30 set for static ones), the
+  bottom level's address in 256-byte units.
+- The static world's structures are shipped **packed ("dehydrated")** and
+  unpacked in place, once, by DecompressHeader, Box32/Box16Rehydration and
+  LeafRehydration when they have been streamed in (3,000 in the opening).
+- Dynamic ones are built, their compacted size read back by the title from a
+  small buffer, and copied to a place of that size.
 
-With those six draws prioritized, mean brightness on the wall left of the
-window rose from 11 to 50 on a scale of 0 to 255. The papers beside the
-bunk rose from 15 to 47. The same patches in a published reference image
-measured 103 and 65. Measurements use 640 by 360 images and luma weights of
-0.2126 red, 0.7152 green and 0.0722 blue. The camera faced the window in
-each image. The character's pose differed.
+## How title memory by address is held (`memory.rs`)
 
-With the builder's root mapped at first use, a release build measured 65
-on the wall and 61 on the papers (medians over 16 frames).
+Pages of 64 KiB in arenas on the card, whole title buffers in their own copies,
+pages with small title buffers as windows of title memory. The module's
+comment has the rules. In short: what the builder stores stays on the card
+(only small title buffers it was given to write come back); a packed structure
+goes up whole when the builder comes to it; title buffers take its stores only
+after it was given them as an unordered access view.
 
-After merging upstream through `be7717f`, we started the game with gamepad
-input and held the camera still while switching ray traversal off and on.
-The screen-probe irradiance fell to zero on both patches with traversal
-disabled and returned when traversal resumed.
+| variable | does |
+|---|---|
+| `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
+| `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
+| `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
+| `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
+| `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
+| `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
+| `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
+| `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
-| Patch | Rays on | Rays off | Rays restored |
-| --- | ---: | ---: | ---: |
-| Wall left of the window | 64 | 51 | 63 |
-| Papers beside the bunk | 60 | 45 | 60 |
-
-On another cold start, the final release build measured 50 on the wall
-and 45 on the papers (medians over 16 frames). Brightness varies between
-starts, which is why the traversal comparison used one run.
-
-A second published reference measured 60 on the wall and 36 on the papers
-after cropping the black borders. Framing and exposure differ between the
-two references.
-
-At the blue table under the fluorescent lamps, a fixed-camera capture
-showed a shadow on the floor behind the table base. With the two local
-shadow masks forced to full visibility, that patch brightened from 46 to
-59. Restoring the game's masks brought it back to 43. An exposed patch
-on the same floor stayed between 51 and 53. The character also cast a
-head-shaped shadow on the wall opposite the cell window.
+Every ten seconds the log has a line "title memory by address: ..." with pages,
+dispatches, faults and what came.
 
 ## Known gaps
 
-- The window wall is darker than the brighter reference.
-- Not retested on a GPU with 32-lane waves. There, a few builder pipelines
-  were refused by the host (they ask for 64-lane waves) or did not translate,
-  which kept the builder off. The measurements here are from a 64-lane
-  RX 7900 XTX.
-- Five shadow-mask trace programs do not translate yet.
-- In some runs the back of the inmate shirt is black. A pixel trace at
-  (480, 592) in the 1280 by 720 base-color buffer showed
-  `PS_DeferredPedTexturedNC_b1a27fc2_Wrapped` writing RGBA (0, 0, 0, 5).
-  In a run where the shirt appeared orange, the same area had RGB values
-  around (209, 90, 49). Toggling the rays left the material values unchanged.
-  The normal and material targets differ at the same pixels too, so every map
-  of the shirt is wrong, not only its color. In one of ten later runs the
-  shirt showed the diamond pattern of the window's fence instead of black:
-  the shirt's textures, which it picks by index, showed another texture.
-  Its table textures were the same as in good runs. Two causes were ruled
-  out. With every decoration bake dropped, the shirt stayed orange and the
-  heads went invisible. Refreshing placed textures uploaded before their
-  streamed bytes arrived (`VICTORY_PAGE_WRITES=1`) did not stop it; those
-  were the same three or four small textures in every run.
-- Gameplay measurements cover the opening cell on one GPU.
-- An access to a title page that has no host copy is lost (a read gives zero, a
-  store is dropped).
+- Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of
+  275 in light-15). Part of the cause, run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
+  structure's compacted size, reads it one or two frames later without looking
+  whether it is there, takes memory of that size and has the structure copied
+  into it. Our submissions land up to two frames late; the title read what the
+  slot held before, another structure's size, and the copy wrote over the
+  neighbours. Waiting for a submission that asks (`VICTORY_BVH_SIZES_WAIT=1`)
+  did not mend it and costs some 20 ms a frame (light-15): the title asks in
+  every frame, and what it read was as old as before. Open.
+- What a structure that was written over says of its size sent the builder's
+  copy of it through gigabytes of other structures; bounded now
+  (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame
+  before, 90 after (the dorm).
+- The card's time in the dorm with the builder (timing run light-13, title's
+  commands 84 ms): `CopyForBVHUpdate` 13.3 ms in 63 dispatches (before the
+  bound), traces 24 ms (`RaytraceVBuffer` 7.9, screen probes 6.4, irradiance
+  cache 3.5, primary probes 2.3, shadows 1.6).
+- Captures made on 2026-11-25 (builder on or off) hang the card in a replay
+  (cause unknown; do not try).
+- Five shadow-mask trace programs do not translate (a structure's address out
+  of a descriptor picked from the heap by a computed index: the host would have
+  to give a table of addresses by slot). The title did not create them in any
+  run so far.
+- An access to a page that is not there is lost (a read gives zero, a store is
+  dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
-- Cost on the GPU is unmeasured.
+
+## Without rays: the stand-in (`crates/victory-gpu/src/ambient.rs`)
+
+Without structures every ray misses. The title's program that resolves the
+diffuse light of its screen probes (`CS_ScreenProbes_TemporalResolve_*`, list
+184 of a frame) then leaves the sky's light outdoors, nothing indoors, and in
+blocks of tiles what the probes' memory held. `VICTORY_AMBIENT=<share>` raises
+it to an estimate right after that program: the title keeps, for its own screen
+traces, the light visible surfaces send out (`CS_CacheScreenSpaceRadiance`,
+1280x720, the frame before); its mean in 64x36 cells is gathered at 160x90
+points, each cell weighted by the share of the surroundings it covers, as a
+directional value; each pixel takes it between the points by depth, with its
+normal and a shade in creases. So level and tint follow the hour, the room and
+its lamps. What the program left counts up to four times the estimate.
+
+Where it can be put, and the crease shade, are beloooo's (VIctory-Belobug-AMD
+06031237, 4f45ab88, cd9f78ce); `VICTORY_AMBIENT=constant:<level>` is that
+fork's constant.
+
+| variable | does |
+|---|---|
+| `VICTORY_AMBIENT=<share>` | the estimate, 1 all of it (unset: the title's own) |
+| `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
+| `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
+| `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+
+It is off while the builder runs.
 
 ## Where to look
 

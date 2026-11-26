@@ -303,7 +303,7 @@ fn start() {
     let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
-            crate::cores::keep_on_fast_cores("victory-list");
+            crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
             loop {
                 let recording = {
@@ -421,7 +421,7 @@ macro_rules! plain {
 plain! {
     TOPOLOGY topology = state::topology, (v: u32);
     STENCIL_REF stencil_ref = state::stencil_ref, (v: u32);
-    DEPTH_BOUNDS depth_bounds = super::depth_bounds, (min: f32, max: f32);
+    DEPTH_BOUNDS depth_bounds = state::depth_bounds, (min: f32, max: f32);
     COMPUTE_TABLE compute_table = state::compute_table, (slot: u32, handle: u64);
     GRAPHICS_TABLE graphics_table = state::graphics_table, (slot: u32, handle: u64);
     COMPUTE_CONSTANT compute_constant = state::compute_constant, (slot: u32, value: u32, offset: u32);
@@ -532,14 +532,12 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if front.closed || front.recording.is_none() {
         return std::ptr::null_mut();
     }
-    // (Upload memory is an [`super::UploadBlock`], as in the full list: low
-    // addresses the title's records can hold.)
-    let Some(mut block) = super::UploadBlock::new(len) else {
+    let Some(mut block) = Upload::new(len) else {
         return std::ptr::null_mut();
     };
-    let Some(place) = block.take(usize::try_from(size).unwrap_or(0).max(1), align) else {
-        return std::ptr::null_mut();
-    };
+    let start = block.start();
+    // SAFETY: the offset is below `align`, so `size` bytes fit after it.
+    let place = unsafe { start.add(start.align_offset(align)) };
     front.put(UPLOAD, &[Box::into_raw(Box::new(block)) as u64]);
     place
 }
@@ -695,7 +693,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
-            let block = *unsafe { Box::from_raw(w[0] as *mut super::UploadBlock) };
+            let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);

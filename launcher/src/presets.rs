@@ -15,7 +15,7 @@ pub const ALL: [&str; 4] = [STABLE, LOOK, EXPERIMENTAL, CUSTOM];
 pub const LOOK_ON: [(&str, &str); 2] = [("VICTORY_LOOK", "1"), ("VICTORY_SHADER_FIXES", "1")];
 
 /// The runtime build the bundled runtime folder is made from (see the repository's runtime/).
-pub const BUNDLED_BUILD: &str = "v0.4.5 runtime";
+pub const BUNDLED_BUILD: &str = "v0.4.6 runtime";
 /// The build the Experimental switches were merged into (fx-cand2); older builds ignore them.
 pub const EXPERIMENTAL_BUILD: &str = "fx-cand2";
 
@@ -32,17 +32,27 @@ pub const C1: [&str; 9] = [
     "VICTORY_PREP_REUSE",
 ];
 
-/// fx-cand4 additions to Stable: sub-page memory, copies without the extra query, a 4 GB
-/// card-buffer pool (the runtime caps the room it keeps with `VICTORY_CARD_ROOM_KEPT_MB`, 512 by
-/// default), PlayStation pads read natively over USB (`VICTORY_PAD_PS`) and `VICTORY_FRIENDLY`,
-/// which leaves processor time to the desktop. Lazy remapping (`VICTORY_REMAP_LAZY`) is left
-/// out: a moving A/B showed it now slows the world down. Fast boot stays optional (not set here).
-pub const CAND4: [(&str, &str); 5] = [
-    ("VICTORY_MEM_SUBPAGE", "1"),
-    ("VICTORY_COPY_NOQUERY", "1"),
-    ("VICTORY_CARD_BUFFERS_MB", "4096"),
-    ("VICTORY_PAD_PS", "1"),
-    ("VICTORY_FRIENDLY", "1"),
+/// The engine's picture and residency settings (since 0.4.6): ambient and sky light, textures shown
+/// complete, the threaded list and submission path, and buffers of 64 KB and up kept on the card.
+pub const CAND4: [(&str, &str); 18] = [
+    ("VICTORY_AMBIENT_AIR", "1.5"),
+    ("VICTORY_TEXTURE_NO_WAIT", "1"),
+    ("VICTORY_WIDE_BACK", "1"),
+    ("VICTORY_CARD_REHASH_RUNS", "1"),
+    ("VICTORY_JOIN_COPIES", "1"),
+    ("VICTORY_INDIRECT_WINDOW", "1"),
+    ("VICTORY_RELAY_COPY", "1"),
+    ("VICTORY_CARD_STEPS", "2"),
+    ("VICTORY_INDIRECT_BATCH", "2"),
+    ("VICTORY_MAP_THREADS", "1"),
+    ("VICTORY_CARD_AWAKE", "1"),
+    ("VICTORY_SHOW_AFTER", "1"),
+    ("VICTORY_AMBIENT", "0.8"),
+    ("VICTORY_THIN", "1"),
+    ("VICTORY_JOIN_PARTS", "8"),
+    ("VICTORY_UPLOAD_AHEAD", "1"),
+    ("VICTORY_LEVELS_ON_DEMAND", "1"),
+    ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
 ];
 
 /// Variables play.ps1 clears before a plain run (so nothing left in the launcher's own
@@ -86,7 +96,7 @@ pub fn blurb(preset: &str) -> &'static str {
         EXPERIMENTAL => "C1 plus the safe fx-cand2 switches (indirect window and keep, tabled skip frames). Own cache.",
         LOOK => "Stable plus the picture fixes (VICTORY_LOOK) and the shader translation fixes (VICTORY_SHADER_FIXES). Opt-in, not yet measured on the RTX 3060; the first run rebuilds shaders.",
         CUSTOM => "Your World options from Settings (ray tracing, stand-in light, debug view).",
-        _ => "The verified fx-cand4 setup: precise syncs, the speed switches, sub-page memory, copy cuts, PlayStation pads.",
+        _ => "The engine's default setup: full picture (ambient and sky light, complete textures), threaded submissions, buffers kept on the card.",
     }
 }
 
@@ -96,7 +106,6 @@ pub fn stable_env(game: &Path, victory_cache: &Path) -> Vec<(&'static str, Strin
     let mut v = vec![
         ("VICTORY_GAME_DIR", game.display().to_string()),
         ("VICTORY_CACHE_DIR", victory_cache.display().to_string()),
-        ("VICTORY_SAVE_SLOT", "default".to_string()),
         ("VICTORY_OWN_UPSCALER", "1".to_string()),
         ("VICTORY_NO_WATCHDOG", "1".to_string()),
         ("VICTORY_RELAY", "2".to_string()),
@@ -151,11 +160,10 @@ mod tests {
     #[test]
     fn stable_matches_play_ps1() {
         let e = stable_env(Path::new("D:/dump"), Path::new("F:/c"));
-        assert_eq!(e.len(), 10 + C1.len() + CAND4.len());
-        assert_eq!(get(&e, "VICTORY_FRIENDLY").as_deref(), Some("1"));
+        assert_eq!(e.len(), 9 + C1.len() + CAND4.len());
+        assert!(get(&e, "VICTORY_SAVE_SLOT").is_none());
         assert!(get(&e, "VICTORY_REMAP_LAZY").is_none());
         for (k, v) in [
-            ("VICTORY_SAVE_SLOT", "default"),
             ("VICTORY_OWN_UPSCALER", "1"),
             ("VICTORY_NO_WATCHDOG", "1"),
             ("VICTORY_RELAY", "2"),

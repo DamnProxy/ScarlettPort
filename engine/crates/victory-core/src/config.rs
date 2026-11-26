@@ -24,16 +24,6 @@ pub struct Config {
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
-    /// `[controls]`: keyboard and mouse bindings, read by `victory-hle`.
-    pub controls: Option<toml::Table>,
-    /// `[display]`: window mode and the overlay's graph, read by `overlay`.
-    pub display: Option<toml::Table>,
-    /// `[pace]`: the pacing switches, read by `pace`.
-    pub pace: Option<toml::Table>,
-    /// `[game]`: vibration and the keyboard hints, read by `rumble` and `hints`.
-    pub game: Option<toml::Table>,
-    /// `[upscale]`: the upscaler and frame generation, read by `upscale`.
-    pub upscale: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,11 +31,6 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
-    controls: Option<toml::Table>,
-    display: Option<toml::Table>,
-    pace: Option<toml::Table>,
-    game: Option<toml::Table>,
-    upscale: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -58,17 +43,10 @@ struct FilePaths {
     test_titles: Vec<PathBuf>,
 }
 
-/// Empty means unset, like the other path variables.
-fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
-    env("VICTORY_CONFIG")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = explicit_config_path(|key| std::env::var_os(key));
+        let explicit = explicit_config_path(|k| std::env::var_os(k));
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
@@ -92,13 +70,7 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        let mut cfg = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
-        cfg.controls = parsed.controls;
-        cfg.display = parsed.display;
-        cfg.pace = parsed.pace;
-        cfg.game = parsed.game;
-        cfg.upscale = parsed.upscale;
-        Ok(cfg)
+        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
     }
 
     fn resolve(
@@ -125,11 +97,6 @@ impl Config {
             data_dir,
             test_titles,
             source,
-            controls: None,
-            display: None,
-            pace: None,
-            game: None,
-            upscale: None,
         })
     }
 
@@ -150,6 +117,14 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+/// The config file explicitly named by the environment, if any. An empty
+/// `VICTORY_CONFIG` means unset, like the other path variables.
+fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("VICTORY_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -173,17 +148,6 @@ fn default_dir(name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-
-    #[test]
-    fn empty_config_env_is_ignored() {
-        let empty = |k: &str| (k == "VICTORY_CONFIG").then(OsString::new);
-        assert_eq!(explicit_config_path(empty), None);
-        let set = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("custom.toml"));
-        assert_eq!(
-            explicit_config_path(set),
-            Some(PathBuf::from("custom.toml"))
-        );
-    }
 
     #[test]
     fn environment_overrides_file() {
@@ -233,19 +197,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_config_env_is_ignored() {
+        let empty = |k: &str| (k == "VICTORY_CONFIG").then(OsString::new);
+        assert_eq!(explicit_config_path(empty), None);
+        let set = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("custom.toml"));
+        assert_eq!(
+            explicit_config_path(set),
+            Some(PathBuf::from("custom.toml"))
+        );
+    }
+
+    #[test]
     fn example_config_parses() {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
-    }
-
-    #[test]
-    fn launcher_sections_parse() {
-        // What the ScarlettPort launcher's Settings, Features page writes.
-        let text = "[display]\nhdr = false\n\n[game]\nrumble = true\nrumble_strength = 1.0\nkbm_hints = \"auto\"\n\n[pace]\npace = true\nfps = 30\n\n[upscale]\nupscaler = \"fsr\"\nquality = \"quality\"\nsharpness = 0.2\nframegen = false\n";
-        assert!(toml::from_str::<FileConfig>(text).is_ok());
-        // Unknown sections are still refused, so typos are caught.
-        assert!(toml::from_str::<FileConfig>("[dispaly]\nhdr = true\n").is_err());
     }
 
     #[test]

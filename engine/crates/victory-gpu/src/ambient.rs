@@ -92,17 +92,9 @@ fn parse(set: &str) -> Set {
     }
 }
 
-/// `VICTORY_AMBIENT_PCT` (live, for the in-session A/B): unset follows
-/// `VICTORY_AMBIENT`; `0` off; `N` the estimate at N per cent (80 = 0.8).
-static PCT: victory_core::live::Switch = victory_core::live::Switch::new("AMBIENT_PCT", u64::MAX);
-
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    match PCT.get() {
-        u64::MAX => *SET.get_or_init(|| parse(&crate::cflook::var("AMBIENT", "0.8").unwrap_or_default())),
-        0 => Set::Off,
-        pct => Set::Estimate(pct as f32 / 100.0),
-    }
+    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
@@ -113,16 +105,9 @@ pub(crate) fn on() -> bool {
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
-    /// `VICTORY_AMBIENT_AIR_PCT` (live): unset follows `VICTORY_AMBIENT_AIR`;
-    /// `0` off; `N` a multiple of N per cent (150 = 1.5).
-    static PCT: victory_core::live::Switch = victory_core::live::Switch::new("AMBIENT_AIR_PCT", u64::MAX);
-    match PCT.get() {
-        u64::MAX => {}
-        pct => return pct as f32 / 100.0,
-    }
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
-        let set = crate::cflook::var("AMBIENT_AIR", "1.5").unwrap_or_default();
+        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
 }
