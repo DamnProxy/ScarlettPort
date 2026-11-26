@@ -8,14 +8,9 @@
 #   SCARLETT_OWN_UPSCALER=1 ask for the title's own upscaler on the Series S profile (recommended)
 #   SCARLETT_NO_WATCHDOG=1  disarm the title's stall watchdog so it can wait for slow first-run
 #                          shader builds instead of ending itself
-#   SCARLETT_SYNC_PRECISE=1 a submission waits only for the submissions it depends on
-#   SCARLETT_READ_SETTLE_PRECISE=1  read-backs settle on the exact submissions they need
-#   SCARLETT_PRECOMPILED_GRAPHICS=1 graphics pipelines come from the title's precompiled cache,
-#                          prebuilt by `scarlett precompile-graphics` (run once, below; needs a GPU)
-#   SCARLETT_READFIX, SCARLETT_COPY_BACK_ONLY_READBACK, SCARLETT_NARROW_ROOT / _VIEWS / _BVH,
-#                          SCARLETT_PREP_BARRIERS / _TABLES / _REUSE = 1: the other verified speed settings
-#   SCARLETT_RELAY=2        submission relay, form 2 (needed by the two settings above)
+#   SCARLETT_RELAY=2        submission relay, form 2
 #   SCARLETT_PIPELINE_WAIT_MS=0  do not hold a draw back waiting for a pipeline build
+#   The engine's CAND4 group (THIN, CARD_BUFFERS_MIN_KB, CARD_STEPS, ...), as the launcher sets it.
 #   SCARLETT_FAST_BOOT=1    with -FastBoot: press through logos and menus (testing only)
 #   SCARLETT_RAYTRACING=1   with -RayTracing: the title's ray-traced lighting, for that launch only
 #   SCARLETT_SAVE_SLOT      with -SaveSlot: pick a save slot by name
@@ -58,19 +53,35 @@ if (-not (Test-Path $exe)) {
 $env:SCARLETT_GAME_DIR = $Game
 if (-not $NoOwnUpscaler) { $env:SCARLETT_OWN_UPSCALER = '1' }
 if (-not $KeepWatchdog) { $env:SCARLETT_NO_WATCHDOG = '1' }
-# The verified speed settings (see docs/RUNTIMES.md). The experimental memory switches
-# (msfix, mem2) stay off.
 $env:SCARLETT_RELAY = '2'
-$env:SCARLETT_SYNC_PRECISE = '1'
-$env:SCARLETT_READ_SETTLE_PRECISE = '1'
-# The rest of the verified speed settings. The grid fix is in this runtime, so precompiled graphics pipelines are on.
-foreach ($k in 'SCARLETT_PRECOMPILED_GRAPHICS','SCARLETT_READFIX','SCARLETT_COPY_BACK_ONLY_READBACK','SCARLETT_NARROW_ROOT','SCARLETT_NARROW_VIEWS','SCARLETT_NARROW_BVH','SCARLETT_PREP_BARRIERS','SCARLETT_PREP_TABLES','SCARLETT_PREP_REUSE') { Set-Item "env:$k" '1' }
-# fx-cand4: sub-page memory, copies without the extra query, 4 GB card buffers. SCARLETT_REMAP_LAZY is left
-# out: a moving A/B showed it now slows the world down.
-$env:SCARLETT_MEM_SUBPAGE = '1'; $env:SCARLETT_COPY_NOQUERY = '1'; $env:SCARLETT_CARD_BUFFERS_MB = '4096'
-# Leaves processor time to the desktop while the title runs.
-$env:SCARLETT_FRIENDLY = '1'
 $env:SCARLETT_PIPELINE_WAIT_MS = '0'
+# SCARLETT_CARD_BUFFERS_MB is deliberately not set: the engine scales this ceiling from VRAM
+# (512 MiB on a <=12 GiB budget) and reserves at most 1 GiB of texture room for card buffers,
+# so overriding only the ceiling (the old 4096) leaves the two out of step.
+
+# The engine's settings, identical to the launcher's Stable preset (CAND4 in
+# launcher/src/presets.rs) and to engine/Play-ScarlettPort.cmd. Keep the three lists in step.
+$live = [ordered]@{
+    'SCARLETT_AMBIENT_AIR'          = '1.5'
+    'SCARLETT_TEXTURE_NO_WAIT'      = '1'
+    'SCARLETT_WIDE_BACK'            = '1'
+    'SCARLETT_CARD_REHASH_RUNS'     = '1'
+    'SCARLETT_JOIN_COPIES'          = '1'
+    'SCARLETT_INDIRECT_WINDOW'      = '1'
+    'SCARLETT_RELAY_COPY'           = '1'
+    'SCARLETT_CARD_STEPS'           = '2'
+    'SCARLETT_INDIRECT_BATCH'       = '2'
+    'SCARLETT_MAP_THREADS'          = '1'
+    'SCARLETT_CARD_AWAKE'           = '1'
+    'SCARLETT_SHOW_AFTER'           = '1'
+    'SCARLETT_AMBIENT'              = '0.8'
+    'SCARLETT_THIN'                 = '1'
+    'SCARLETT_JOIN_PARTS'           = '8'
+    'SCARLETT_UPLOAD_AHEAD'         = '1'
+    'SCARLETT_LEVELS_ON_DEMAND'     = '1'
+    'SCARLETT_CARD_BUFFERS_MIN_KB'  = '64'
+}
+foreach ($k in $live.Keys) { Set-Item "env:$k" $live[$k] }
 if ($FastBoot) { $env:SCARLETT_FAST_BOOT = '1' }
 if ($Look) { $env:SCARLETT_LOOK = '1'; $env:SCARLETT_SHADER_FIXES = '1' }
 if ($SaveSlot) { $env:SCARLETT_SAVE_SLOT = $SaveSlot }
