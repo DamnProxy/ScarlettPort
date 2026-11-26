@@ -111,7 +111,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 mod switch_tests {
     #[test]
     fn legacy_names() {
-        assert_eq!(super::legacy_name("SCARLETT_LOOK").map(|n| n.len()), Some("SCARLETT_LOOK".len()));
+        assert!(super::legacy_name("SCARLETT_LOOK").is_some_and(|n| n.ends_with("_LOOK") && n != "SCARLETT_LOOK"));
         assert_eq!(super::legacy_name("XCL_DXC_DIR"), None);
     }
 }
