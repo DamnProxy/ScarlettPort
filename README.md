@@ -28,7 +28,23 @@ Developed and tested so far against one open-world title. It boots, gets through
 
 ## 📸 Screenshots
 
-All captured on an RTX 3060 under Windows 10.
+### Opening cell, ray tracing on (contributor's capture, PR #25)
+
+| Before | After |
+| --- | --- |
+| ![Cell wall before the lighting fix](https://github.com/user-attachments/assets/5e917b82-c0bb-4cbd-bb3e-9dc3b840a42d) | ![Cell wall after the lighting fix](https://github.com/user-attachments/assets/99a24a6d-f9c3-432a-8d4e-443f88d9568f) |
+| ![Bunks before the lighting fix](https://github.com/user-attachments/assets/e1312aa7-9d51-4f8a-9144-28886e0acb9f) | ![Bunks after the lighting fix](https://github.com/user-attachments/assets/71b78492-79b6-4d29-84f1-b07b8e3ac721) |
+| ![Floor behind the table base with shadows disabled](https://github.com/user-attachments/assets/b13bbf0a-87c7-4928-8f1f-0ce09fda5a47) | ![Shadow behind the table base](https://github.com/user-attachments/assets/014da3d5-ad7f-4b08-af21-f2dbac7a05de) |
+
+<sub>Bounce light on the cell wall and bunk, and the table's shadow, restored by grooving6's PR #25. Captured by the contributor on an RX 7900 XTX with ray tracing switched on (`-RayTracing`, off by default). Not measured on other cards; ray tracing costs frame rate.</sub>
+
+### Opening cell on an RTX 3060, default settings
+
+![Opening cell on an RTX 3060](assets/cell-rtx3060.png)
+
+<sub>The v0.4.3 runtime on an RTX 3060 under Windows 10, ray tracing off, while walking and turning: warm rim light through the fence, hair and bunks drawn. Measured at about 5 fps in this scene.</sub>
+
+The screenshots below were captured on an RTX 3060 under Windows 10.
 
 ### Gameplay view, lit
 
