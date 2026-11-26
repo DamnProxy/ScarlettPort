@@ -143,6 +143,13 @@ pub fn world_env(c: &Config, game: &Path, cache_dir: &str) -> Vec<(&'static str,
         v.push(("SCARLETT_PRECOMPILED_GRAPHICS", "1".to_string()));
     }
     v.extend(SPEED_SETTINGS.iter().map(|k| (*k, "1".to_string())));
+    // The engine's picture and residency settings, as in Stable (ambient and sky light, complete
+    // textures, buffers kept on the card); without them Custom ran darker and slower than Stable.
+    v.extend(crate::presets::CAND4.iter().map(|(k, x)| (*k, x.to_string())));
+    if c.raytracing {
+        // The switch the runtime reads for the title's own ray-traced light.
+        v.push(("SCARLETT_BVH_BUILDER", "1".to_string()));
+    }
     if c.debug_view {
         v.push(("SCARLETT_DEBUG_PS", "1".to_string()));
         v.push(("SCARLETT_SHOW_TARGET", "2560x1440-f28".to_string()));
@@ -253,6 +260,10 @@ mod tests {
         let e = world_env(&c, &g, "E:/c");
         assert_eq!(get(&e, "SCARLETT_AUTO_INPUT").as_deref(), Some("1"));
         assert_eq!(get(&e, "SCARLETT_RAYTRACING").as_deref(), Some("1"));
+        assert_eq!(get(&e, "SCARLETT_BVH_BUILDER").as_deref(), Some("1"));
+        for (k, v) in crate::presets::CAND4 {
+            assert_eq!(get(&e, k).as_deref(), Some(v), "Custom keeps the engine's settings: {k}");
+        }
     }
 
     #[test]
