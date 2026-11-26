@@ -66,8 +66,14 @@ const LEGACY_DATA_DIR: &str = "victory"; // rename:keep
 /// `%LOCALAPPDATA%\ScarlettPort` does not is moved over (copied when it cannot be moved);
 /// the launcher's own files in `%LOCALAPPDATA%\ScarlettPort` are left as they are.
 pub fn migrate_legacy_data() {
-    let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else { return };
-    let root = data_dir();
+    if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        migrate_legacy_data_in(&base);
+    }
+}
+
+/// `migrate_legacy_data` for the data folders under `base` (`%LOCALAPPDATA%`).
+fn migrate_legacy_data_in(base: &Path) {
+    let root = base.join("ScarlettPort");
     let old_toml = root.join(format!("{LEGACY_DATA_DIR}.toml"));
     if old_toml.is_file() && !root.join("scarlett.toml").exists() {
         let _ = std::fs::rename(&old_toml, root.join("scarlett.toml"));
@@ -85,6 +91,16 @@ pub fn migrate_legacy_data() {
         let _ = copy_tree(&entry.path(), &target);
     }
     let _ = std::fs::remove_dir(&old);
+}
+
+/// A folder setting that pointed into the former data folder (`<base>\<old name>\...`) points
+/// into `<base>\ScarlettPort\...` after the move. Other paths are returned as they are.
+pub fn migrate_data_path(path: &str, base: &Path) -> String {
+    let old = base.join(LEGACY_DATA_DIR).display().to_string();
+    let t = path.trim();
+    let n = old.len();
+    let inside = t.len() >= n && t.is_char_boundary(n) && t[..n].eq_ignore_ascii_case(&old) && (t.len() == n || t[n..].starts_with(['\\', '/']));
+    if inside { format!("{}{}", base.join("ScarlettPort").display(), &t[n..]) } else { path.to_string() }
 }
 
 /// A shader cache folder kept under its former name inside `cache` takes the new one.
@@ -113,6 +129,39 @@ mod switch_tests {
     fn legacy_names() {
         assert!(super::legacy_name("SCARLETT_LOOK").is_some_and(|n| n.ends_with("_LOOK") && n != "SCARLETT_LOOK"));
         assert_eq!(super::legacy_name("XCL_DXC_DIR"), None);
+    }
+
+    #[test]
+    fn data_paths_follow_the_moved_folder() {
+        use std::path::Path;
+        let base = Path::new(r"C:\Users\Zoë Ünal\AppData\Local");
+        let old = base.join(super::LEGACY_DATA_DIR);
+        let cache = format!(r"{}\cache", old.display());
+        assert_eq!(super::migrate_data_path(&cache, base), format!(r"{}\cache", base.join("ScarlettPort").display()));
+        let upper = format!(r"{}\cache", old.display().to_string().to_ascii_uppercase());
+        assert_eq!(super::migrate_data_path(&upper, base), format!(r"{}\cache", base.join("ScarlettPort").display()));
+        assert_eq!(super::migrate_data_path(r"D:\ScarlettCache", base), r"D:\ScarlettCache");
+        let sibling = format!(r"{}2\x", old.display());
+        assert_eq!(super::migrate_data_path(&sibling, base), sibling, "a folder that only starts with the old name stays");
+        assert_eq!(super::migrate_data_path("", base), "");
+    }
+
+    #[test]
+    fn legacy_data_moves_over_without_overwriting() {
+        // A temporary %LOCALAPPDATA% with a space and a non-ASCII character in its name.
+        let base = std::env::temp_dir().join(format!("sp-mig-{} ü", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let old = base.join(super::LEGACY_DATA_DIR);
+        std::fs::create_dir_all(old.join("data")).unwrap();
+        std::fs::write(old.join("data").join("save.bin"), "s").unwrap();
+        std::fs::write(old.join("launcher.json"), "old").unwrap();
+        std::fs::create_dir_all(base.join("ScarlettPort")).unwrap();
+        std::fs::write(base.join("ScarlettPort").join("launcher.json"), "new").unwrap();
+        super::migrate_legacy_data_in(&base);
+        let new = base.join("ScarlettPort");
+        assert_eq!(std::fs::read_to_string(new.join("data").join("save.bin")).unwrap(), "s");
+        assert_eq!(std::fs::read_to_string(new.join("launcher.json")).unwrap(), "new", "existing files win");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
