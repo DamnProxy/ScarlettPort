@@ -15,7 +15,7 @@ pub const ALL: [&str; 4] = [STABLE, LOOK, EXPERIMENTAL, CUSTOM];
 pub const LOOK_ON: [(&str, &str); 2] = [("VICTORY_LOOK", "1"), ("VICTORY_SHADER_FIXES", "1")];
 
 /// The runtime build the bundled runtime folder is made from (see the repository's runtime/).
-pub const BUNDLED_BUILD: &str = "v0.4.4 runtime";
+pub const BUNDLED_BUILD: &str = "v0.4.5 runtime";
 /// The build the Experimental switches were merged into (fx-cand2); older builds ignore them.
 pub const EXPERIMENTAL_BUILD: &str = "fx-cand2";
 

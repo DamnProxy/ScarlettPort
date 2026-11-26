@@ -8,17 +8,17 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$bin  = Join-Path $root 'runtime\victory\target\release'
+$bin  = Join-Path $root 'engine\target\release'
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw 'Rust is not installed. Get it from https://rustup.rs (stable-x86_64-pc-windows-msvc).'
 }
 
-Write-Host '==> Building VIctory runtime (release)...' -ForegroundColor Cyan
-Push-Location (Join-Path $root 'runtime\victory')
+Write-Host '==> Building the ScarlettPort runtime (release)...' -ForegroundColor Cyan
+Push-Location (Join-Path $root 'engine')
 # Cargo writes progress to stderr; Windows PowerShell 5.1 would treat that as an error under 'Stop'.
 $ErrorActionPreference = 'Continue'
-cargo rustc --release -p victory --bin victory --features diagnostics --locked -- -C link-arg=/EXPORT:D3D12SDKVersion,DATA -C link-arg=/EXPORT:D3D12SDKPath,DATA
+cargo rustc --release -p victory --bin scarlett --features diagnostics --locked -- -C link-arg=/EXPORT:D3D12SDKVersion,DATA -C link-arg=/EXPORT:D3D12SDKPath,DATA
 $code = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 Pop-Location
@@ -40,10 +40,10 @@ if (-not (Test-Path (Join-Path $agility 'D3D12Core.dll'))) {
 
 if ($Game -and -not $SkipPrecompile) {
     if (-not (Test-Path $Game)) { throw "No folder '$Game'." }
-    Write-Host '==> Prebuilding precompiled graphics pipelines (victory precompile-graphics)...' -ForegroundColor Cyan
-    $env:VICTORY_GAME_DIR = $Game
+    Write-Host '==> Prebuilding precompiled graphics pipelines (scarlett precompile-graphics)...' -ForegroundColor Cyan
+    $env:SCARLETT_GAME_DIR = $Game
     $ErrorActionPreference = 'Continue'
-    & (Join-Path $bin 'victory.exe') precompile-graphics
+    & (Join-Path $bin 'scarlett.exe') precompile-graphics
     $code = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
     if ($code -ne 0) { throw "victory precompile-graphics failed (exit $code)." }

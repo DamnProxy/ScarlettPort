@@ -1,3 +1,5 @@
+> ScarlettPort note: this README is kept from upstream. In this repository the executable is `scarlett.exe` (it was `victory.exe` before 0.4.5) and every `VICTORY_*` switch can be given as `SCARLETT_*`; see `UPSTREAM.md`.
+
 # VIctory fork (work in progress)
 
 ## victory-amd

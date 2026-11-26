@@ -629,7 +629,7 @@ impl Launcher {
         let world = self.world_selected();
         let idle = self.running.is_none();
         let engine_sub = if !bundled {
-            "victory.exe was not found in the runtime folder  ·  using Classic".to_string()
+            "The ScarlettPort runtime was not found in the runtime folder  ·  using Classic".to_string()
         } else if world {
             crate::engine::WORLD_LABEL.to_string()
         } else {
@@ -1048,7 +1048,7 @@ impl Launcher {
         }
         let y = y + 126.;
         caption(&p, pos2(c.min.x, y), Align2::LEFT_TOP, "Built on");
-        let built = "The Classic engine is built on XCL (github.com/ivall/xcl, GPL-2.0-only). The World engine is built on VIctory by Marvisak (github.com/Marvisak/VIctory, GPL-3.0-or-later). ScarlettPort's own code and changes are licensed as set out in LICENSE.md. No game code or assets are included.";
+        let built = "The Classic engine is built on XCL (github.com/ivall/xcl, GPL-2.0-only). The World engine is the ScarlettPort runtime, which started as a fork of VIctory by Marvisak (github.com/Marvisak/VIctory, GPL-3.0-or-later) via fxceless/victory-fork; full credits in CREDITS.md. ScarlettPort's own code and changes are licensed as set out in LICENSE.md. No game code or assets are included.";
         let g = p.layout(built.into(), font(12.5, "regular"), TEXT_MUTED, c.width().min(620.));
         p.galley(pos2(c.min.x, y + 20.), g, TEXT_MUTED);
     }

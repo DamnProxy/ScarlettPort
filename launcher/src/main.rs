@@ -127,7 +127,7 @@ pub struct Config {
     /// Play preset: "stable", "experimental" or "custom" (`presets`).
     #[serde(default = "default_preset")]
     pub preset: String,
-    /// "bundled" (the runtime folder beside the launcher) or "local" (a victory.exe the user
+    /// "bundled" (the runtime folder beside the launcher) or "local" (a scarlett.exe or victory.exe the user
     /// picked, e.g. their own newest build). Updates never touch a local build.
     #[serde(default = "default_runtime")]
     pub runtime_mode: String,
@@ -232,7 +232,7 @@ pub struct Launcher {
     pub config: Config,
     pub runtime_dir: Option<PathBuf>,
     pub runtime_note: String,
-    /// Set when victory.exe is in the runtime folder.
+    /// Set when the ScarlettPort runtime (scarlett.exe or victory.exe) is in the runtime folder.
     pub world_dir: Option<PathBuf>,
     pub world_hash: Option<String>,
     /// The running (or last) shader build's progress.
@@ -550,7 +550,7 @@ impl Launcher {
         let lines: Vec<String> = self.logs.iter().map(|(t, _)| t.clone()).collect();
         let tail = lines[lines.len().saturating_sub(200)..].join("\n");
         let folders = [(self.config.game_path.as_str(), "<game>"), (self.config.cache_dir.as_str(), "<cache>")];
-        let engine = if self.world_selected() { format!("World engine (VIctory-based), {}", self.world_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) } else { format!("Classic engine (XCL), {}", self.runtime_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) };
+        let engine = if self.world_selected() { format!("World engine (ScarlettPort runtime), {}", self.world_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) } else { format!("Classic engine (XCL), {}", self.runtime_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) };
         let build = self.build.as_ref().map(|b| format!("\nLast shader build: {} in {}", b.name, flow::duration(b.started.elapsed().as_secs()))).unwrap_or_default();
         let fields: Vec<(&str, String)> = vec![
             ("gpu", sys.gpu.clone()),
@@ -692,11 +692,11 @@ impl Launcher {
             let args = self.play_args(&game);
             cmd.current_dir(self.victory_dir()).args(&args);
             for k in presets::CLEARED {
-                cmd.env_remove(k);
+                runtime::clear_switch(&mut cmd, k);
             }
             let env = self.play_env(&game);
             for (k, v) in &env {
-                cmd.env(k, v);
+                runtime::set_switch(&mut cmd, k, v);
             }
             self.fps = None;
             self.perf = None;
@@ -821,7 +821,7 @@ impl Launcher {
     pub fn build_label(&self) -> String {
         if self.local_selected() {
             if !self.local_ok() {
-                return "Local build: pick a victory.exe in Settings, Runtime".into();
+                return "Local build: pick a scarlett.exe in Settings, Runtime".into();
             }
             let d = if self.local_desc.is_empty() { "reading the build…".to_string() } else { self.local_desc.clone() };
             format!("Local build ({d})")
@@ -887,7 +887,7 @@ impl Launcher {
         let tx = self.tx.clone();
         let start = PathBuf::from(self.config.local_exe.trim());
         std::thread::spawn(move || {
-            let mut d = rfd::FileDialog::new().set_title("Select a victory.exe build").add_filter("victory.exe", &["exe"]);
+            let mut d = rfd::FileDialog::new().set_title("Select a scarlett.exe build").add_filter("scarlett.exe / victory.exe", &["exe"]);
             if let Some(dir) = start.parent().filter(|d| d.is_dir()) {
                 d = d.set_directory(dir);
             }

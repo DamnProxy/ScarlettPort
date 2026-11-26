@@ -34,7 +34,7 @@ pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr().cast());
 
 #[derive(Parser)]
 #[command(
-    name = "victory",
+    name = "scarlett",
     version,
     about = "Run an Xbox Series title natively on Windows"
 )]

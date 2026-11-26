@@ -217,17 +217,17 @@ fn world(job: &Job) -> Result<String, String> {
     let base = |c: &mut Command| {
         c.current_dir(&job.runtime);
         for (k, v) in &job.env {
-            c.env(k, v);
+            crate::runtime::set_switch(c, k, v);
         }
     };
     if st.warm {
-        log(&job.tx, "Shaders already translated for this engine build: skipping `victory warm`.");
+        log(&job.tx, "Shaders already translated for this engine build: skipping `scarlett warm`.");
     } else {
         p.jobs = engine::jobs(cores(), free_mb(), 512);
         let mut cmd = Command::new(&job.exe);
         base(&mut cmd);
         cmd.args(engine::warm_args(&job.game, p.jobs));
-        log(&job.tx, format!("> victory.exe warm \"{}\" --jobs {}  (phase 1 of {phases}: translate every shader, about 3 min; already translated ones are read from the cache)", job.game.display(), p.jobs));
+        log(&job.tx, format!("> scarlett warm \"{}\" --jobs {}  (phase 1 of {phases}: translate every shader, about 3 min; already translated ones are read from the cache)", job.game.display(), p.jobs));
         p.current = "translating (the engine reports every 2,000 shaders)".into();
         send(job, &p);
         let mut tick = Instant::now();
@@ -270,7 +270,7 @@ fn world(job: &Job) -> Result<String, String> {
             let mut cmd = Command::new(&job.exe);
             base(&mut cmd);
             cmd.args(engine::graphics_args(&job.game, p.jobs, skip, engine::CHUNK));
-            log(&job.tx, format!("> victory.exe precompile-graphics --jobs {} --skip {skip} --limit {}  (phase 2 of 2, prepare shaders: makes the graphics pipelines now, at low priority, so moving in the world does not stutter on first use; Stop resumes later)", p.jobs, engine::CHUNK));
+            log(&job.tx, format!("> scarlett precompile-graphics --jobs {} --skip {skip} --limit {}  (phase 2 of 2, prepare shaders: makes the graphics pipelines now, at low priority, so moving in the world does not stutter on first use; Stop resumes later)", p.jobs, engine::CHUNK));
             p.current = format!("pipeline records {}–{}", skip + 1, skip + engine::CHUNK);
             p.current_since = Instant::now();
             p.done = skip;

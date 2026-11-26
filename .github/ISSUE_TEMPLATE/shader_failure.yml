@@ -6,7 +6,7 @@ body:
     id: runtime
     attributes:
       label: Runtime
-      options: [XCL, VIctory-based runtime]
+      options: [XCL, ScarlettPort runtime]
     validations:
       required: true
   - type: input

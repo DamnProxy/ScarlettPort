@@ -1,6 +1,10 @@
-# Provenance
+# Credits
 
-This tree is the VIctory-based runtime used by ScarlettPort, vendored as plain source (no build output, no history). It is licensed GPL-3.0-or-later; `LICENSE` is unchanged.
+ScarlettPort's runtime (`engine/`) started as a fork of VIctory (GPL-3.0). This is the full list of the work it comes from and the work merged into it. The runtime is licensed GPL-3.0-or-later; `engine/LICENSE` is unchanged. Fork point and merge policy: [`engine/UPSTREAM.md`](engine/UPSTREAM.md).
+
+The Classic engine in `runtime/xcl` is XCL by ivall and contributors (https://github.com/ivall/xcl, GPL-2.0-only); its credits stay in that folder.
+
+This file was `runtime/victory/SCARLETTPORT.md` before 0.4.5; paths below are relative to `engine/`.
 
 ## Lineage
 

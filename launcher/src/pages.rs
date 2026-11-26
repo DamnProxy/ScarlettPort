@@ -110,7 +110,7 @@ impl Launcher {
                 me.config.runtime_mode = BUNDLED.into();
                 me.save();
             }
-            if choice(ui, Rect::from_min_size(pos2(r.min.x + half + 10., r.min.y), vec2(half, 64.)), "rt-local", "Local build", "Your own victory.exe  ·  updates never touch it", me.local_selected()) && !busy {
+            if choice(ui, Rect::from_min_size(pos2(r.min.x + half + 10., r.min.y), vec2(half, 64.)), "rt-local", "Local build", "Your own scarlett.exe  ·  updates never touch it", me.local_selected()) && !busy {
                 me.config.runtime_mode = LOCAL.into();
                 me.save();
                 me.refresh_local();
@@ -118,7 +118,7 @@ impl Launcher {
             if me.local_selected() {
                 let r = Self::take(ui, w, 44.);
                 let field = Rect::from_min_size(r.min, vec2(w - 120., 44.));
-                if text_field(ui, field, "rt-exe", &mut me.config.local_exe, "victory.exe", Some(Icon::Server), !busy).lost_focus() {
+                if text_field(ui, field, "rt-exe", &mut me.config.local_exe, "scarlett.exe", Some(Icon::Server), !busy).lost_focus() {
                     me.save();
                     me.refresh_local();
                 }
@@ -127,7 +127,7 @@ impl Launcher {
                 }
                 let r = Self::take(ui, w, 18.);
                 let (text, color) = if me.config.local_exe.trim().is_empty() {
-                    ("Pick the victory.exe of your build (its D3D12 folder must sit beside it).".to_string(), TEXT_MUTED)
+                    ("Pick the scarlett.exe (or, before 0.4.5, victory.exe) of your build (its D3D12 folder must sit beside it).".to_string(), TEXT_MUTED)
                 } else if !me.local_ok() {
                     ("That file does not exist.".to_string(), WARNING)
                 } else if me.local_desc.is_empty() {
@@ -379,7 +379,7 @@ impl Launcher {
         let body = Rect::from_min_max(pos2(area.min.x, top), area.max);
         let (slots, err) = match &self.saves {
             None => {
-                let t = if self.saves_busy { "Reading the saves (victory saves list)…" } else { "Press Refresh to list the saves." };
+                let t = if self.saves_busy { "Reading the saves (scarlett saves list)…" } else { "Press Refresh to list the saves." };
                 p.text(pos2(area.min.x, top + 6.), Align2::LEFT_TOP, t, font(13., "regular"), TEXT_FAINT);
                 return;
             }
@@ -515,8 +515,8 @@ impl Launcher {
         let list = Rect::from_min_max(pos2(right.min.x, y), pos2(right.max.x, right.max.y - 150.));
         card(&p, list, LINE);
         let items: Vec<String> = match &self.crashes {
-            None if self.crashes_busy => vec!["Running victory crashes list…".into()],
-            None => vec!["Press Refresh (victory crashes list).".into()],
+            None if self.crashes_busy => vec!["Running scarlett crashes list…".into()],
+            None => vec!["Press Refresh (scarlett crashes list).".into()],
             Some(Err(e)) => vec![e.clone()],
             Some(Ok(v)) if v.is_empty() => vec!["No crashes recorded.".into()],
             Some(Ok(v)) => v.clone(),

@@ -524,6 +524,7 @@ fn names_say_what_waits_and_whose_code_it_is() {
     );
     assert_eq!(kind_of("vcruntime140.dll", false), Kind::Other);
     assert_eq!(kind_of("victory.exe", true), Kind::Ours);
+    assert_eq!(kind_of("scarlett.exe", true), Kind::Ours);
     assert_eq!(Role::of_name("victory-pipelines-3"), Some(Role::Pipelines));
     assert_eq!(Role::of_name("victory-wide-0"), Some(Role::Wide));
     assert_eq!(Role::of_name("victory-window"), None);

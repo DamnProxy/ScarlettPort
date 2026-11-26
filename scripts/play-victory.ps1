@@ -4,40 +4,40 @@
 #          [-NoOwnUpscaler] [-KeepWatchdog] [-FastBoot] [-RayTracing] [-SaveSlot name] [-Precompile] [-SkipPrecompile]
 #
 # Environment it sets (you can also set these by hand before running the exe):
-#   VICTORY_GAME_DIR       the dump folder
-#   VICTORY_OWN_UPSCALER=1 ask for the title's own upscaler on the Series S profile (recommended)
-#   VICTORY_NO_WATCHDOG=1  disarm the title's stall watchdog so it can wait for slow first-run
+#   SCARLETT_GAME_DIR       the dump folder
+#   SCARLETT_OWN_UPSCALER=1 ask for the title's own upscaler on the Series S profile (recommended)
+#   SCARLETT_NO_WATCHDOG=1  disarm the title's stall watchdog so it can wait for slow first-run
 #                          shader builds instead of ending itself
-#   VICTORY_SYNC_PRECISE=1 a submission waits only for the submissions it depends on
-#   VICTORY_READ_SETTLE_PRECISE=1  read-backs settle on the exact submissions they need
-#   VICTORY_PRECOMPILED_GRAPHICS=1 graphics pipelines come from the title's precompiled cache,
+#   SCARLETT_SYNC_PRECISE=1 a submission waits only for the submissions it depends on
+#   SCARLETT_READ_SETTLE_PRECISE=1  read-backs settle on the exact submissions they need
+#   SCARLETT_PRECOMPILED_GRAPHICS=1 graphics pipelines come from the title's precompiled cache,
 #                          prebuilt by `victory precompile-graphics` (run once, below; needs a GPU)
-#   VICTORY_READFIX, VICTORY_COPY_BACK_ONLY_READBACK, VICTORY_NARROW_ROOT / _VIEWS / _BVH,
-#                          VICTORY_PREP_BARRIERS / _TABLES / _REUSE = 1: the other verified speed settings
-#   VICTORY_RELAY=2        submission relay, form 2 (needed by the two settings above)
-#   VICTORY_PIPELINE_WAIT_MS=0  do not hold a draw back waiting for a pipeline build
-#   VICTORY_FAST_BOOT=1    with -FastBoot: press through logos and menus (testing only)
-#   VICTORY_RAYTRACING=1   with -RayTracing: the title's ray-traced lighting, for that launch only
-#   VICTORY_SAVE_SLOT      with -SaveSlot: pick a save slot by name
-#   VICTORY_AUTO_INPUT=1   with -AutoInput: press A on a timer so menus advance without a pad
-#   VICTORY_PRESS_FILE     press.txt in the repo root: write button names ("A", "DOWN DOWN A") to press them
+#   SCARLETT_READFIX, SCARLETT_COPY_BACK_ONLY_READBACK, SCARLETT_NARROW_ROOT / _VIEWS / _BVH,
+#                          SCARLETT_PREP_BARRIERS / _TABLES / _REUSE = 1: the other verified speed settings
+#   SCARLETT_RELAY=2        submission relay, form 2 (needed by the two settings above)
+#   SCARLETT_PIPELINE_WAIT_MS=0  do not hold a draw back waiting for a pipeline build
+#   SCARLETT_FAST_BOOT=1    with -FastBoot: press through logos and menus (testing only)
+#   SCARLETT_RAYTRACING=1   with -RayTracing: the title's ray-traced lighting, for that launch only
+#   SCARLETT_SAVE_SLOT      with -SaveSlot: pick a save slot by name
+#   SCARLETT_AUTO_INPUT=1   with -AutoInput: press A on a timer so menus advance without a pad
+#   SCARLETT_PRESS_FILE     press.txt in the repo root: write button names ("A", "DOWN DOWN A") to press them
 param(
     [Parameter(Mandatory)] [string]$Game,
     # The console profile the title sees. series-s is the recommended default.
     [ValidateSet('series-s', 'series-x')] [string]$Console = 'series-s',
     # Press A on a timer so the title screens advance without a controller.
     [switch]$AutoInput,
-    # Opt-in picture and shader translation fixes (VICTORY_LOOK, VICTORY_SHADER_FIXES); not yet measured on the RTX 3060.
+    # Opt-in picture and shader translation fixes (SCARLETT_LOOK, SCARLETT_SHADER_FIXES); not yet measured on the RTX 3060.
     [switch]$Look,
-    # Do not set VICTORY_OWN_UPSCALER=1.
+    # Do not set SCARLETT_OWN_UPSCALER=1.
     [switch]$NoOwnUpscaler,
-    # Do not set VICTORY_NO_WATCHDOG=1.
+    # Do not set SCARLETT_NO_WATCHDOG=1.
     [switch]$KeepWatchdog,
-    # Testing only: VICTORY_FAST_BOOT=1.
+    # Testing only: SCARLETT_FAST_BOOT=1.
     [switch]$FastBoot,
     # Run the title's ray-traced lighting passes with its software BVH traversal.
     [switch]$RayTracing,
-    # Save slot name (VICTORY_SAVE_SLOT).
+    # Save slot name (SCARLETT_SAVE_SLOT).
     [string]$SaveSlot = '',
     # Run `victory precompile-graphics` even if it already ran once.
     [switch]$Precompile,
@@ -46,7 +46,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$vic  = Join-Path $root 'runtime\victory\target\release\victory.exe'
+$vic  = Join-Path $root 'engine\target\release\scarlett.exe'
+# Builds before 0.4.5 produced victory.exe; still accepted.
+if (-not (Test-Path $vic)) { $vic = Join-Path $root 'engine\target\release\victory.exe' }
 
 if (-not (Test-Path $vic)) { throw 'Not built yet. Run .\scripts\setup-victory.ps1 first.' }
 $exe = Join-Path $Game 'game_scarlett_master.exe'
@@ -54,29 +56,29 @@ if (-not (Test-Path $exe)) {
     throw "No game_scarlett_master.exe in '$Game'. Point -Game at your own dump."
 }
 
-$env:VICTORY_GAME_DIR = $Game
-if (-not $NoOwnUpscaler) { $env:VICTORY_OWN_UPSCALER = '1' }
-if (-not $KeepWatchdog) { $env:VICTORY_NO_WATCHDOG = '1' }
+$env:SCARLETT_GAME_DIR = $Game
+if (-not $NoOwnUpscaler) { $env:SCARLETT_OWN_UPSCALER = '1' }
+if (-not $KeepWatchdog) { $env:SCARLETT_NO_WATCHDOG = '1' }
 # The verified speed settings (see docs/RUNTIMES.md). The experimental memory switches
 # (msfix, mem2) stay off.
-$env:VICTORY_RELAY = '2'
-$env:VICTORY_SYNC_PRECISE = '1'
-$env:VICTORY_READ_SETTLE_PRECISE = '1'
+$env:SCARLETT_RELAY = '2'
+$env:SCARLETT_SYNC_PRECISE = '1'
+$env:SCARLETT_READ_SETTLE_PRECISE = '1'
 # The rest of the verified speed settings. The grid fix is in this runtime, so precompiled graphics pipelines are on.
-foreach ($k in 'VICTORY_PRECOMPILED_GRAPHICS','VICTORY_READFIX','VICTORY_COPY_BACK_ONLY_READBACK','VICTORY_NARROW_ROOT','VICTORY_NARROW_VIEWS','VICTORY_NARROW_BVH','VICTORY_PREP_BARRIERS','VICTORY_PREP_TABLES','VICTORY_PREP_REUSE') { Set-Item "env:$k" '1' }
-# fx-cand4: sub-page memory, copies without the extra query, 4 GB card buffers. VICTORY_REMAP_LAZY is left
+foreach ($k in 'SCARLETT_PRECOMPILED_GRAPHICS','SCARLETT_READFIX','SCARLETT_COPY_BACK_ONLY_READBACK','SCARLETT_NARROW_ROOT','SCARLETT_NARROW_VIEWS','SCARLETT_NARROW_BVH','SCARLETT_PREP_BARRIERS','SCARLETT_PREP_TABLES','SCARLETT_PREP_REUSE') { Set-Item "env:$k" '1' }
+# fx-cand4: sub-page memory, copies without the extra query, 4 GB card buffers. SCARLETT_REMAP_LAZY is left
 # out: a moving A/B showed it now slows the world down.
-$env:VICTORY_MEM_SUBPAGE = '1'; $env:VICTORY_COPY_NOQUERY = '1'; $env:VICTORY_CARD_BUFFERS_MB = '4096'
+$env:SCARLETT_MEM_SUBPAGE = '1'; $env:SCARLETT_COPY_NOQUERY = '1'; $env:SCARLETT_CARD_BUFFERS_MB = '4096'
 # Leaves processor time to the desktop while the title runs.
-$env:VICTORY_FRIENDLY = '1'
-$env:VICTORY_PIPELINE_WAIT_MS = '0'
-if ($FastBoot) { $env:VICTORY_FAST_BOOT = '1' }
-if ($Look) { $env:VICTORY_LOOK = '1'; $env:VICTORY_SHADER_FIXES = '1' }
-if ($SaveSlot) { $env:VICTORY_SAVE_SLOT = $SaveSlot }
+$env:SCARLETT_FRIENDLY = '1'
+$env:SCARLETT_PIPELINE_WAIT_MS = '0'
+if ($FastBoot) { $env:SCARLETT_FAST_BOOT = '1' }
+if ($Look) { $env:SCARLETT_LOOK = '1'; $env:SCARLETT_SHADER_FIXES = '1' }
+if ($SaveSlot) { $env:SCARLETT_SAVE_SLOT = $SaveSlot }
 # Write button names here ("A", "DOWN DOWN A") to press them while the game runs.
-$env:VICTORY_PRESS_FILE = Join-Path $root 'press.txt'
-Set-Content -Path $env:VICTORY_PRESS_FILE -Value '' -NoNewline
-if ($AutoInput) { $env:VICTORY_AUTO_INPUT = '1' }
+$env:SCARLETT_PRESS_FILE = Join-Path $root 'press.txt'
+Set-Content -Path $env:SCARLETT_PRESS_FILE -Value '' -NoNewline
+if ($AutoInput) { $env:SCARLETT_AUTO_INPUT = '1' }
 
 # Prebuild the title's precompiled graphics pipelines into the pipeline library (needs a GPU; the
 # first run takes a while and is done once, marked by a stamp file).
@@ -102,11 +104,11 @@ $ErrorActionPreference = 'Continue'
 # For this launch only: PowerShell's environment belongs to the whole session, so a plain launch
 # after one with -RayTracing in the same window would still run with ray tracing. A value set by
 # hand before running the script is kept when the switch is left out.
-$rayTracingBefore = $env:VICTORY_RAYTRACING
-if ($RayTracing) { $env:VICTORY_RAYTRACING = '1' }
+$rayTracingBefore = $env:SCARLETT_RAYTRACING
+if ($RayTracing) { $env:SCARLETT_RAYTRACING = '1' }
 try {
     & $vic run $exe --execute --console $Console *> $log
 } finally {
-    $env:VICTORY_RAYTRACING = $rayTracingBefore
+    $env:SCARLETT_RAYTRACING = $rayTracingBefore
 }
 exit $LASTEXITCODE

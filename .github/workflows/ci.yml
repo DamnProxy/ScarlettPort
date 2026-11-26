@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       xcl: ${{ steps.f.outputs.xcl }}
-      victory: ${{ steps.f.outputs.victory }}
+      engine: ${{ steps.f.outputs.engine }}
       launcher: ${{ steps.f.outputs.launcher }}
       scripts: ${{ steps.f.outputs.scripts }}
     steps:
@@ -30,8 +30,8 @@ jobs:
             xcl:
               - 'runtime/xcl/**'
               - '.github/workflows/ci.yml'
-            victory:
-              - 'runtime/victory/**'
+            engine:
+              - 'engine/**'
               - '.github/workflows/ci.yml'
             launcher:
               - 'launcher/**'
@@ -99,21 +99,21 @@ jobs:
       - name: Unit tests
         run: cargo test --release -p xcl --lib --locked -- --test-threads=4
 
-  victory:
+  engine:
     needs: changes
-    if: needs.changes.outputs.victory == 'true'
+    if: needs.changes.outputs.engine == 'true'
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: runtime/victory
+        working-directory: engine
     steps:
       - uses: actions/checkout@v4
-      # runtime/victory/rust-toolchain.toml pins the toolchain; rustup installs it on first use.
+      # engine/rust-toolchain.toml pins the toolchain; rustup installs it on first use.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: runtime/victory
+          workspaces: engine
       - name: Build
-        run: cargo rustc --release -p victory --bin victory --features diagnostics --locked -- -C link-arg=/EXPORT:D3D12SDKVersion,DATA -C link-arg=/EXPORT:D3D12SDKPath,DATA
+        run: cargo rustc --release -p victory --bin scarlett --features diagnostics --locked -- -C link-arg=/EXPORT:D3D12SDKVersion,DATA -C link-arg=/EXPORT:D3D12SDKPath,DATA
       # Crates that do not open a GPU device. victory-gpu and victory-hle tests need a Shader Model 6.6
       # device and are not run here. Allowed to fail until the list is confirmed on a hosted runner.
       - name: Unit tests (no GPU)

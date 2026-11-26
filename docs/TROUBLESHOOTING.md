@@ -29,7 +29,7 @@ The title ships tens of thousands of GPU programs. Each is translated for your c
 
 **Where saves live:**
 
-- World engine (default, VIctory-based): `%LOCALAPPDATA%\VIctory\data\<title id>\saves\`.
+- World engine (default, ScarlettPort runtime): `%LOCALAPPDATA%\VIctory\data\<title id>\saves\`.
 - Classic engine (XCL): `%LOCALAPPDATA%\XCL\<package name>\`, in the `saves` and `pls` folders (or under `%XCL_DATA_ROOT%` if you set it).
 
 **Back up:**
@@ -47,7 +47,7 @@ The title ships tens of thousands of GPU programs. Each is translated for your c
 | Characters with missing faces, skin or hair | some skin, hair and clothes pixel shaders were refused, so those draws are dropped | fix in testing, not released |
 | Missing objects or walls on NVIDIA | oversized mesh shaders and a too-small view heap drop draws | fixes in testing, not released |
 | A grid of triangles or tiles over the picture | old builds decoded rectangle-list pipelines wrong | fixed in v0.2.1; update (if you build yourself, use the current source) |
-| Black picture with certain switches | the opt-in `VICTORY_COPY_BACK_ONLY_READBACK` mode left stale data in memory | fix in testing; leave that switch off |
+| Black picture with certain switches | the opt-in `SCARLETT_COPY_BACK_ONLY_READBACK` mode left stale data in memory | fix in testing; leave that switch off |
 | Some HUD text cut off | not known yet | open |
 
 If you changed environment switches (see [RUNTIMES.md](RUNTIMES.md)) and the picture breaks, go back to the defaults (the launcher's default settings, or `play-victory.ps1` with no extra switches) before reporting.

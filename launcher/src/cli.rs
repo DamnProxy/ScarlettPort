@@ -1,4 +1,4 @@
-//! Running the runtime's own tools (`victory saves ...`, `victory crashes list`, `--version`)
+//! Running the runtime's own tools (`scarlett saves ...`, `scarlett crashes list`, `--version`)
 //! and reading what they print. Commands run without a console window, on a worker thread.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,7 +11,7 @@ pub fn run(exe: &Path, args: &[String], env: &[(&'static str, String)]) -> Resul
         cmd.current_dir(d);
     }
     for (k, v) in env {
-        cmd.env(k, v);
+        crate::runtime::set_switch(&mut cmd, k, v);
     }
     #[cfg(windows)]
     {
@@ -140,7 +140,7 @@ pub fn profiles() -> Vec<(String, String)> {
 
 /// The runtime's save folder: `VICTORY_DATA_DIR`, else `%LOCALAPPDATA%\victory\data`.
 pub fn saves_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("VICTORY_DATA_DIR") {
+    if let Some(d) = std::env::var_os("SCARLETT_DATA_DIR").or_else(|| std::env::var_os("VICTORY_DATA_DIR")) {
         return PathBuf::from(d);
     }
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("victory").join("data")
