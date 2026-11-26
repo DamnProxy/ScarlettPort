@@ -1407,7 +1407,7 @@ impl Launcher {
                 Message::SavesDone(r) => {
                     self.saves_busy = false;
                     self.saves_msg = match r {
-                        Ok(t) => t.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("Done.").trim().to_string(),
+                        Ok(t) => t.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("Done.").trim().to_string(),
                         Err(e) => format!("Failed: {e}"),
                     };
                     self.log(format!("Saves: {}", self.saves_msg), LogKind::Info);

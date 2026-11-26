@@ -307,7 +307,7 @@ pub fn run(dir: &Path) -> Report {
                 }
                 push(&mut rep, Level::Warn, format!("{} manifest entries do not match", gone.len() + sized.len()), d, Some(mp.clone()));
             }
-            if pack_listed == 0 && entries.len() > 0 {
+            if pack_listed == 0 && !entries.is_empty() {
                 push(&mut rep, Level::Warn, "The manifest lists nothing under pack\\".into(), "pack\\ could only be checked against the title's known nine packs.".into(), Some(mp));
             }
         }

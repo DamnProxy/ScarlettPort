@@ -122,7 +122,7 @@ pub fn free_mb() -> Option<u64> {
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a correctly sized, zeroed MEMORYSTATUSEX.
-    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then(|| m.ullAvailPhys / (1024 * 1024))
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPhys / (1024 * 1024))
 }
 
 #[cfg(not(windows))]

@@ -956,7 +956,7 @@ impl Launcher {
             self.save();
         }
         let dir = self.config.cache_dir.trim().to_string();
-        let drive = if dir.as_bytes().get(1) == Some(&b':') { format!("{}:", &dir[..1].to_uppercase()) } else { "That drive".to_string() };
+        let drive = if dir.as_bytes().get(1) == Some(&b':') { format!("{}:", dir[..1].to_uppercase()) } else { "That drive".to_string() };
         let (text, color) = match self.cache_free.and_then(|(_, f)| f) {
             Some(f) if f < game::LOW_SPACE => (format!("{drive} has only {} free. The shader cache needs about 40 GB.", game::human(f)), WARNING),
             Some(f) => (format!("{drive} has {} free.", game::human(f)), SUCCESS),

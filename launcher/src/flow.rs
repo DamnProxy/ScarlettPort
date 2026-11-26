@@ -118,7 +118,7 @@ pub fn duration(secs: u64) -> String {
 
 /// Seconds left from the time so far and the fraction done (None until 2% is done).
 pub fn eta_secs(elapsed: u64, fraction: f32) -> Option<u64> {
-    (fraction >= 0.02 && fraction < 1.).then(|| (elapsed as f32 * (1. - fraction) / fraction).round() as u64)
+    (0.02..1.).contains(&fraction).then(|| (elapsed as f32 * (1. - fraction) / fraction).round() as u64)
 }
 
 #[cfg(test)]

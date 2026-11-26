@@ -124,7 +124,7 @@ pub fn fit(ui: &Ui, text: &str, f: FontId, width: f32) -> String {
     let chars: Vec<char> = text.chars().collect();
     let (mut lo, mut hi) = (0, chars.len());
     while lo < hi {
-        let mid = (lo + hi + 1) / 2;
+        let mid = (lo + hi).div_ceil(2);
         let s: String = chars[..mid].iter().collect::<String>() + "…";
         if text_width(ui, &s, f.clone()) <= width { lo = mid } else { hi = mid - 1 }
     }

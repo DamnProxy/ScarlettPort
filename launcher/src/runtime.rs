@@ -123,6 +123,32 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What was found in the runtime folder: (folder, World engine hash, Classic engine hash).
+/// A hash is the SHA-256 of the engine's executable; it is what "shaders built for" refers to.
+pub struct Found {
+    pub dir: PathBuf,
+    pub world: Option<String>,
+    pub classic: Option<String>,
+}
+
+pub fn file_hash(p: &Path) -> Option<String> {
+    let bytes = std::fs::read(p).ok().filter(|b| !b.is_empty())?;
+    Some(Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Looks for the engines beside the launcher.
+pub fn locate() -> Result<Found, String> {
+    let dir = runtime_dir();
+    let found = Found { world: file_hash(&scarlett_exe()), classic: file_hash(&xcl_exe()), dir: dir.clone() };
+    if found.world.is_none() && found.classic.is_none() {
+        return Err(format!(
+            "No engine found in {}. Extract the whole release ZIP and keep the runtime folder beside ScarlettPort.exe.",
+            dir.display()
+        ));
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod switch_tests {
     #[test]
@@ -163,30 +189,4 @@ mod switch_tests {
         assert_eq!(std::fs::read_to_string(new.join("launcher.json")).unwrap(), "new", "existing files win");
         let _ = std::fs::remove_dir_all(&base);
     }
-}
-
-/// What was found in the runtime folder: (folder, World engine hash, Classic engine hash).
-/// A hash is the SHA-256 of the engine's executable; it is what "shaders built for" refers to.
-pub struct Found {
-    pub dir: PathBuf,
-    pub world: Option<String>,
-    pub classic: Option<String>,
-}
-
-pub fn file_hash(p: &Path) -> Option<String> {
-    let bytes = std::fs::read(p).ok().filter(|b| !b.is_empty())?;
-    Some(Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Looks for the engines beside the launcher.
-pub fn locate() -> Result<Found, String> {
-    let dir = runtime_dir();
-    let found = Found { world: file_hash(&scarlett_exe()), classic: file_hash(&xcl_exe()), dir: dir.clone() };
-    if found.world.is_none() && found.classic.is_none() {
-        return Err(format!(
-            "No engine found in {}. Extract the whole release ZIP and keep the runtime folder beside ScarlettPort.exe.",
-            dir.display()
-        ));
-    }
-    Ok(found)
 }

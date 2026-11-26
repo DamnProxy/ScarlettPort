@@ -62,7 +62,7 @@ fn decode_text(raw: &[u8]) -> Option<String> {
     } else {
         return Some(String::from_utf8_lossy(raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw)).into_owned());
     };
-    let units: Vec<u16> = body.chunks_exact(2).map(|b| if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) }).collect();
+    let units: Vec<u16> = body.as_chunks::<2>().0.iter().map(|b| if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) }).collect();
     String::from_utf16(&units).ok()
 }
 
