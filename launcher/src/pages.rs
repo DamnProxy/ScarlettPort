@@ -1,7 +1,6 @@
 //! The pages added in 0.3: the preset row on Play, Settings (Runtime, Features), Verify game
 //! files, Saves, Logs and crashes, and the first-run wizard. Same theme and widgets as view.rs.
 use crate::theme::*;
-use crate::flow::Stage;
 use crate::verify::Level;
 use crate::{cli, perf, presets, tuning};
 use crate::{Launcher, LogKind, Page, RunKind, BUNDLED, GAME_EXE, LOCAL};
@@ -77,7 +76,7 @@ impl Launcher {
         let meta = if warn {
             format!("Experimental needs an {} build: pick it in Settings, Runtime (the bundled {} ignores its switches)", presets::EXPERIMENTAL_BUILD, presets::BUNDLED_BUILD)
         } else {
-            format!("{}  ·  {}", presets::label(&self.config.preset), self.build_label())
+            format!("{}  Â·  {}", presets::label(&self.config.preset), self.build_label())
         };
         let shown = fit(ui, &meta, font(12., "regular"), rect.width() - 400.);
         p.text(pos2(rect.min.x + 50., rect.center().y + 10.), Align2::LEFT_CENTER, shown, font(12., "regular"), if warn { WARNING } else { TEXT_MUTED });
@@ -105,12 +104,12 @@ impl Launcher {
             let half = (w - 10.) / 2.;
             let r = Self::take(ui, w, 64.);
             let busy = me.running.is_some();
-            let bundled = format!("{}  ·  updated with the launcher", presets::BUNDLED_BUILD);
+            let bundled = format!("{}  Â·  updated with the launcher", presets::BUNDLED_BUILD);
             if choice(ui, Rect::from_min_size(r.min, vec2(half, 64.)), "rt-bundled", "Bundled", &bundled, !me.local_selected()) && !busy {
                 me.config.runtime_mode = BUNDLED.into();
                 me.save();
             }
-            if choice(ui, Rect::from_min_size(pos2(r.min.x + half + 10., r.min.y), vec2(half, 64.)), "rt-local", "Local build", "Your own scarlett.exe  ·  updates never touch it", me.local_selected()) && !busy {
+            if choice(ui, Rect::from_min_size(pos2(r.min.x + half + 10., r.min.y), vec2(half, 64.)), "rt-local", "Local build", "Your own scarlett.exe  Â·  updates never touch it", me.local_selected()) && !busy {
                 me.config.runtime_mode = LOCAL.into();
                 me.save();
                 me.refresh_local();
@@ -131,7 +130,7 @@ impl Launcher {
                 } else if !me.local_ok() {
                     ("That file does not exist.".to_string(), WARNING)
                 } else if me.local_desc.is_empty() {
-                    ("Reading the build…".to_string(), TEXT_MUTED)
+                    ("Reading the buildâ€¦".to_string(), TEXT_MUTED)
                 } else {
                     (format!("Build: {}", me.local_desc), SUCCESS)
                 };
@@ -164,7 +163,7 @@ impl Launcher {
             caption(&p, r.min, Align2::LEFT_TOP, "Preset");
             for pr in presets::ALL {
                 let build = if pr == presets::EXPERIMENTAL { format!("for {}", presets::EXPERIMENTAL_BUILD) } else { me.build_label() };
-                let meta = format!("{}  ·  {build}", presets::blurb(pr));
+                let meta = format!("{}  Â·  {build}", presets::blurb(pr));
                 let r = Self::take(ui, w, 64.);
                 if choice(ui, r, ("rt-preset", pr), presets::label(pr), &fit(ui, &meta, font(12., "regular"), w - 60.), me.config.preset == pr) && !busy {
                     me.config.preset = pr.to_string();
@@ -174,7 +173,7 @@ impl Launcher {
             let env = me.play_env(&std::path::PathBuf::from(if me.config.game_path.is_empty() { "<game>" } else { &me.config.game_path }));
             let shown: Vec<String> = env.iter().filter(|(k, _)| !matches!(*k, "SCARLETT_GAME_DIR" | "SCARLETT_CONFIG")).map(|(k, v)| format!("{}={v}", k.trim_start_matches("SCARLETT_"))).collect();
             let r = Self::take(ui, w, 18.);
-            caption(&p, pos2(r.min.x, r.min.y + 4.), Align2::LEFT_TOP, "What the next run sets (SCARLETT_…)");
+            caption(&p, pos2(r.min.x, r.min.y + 4.), Align2::LEFT_TOP, "What the next run sets (SCARLETT_â€¦)");
             ui.add(egui::Label::new(egui::RichText::new(shown.join("  ")).font(egui::FontId::monospace(11.5)).color(TEXT_MUTED)).wrap());
             if me.config.preset == presets::EXPERIMENTAL {
                 let off: Vec<String> = presets::EXPERIMENTAL_OFF.iter().map(|(k, why)| format!("{k}: {why}")).collect();
@@ -314,7 +313,7 @@ impl Launcher {
         caption(&p, pos2(area.min.x, 72.), Align2::LEFT_TOP, "Game folder");
         let folder = if self.game_ok { self.config.game_path.clone() } else { format!("No game folder yet: pick the folder with {GAME_EXE}") };
         p.text(pos2(area.min.x, 92.), Align2::LEFT_TOP, fit(ui, &folder, font(13., "regular"), area.width() - 300.), font(13., "regular"), TEXT_MUTED);
-        let label = if self.verify_busy { "Checking…" } else if self.verify.is_some() { "Verify again" } else { "Verify" };
+        let label = if self.verify_busy { "Checkingâ€¦" } else if self.verify.is_some() { "Verify again" } else { "Verify" };
         if button(ui, Rect::from_min_size(pos2(area.max.x - 150., 70.), vec2(150., CONTROL)), "vf-run", label, Kind::Primary, self.game_ok && !self.verify_busy, Some(Icon::Refresh)) {
             self.run_verify();
         }
@@ -323,7 +322,7 @@ impl Launcher {
         }
         let body = Rect::from_min_max(pos2(area.min.x, 122.), area.max);
         let Some(rep) = self.verify.clone() else {
-            let msg = if self.verify_busy { "Reading the folder (sizes and links only)…" } else { "Checks every top-level archive, pack\\ against the dump's manifest, links and empty files. Read-only." };
+            let msg = if self.verify_busy { "Reading the folder (sizes and links only)â€¦" } else { "Checks every top-level archive, pack\\ against the dump's manifest, links and empty files. Read-only." };
             p.text(pos2(area.min.x, body.min.y + 10.), Align2::LEFT_TOP, msg, font(13., "regular"), TEXT_FAINT);
             return;
         };
@@ -343,7 +342,7 @@ impl Launcher {
             };
             let r = Self::take(ui, w, 22.);
             dot(&p, pos2(r.min.x + 5., r.center().y), color);
-            p.text(pos2(r.min.x + 16., r.center().y), Align2::LEFT_CENTER, format!("{word}  ·  {} files, {}  ·  nothing was changed", rep.files, crate::game::human(rep.bytes)), font(13., "semibold"), TEXT);
+            p.text(pos2(r.min.x + 16., r.center().y), Align2::LEFT_CENTER, format!("{word}  Â·  {} files, {}  Â·  nothing was changed", rep.files, crate::game::human(rep.bytes)), font(13., "semibold"), TEXT);
             for (i, f) in rep.findings.iter().enumerate() {
                 let r = Self::take(ui, w, 58.);
                 card(&p, r, if f.level == Level::Bad { fade(DANGER, 0.7) } else { LINE });
@@ -386,7 +385,7 @@ impl Launcher {
         let body = Rect::from_min_max(pos2(area.min.x, top), area.max);
         let (slots, err) = match &self.saves {
             None => {
-                let t = if self.saves_busy { "Reading the saves (scarlett saves list)…" } else { "Press Refresh to list the saves." };
+                let t = if self.saves_busy { "Reading the saves (scarlett saves list)â€¦" } else { "Press Refresh to list the saves." };
                 p.text(pos2(area.min.x, top + 6.), Align2::LEFT_TOP, t, font(13., "regular"), TEXT_FAINT);
                 return;
             }
@@ -414,18 +413,18 @@ impl Launcher {
                 icon(&p, Icon::History, pos2(r.min.x + 22., r.center().y), 16., ACCENT);
                 p.text(pos2(r.min.x + 44., r.center().y - 9.), Align2::LEFT_CENTER, format!("Slot {}", s.name), font(14.5, "semibold"), TEXT);
                 let users: Vec<String> = s.users.iter().map(|u| if u.who.is_empty() { u.id.clone() } else { u.who.clone() }).collect();
-                p.text(pos2(r.min.x + 44., r.center().y + 10.), Align2::LEFT_CENTER, fit(ui, &format!("title {}  ·  {} user(s): {}  ·  {containers} container(s)", s.title, s.users.len(), users.join(", ")), font(12., "regular"), w - 340.), font(12., "regular"), TEXT_MUTED);
+                p.text(pos2(r.min.x + 44., r.center().y + 10.), Align2::LEFT_CENTER, fit(ui, &format!("title {}  Â·  {} user(s): {}  Â·  {containers} container(s)", s.title, s.users.len(), users.join(", ")), font(12., "regular"), w - 340.), font(12., "regular"), TEXT_MUTED);
                 if button(ui, Rect::from_min_size(pos2(r.max.x - 284., r.center().y - 14.), vec2(130., 28.)), ("sv-backup", si), "Back up now", Kind::Primary, !me.saves_busy, Some(Icon::Download)) {
                     me.saves_command(vec!["copy".into(), s.name.clone(), format!("{}-backup-{}", s.name, crate::saves::now_stamp())]);
                 }
-                if button(ui, Rect::from_min_size(pos2(r.max.x - 144., r.center().y - 14.), vec2(130., 28.)), ("sv-list", si), "Backups…", Kind::Secondary, true, Some(Icon::Refresh)) {
+                if button(ui, Rect::from_min_size(pos2(r.max.x - 144., r.center().y - 14.), vec2(130., 28.)), ("sv-list", si), "Backupsâ€¦", Kind::Secondary, true, Some(Icon::Refresh)) {
                     me.list_backups(&s.name);
                 }
                 for u in &s.users {
                     for c in &u.containers {
                         let r = Self::take(ui, w, 26.);
                         p.text(pos2(r.min.x + 44., r.center().y), Align2::LEFT_CENTER, &c.name, font(12.5, "semibold"), TEXT);
-                        p.text(pos2(r.min.x + 260., r.center().y), Align2::LEFT_CENTER, format!("{}  ·  {} backup(s)  ·  user {}", c.state, c.backups, if u.who.is_empty() { &u.id } else { &u.who }), font(12., "regular"), TEXT_MUTED);
+                        p.text(pos2(r.min.x + 260., r.center().y), Align2::LEFT_CENTER, format!("{}  Â·  {} backup(s)  Â·  user {}", c.state, c.backups, if u.who.is_empty() { &u.id } else { &u.who }), font(12., "regular"), TEXT_MUTED);
                     }
                 }
                 if let Some((slot, list)) = &backups {
@@ -465,7 +464,7 @@ impl Launcher {
         let side = 330.;
         let left = Rect::from_min_max(pos2(area.min.x, 64.), pos2(area.max.x - side - 14., area.max.y));
         let right = Rect::from_min_max(pos2(left.max.x + 14., 64.), area.max);
-        let title = if live { format!("Live log  ·  {} lines", self.logs.len()) } else { format!("Last run  ·  {} lines", self.last_log.len()) };
+        let title = if live { format!("Live log  Â·  {} lines", self.logs.len()) } else { format!("Last run  Â·  {} lines", self.last_log.len()) };
         caption(&p, pos2(left.min.x, left.min.y + 8.), Align2::LEFT_TOP, &title);
         let field = Rect::from_min_size(pos2(left.max.x - 220., left.min.y), vec2(220., 36.));
         text_field(ui, field, "log-filter", &mut self.log_filter, "Filter", Some(Icon::Info), true);
@@ -506,7 +505,7 @@ impl Launcher {
 
         // ---- crashes and the readout
         caption(&p, pos2(right.min.x, right.min.y + 8.), Align2::LEFT_TOP, "Crashes");
-        if link(ui, pos2(right.max.x, right.min.y + 8.), Align2::RIGHT_TOP, "cr-refresh", if self.crashes_busy { "Listing…" } else { "Refresh" }) {
+        if link(ui, pos2(right.max.x, right.min.y + 8.), Align2::RIGHT_TOP, "cr-refresh", if self.crashes_busy { "Listingâ€¦" } else { "Refresh" }) {
             self.refresh_crashes();
         }
         let mut y = right.min.y + 46.;
@@ -522,7 +521,7 @@ impl Launcher {
         let list = Rect::from_min_max(pos2(right.min.x, y), pos2(right.max.x, right.max.y - 150.));
         card(&p, list, LINE);
         let items: Vec<String> = match &self.crashes {
-            None if self.crashes_busy => vec!["Running scarlett crashes list…".into()],
+            None if self.crashes_busy => vec!["Running scarlett crashes listâ€¦".into()],
             None => vec!["Press Refresh (scarlett crashes list).".into()],
             Some(Err(e)) => vec![e.clone()],
             Some(Ok(v)) if v.is_empty() => vec!["No crashes recorded.".into()],
@@ -574,16 +573,17 @@ impl Launcher {
         egui::Image::new((art.id(), hdr.size())).uv(uv).corner_radius(RADIUS_LG).paint_at(ui, hdr);
         vertical_fill(&p, hdr, RADIUS_LG as f32, |v| Color32::from_black_alpha((90. + v * 150.) as u8));
         p.rect_stroke(hdr, RADIUS_LG, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
-        spaced(&p, pos2(hdr.min.x + 26., hdr.max.y - 62.), Align2::LEFT_BOTTOM, "FIRST RUN  ·  FIVE STEPS", font(11., "bold"), fade(Color32::WHITE, 0.75), 1.2);
+        spaced(&p, pos2(hdr.min.x + 26., hdr.max.y - 62.), Align2::LEFT_BOTTOM, "FIRST RUN", font(11., "bold"), fade(Color32::WHITE, 0.75), 1.2);
         p.text(pos2(hdr.min.x + 26., hdr.max.y - 22.), Align2::LEFT_BOTTOM, "Set up ScarlettPort", font(28., "black"), Color32::WHITE);
         if link(ui, pos2(hdr.max.x - 18., hdr.min.y + 16.), Align2::RIGHT_TOP, "wz-skip", "skip setup") {
+            self.cancel_search();
             self.config.wizard_done = true;
             self.save();
             self.go(Page::Play);
         }
 
         // stepper
-        let steps = ["Game folder", "Verify", "Shaders", "Preset", "Play"];
+        let steps = ["Welcome", "Game folder", "Setup", "Prepare", "Play"];
         let sy = hdr.max.y + 30.;
         let sw = area.width() / steps.len() as f32;
         for (i, s) in steps.iter().enumerate() {
@@ -601,7 +601,8 @@ impl Launcher {
             }
             let hit = ui.interact(Rect::from_center_size(pos2(cx, sy + 12.), vec2(sw - 20., 50.)), ui.id().with(("wz-step", i)), Sense::click());
             hand(ui, &hit);
-            if hit.clicked() && (i <= self.wizard_step || self.game_ok) {
+            // back to any earlier step; forward only once a game folder is set
+            if hit.clicked() && self.running.is_none() && (i <= self.wizard_step || self.game_ok) {
                 self.wizard_step = i;
             }
             p.text(pos2(cx, sy + 26.), Align2::CENTER_CENTER, *s, font(12.5, if i == self.wizard_step { "semibold" } else { "regular" }), txt);
@@ -611,9 +612,10 @@ impl Launcher {
         card(&p, body, LINE);
         let x = body.min.x + 24.;
         let mut y = body.min.y + 22.;
+        let tw = body.width() - 60.;
         let next = Rect::from_min_size(pos2(body.max.x - 24. - 170., body.max.y - 24. - 40.), vec2(170., 40.));
         let back = Rect::from_min_size(pos2(next.min.x - 120., next.min.y), vec2(110., 40.));
-        if self.wizard_step > 0 && self.wizard_step < 4 && button(ui, back, "wz-back", "Back", Kind::Secondary, true, None) {
+        if (1..=2).contains(&self.wizard_step) && button(ui, back, "wz-back", "Back", Kind::Secondary, true, None) {
             self.wizard_step -= 1;
         }
         let heading = |t: &str, sub: &str, p: &egui::Painter, y: &mut f32| {
@@ -621,101 +623,165 @@ impl Launcher {
             p.text(pos2(x, *y + 26.), Align2::LEFT_TOP, sub, font(12.5, "regular"), TEXT_MUTED);
             *y += 58.;
         };
+        let line = |ui: &Ui, p: &egui::Painter, y: f32, t: &str, c: Color32| {
+            p.text(pos2(x, y), Align2::LEFT_TOP, fit(ui, t, font(13., "regular"), tw), font(13., "regular"), c);
+        };
         match self.wizard_step {
             0 => {
-                heading("Pick your game folder", &format!("The folder from your own console dump that contains {GAME_EXE}."), &p, &mut y);
-                let label = if self.game_ok { "Change game folder" } else { "Choose game folder" };
-                if button(ui, Rect::from_min_size(pos2(x, y), vec2(220., 40.)), "wz-pick", label, Kind::Primary, !self.folder_busy, Some(Icon::Folder)) {
-                    self.pick_folder();
-                }
-                if self.game_ok {
-                    p.text(pos2(x, y + 58.), Align2::LEFT_TOP, fit(ui, &self.config.game_path, font(13., "regular"), body.width() - 60.), font(13., "regular"), TEXT);
-                }
-                if !self.folder_note.0.is_empty() {
-                    p.text(pos2(x, y + 80.), Align2::LEFT_TOP, fit(ui, &self.folder_note.0, font(12.5, "regular"), body.width() - 60.), font(12.5, "regular"), if self.folder_note.1 { SUCCESS } else { WARNING });
-                }
-                if button(ui, next, "wz-next0", "Next", Kind::Primary, self.game_ok, Some(Icon::Chevron)) {
+                heading("Welcome", "ScarlettPort runs your own console dump on this PC. Four short steps: your name, the game folder, setup, and a one-time preparation.", &p, &mut y);
+                line(ui, &p, y, "The name other players and the game see for you (up to 15 characters; empty keeps the default).", TEXT_MUTED);
+                let r = text_field(ui, Rect::from_min_size(pos2(x, y + 26.), vec2(320., 48.)), "wz-name", &mut self.name_edit, "Player name", None, true);
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if button(ui, next, "wz-next0", "Next", Kind::Primary, true, Some(Icon::Chevron)) || enter {
+                    self.set_player_name();
                     self.wizard_step = 1;
-                    self.run_verify();
+                    if !self.game_ok && self.search_end.is_none() {
+                        self.start_search();
+                    }
                 }
             }
             1 => {
-                heading("Verify the game files", "Every archive, a complete pack\\, links and sizes. Read-only: nothing is moved or changed.", &p, &mut y);
-                if self.verify.is_none() && !self.verify_busy {
+                heading("Find your game folder", &format!("Looking on every drive for the folder that holds {GAME_EXE}. Pick one, or browse to it."), &p, &mut y);
+                let searching = self.search.is_some();
+                let found = self.found_games.len();
+                let state = if searching {
+                    format!("Searching your drivesâ€¦ {} s  Â·  {found} found", self.search_started.map_or(0, |s| s.elapsed().as_secs()))
+                } else {
+                    match self.search_end {
+                        Some(true) => format!("Search finished: {found} found."),
+                        Some(false) => format!("Search stopped: {found} found. Browse if yours is not listed."),
+                        None => "Not searched yet.".into(),
+                    }
+                };
+                line(ui, &p, y, &state, TEXT_MUTED);
+                if searching {
+                    progress(&p, Rect::from_min_size(pos2(x, y + 22.), vec2(300., 3.)), None, time);
+                    if link(ui, pos2(x + 320., y), Align2::LEFT_TOP, "wz-cancel", "cancel") {
+                        self.cancel_search();
+                    }
+                } else if link(ui, pos2(x + text_width(ui, &state, font(13., "regular")) + 16., y), Align2::LEFT_TOP, "wz-again", "search again") {
+                    self.start_search();
+                }
+                y += 34.;
+                let w = body.width() - 48.;
+                let mut pick = None;
+                for (i, g) in self.found_games.iter().take(3).enumerate() {
+                    let r = Rect::from_min_size(pos2(x, y + i as f32 * 54.), vec2(w, 48.));
+                    let sel = self.game_ok && std::path::Path::new(&self.config.game_path) == g.as_path();
+                    let name = g.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if choice(ui, r, ("wz-found", i), &name, &fit(ui, &g.display().to_string(), font(12., "regular"), w - 60.), sel) {
+                        pick = Some(g.clone());
+                    }
+                }
+                if let Some(g) = pick {
+                    self.use_folder(g);
+                    self.verify = None;
                     self.run_verify();
                 }
-                match &self.verify {
-                    None => {
-                        p.text(pos2(x, y), Align2::LEFT_TOP, "Checking…", font(13., "regular"), TEXT_MUTED);
-                        progress(&p, Rect::from_min_size(pos2(x, y + 26.), vec2(300., 3.)), None, time);
-                    }
-                    Some(r) => {
-                        let (t, c) = match r.worst() {
-                            Level::Ok => ("All checks passed.".to_string(), SUCCESS),
-                            Level::Warn => (format!("Passed with {} warning(s).", r.problems()), WARNING),
-                            Level::Bad => (format!("{} problem(s) found.", r.problems()), DANGER),
-                        };
-                        p.text(pos2(x, y), Align2::LEFT_TOP, t, font(14., "semibold"), c);
-                        let mut yy = y + 26.;
-                        if r.pack_problem {
-                            p.text(pos2(x, yy), Align2::LEFT_TOP, "pack\\ is missing or split: the game crashes at boot until it is whole.", font(13., "semibold"), DANGER);
-                            yy += 22.;
-                        }
-                        for f in r.findings.iter().filter(|f| f.level != Level::Ok).take(4) {
-                            dot(&p, pos2(x + 4., yy + 8.), level_color(f.level));
-                            p.text(pos2(x + 16., yy), Align2::LEFT_TOP, fit(ui, &format!("{}: {}", f.title, f.detail), font(12.5, "regular"), body.width() - 80.), font(12.5, "regular"), TEXT_MUTED);
-                            yy += 20.;
-                        }
-                        if link(ui, pos2(x, yy + 8.), Align2::LEFT_TOP, "wz-details", "show details") {
-                            self.go(Page::Verify);
-                        }
-                    }
+                y += self.found_games.len().min(3) as f32 * 54. + 6.;
+                if button(ui, Rect::from_min_size(pos2(x, y), vec2(150., 36.)), "wz-pick", "Browseâ€¦", Kind::Secondary, !self.folder_busy, Some(Icon::Folder)) {
+                    self.pick_folder();
                 }
-                if button(ui, next, "wz-next1", "Next", Kind::Primary, self.verify.is_some(), Some(Icon::Chevron)) {
+                y += 48.;
+                if self.game_ok {
+                    let (t, c) = match &self.verify {
+                        None => ("Checking the game filesâ€¦".to_string(), TEXT_MUTED),
+                        Some(r) if r.pack_problem => ("pack\\ is missing or split: the game crashes at boot until it is whole.".to_string(), DANGER),
+                        Some(r) => match r.worst() {
+                            Level::Ok => (format!("All game files found  Â·  {}", crate::game::summary(&self.game_checks)), SUCCESS),
+                            _ => {
+                                let missing: Vec<&str> = r.findings.iter().filter(|f| f.level != Level::Ok).map(|f| f.title.as_str()).take(3).collect();
+                                (format!("{} problem(s): {}  (the game may not start; show details)", r.problems(), missing.join(", ")), WARNING)
+                            }
+                        },
+                    };
+                    line(ui, &p, y, &t, c);
+                    if self.verify.as_ref().is_some_and(|r| r.problems() > 0) && link(ui, pos2(x, y + 20.), Align2::LEFT_TOP, "wz-details", "show details") {
+                        self.go(Page::Verify);
+                    }
+                } else if !self.folder_note.0.is_empty() {
+                    line(ui, &p, y, &self.folder_note.0.clone(), WARNING);
+                }
+                if button(ui, next, "wz-next1", "Next", Kind::Primary, self.game_ok, Some(Icon::Chevron)) {
+                    self.cancel_search();
+                    self.run_setup();
                     self.wizard_step = 2;
                 }
             }
             2 => {
-                heading("Build the shaders", &format!("Translates the game's shaders once ({}, resumable). Or skip: they then compile as you play.", self.build_estimate()), &p, &mut y);
-                let stage = self.stage();
-                let building = self.running == Some(RunKind::Precompile);
-                let line = if building { self.build_line() } else if stage == Stage::Ready { "Built for this runtime.".into() } else if self.status.is_empty() { "Not built yet.".into() } else { self.status.clone() };
-                p.text(pos2(x, y), Align2::LEFT_TOP, fit(ui, &line, font(13., "regular"), body.width() - 60.), font(13., "regular"), if stage == Stage::Ready { SUCCESS } else { TEXT_MUTED });
-                if building {
-                    progress(&p, Rect::from_min_size(pos2(x, y + 26.), vec2(body.width() - 60., 3.)), self.build.as_ref().map(|b| b.overall), time);
-                    if button(ui, Rect::from_min_size(pos2(x, y + 44.), vec2(160., 40.)), "wz-stop", "Stop", Kind::Secondary, true, Some(Icon::Stop)) {
-                        self.stop_run();
-                    }
-                } else if stage != Stage::Ready && button(ui, Rect::from_min_size(pos2(x, y + 34.), vec2(200., 40.)), "wz-build", "Build shaders", Kind::Primary, self.engine_ready() && self.running.is_none(), Some(Icon::Download)) {
-                    self.start(RunKind::Precompile);
+                heading("Setup", "What the runtime needs is put in place. Nothing else on your PC is changed.", &p, &mut y);
+                if self.setup_notes.is_empty() {
+                    self.run_setup();
                 }
-                let label = if stage == Stage::Ready { "Next" } else { "Skip for now" };
-                if button(ui, next, "wz-next2", label, if stage == Stage::Ready { Kind::Primary } else { Kind::Secondary }, !building, Some(Icon::Chevron)) {
+                for (i, (ok, n)) in self.setup_notes.iter().enumerate() {
+                    let yy = y + i as f32 * 24.;
+                    dot(&p, pos2(x + 4., yy + 8.), if *ok { SUCCESS } else { DANGER });
+                    p.text(pos2(x + 16., yy), Align2::LEFT_TOP, fit(ui, n, font(13., "regular"), tw - 16.), font(13., "regular"), if *ok { TEXT } else { DANGER });
+                }
+                let ok = self.setup_notes.iter().all(|(o, _)| *o) && self.engine_ready();
+                if !self.engine_ready() {
+                    line(ui, &p, y + self.setup_notes.len() as f32 * 24. + 8., &self.runtime_note.clone(), DANGER);
+                }
+                if button(ui, next, "wz-next2", "Prepare", Kind::Primary, ok, Some(Icon::Chevron)) {
                     self.wizard_step = 3;
+                    if !self.prepared() && self.running.is_none() {
+                        self.start(RunKind::Precompile);
+                    }
                 }
             }
             3 => {
-                heading("Choose a preset", "You can change it any time on the Play page.", &p, &mut y);
-                let w = body.width() - 48.;
-                for (i, pr) in presets::ALL.iter().enumerate() {
-                    let build = if *pr == presets::EXPERIMENTAL { format!("for {}", presets::EXPERIMENTAL_BUILD) } else { self.build_label() };
-                    let r = Rect::from_min_size(pos2(x, y + i as f32 * 70.), vec2(w, 62.));
-                    if choice(ui, r, ("wz-preset", i), presets::label(pr), &fit(ui, &format!("{}  ·  {build}", presets::blurb(pr)), font(12., "regular"), w - 60.), self.config.preset == *pr) {
-                        self.config.preset = pr.to_string();
-                        self.save();
+                let building = self.running == Some(RunKind::Precompile);
+                let ready = !building && self.prepared();
+                heading("Prepare the shaders", "Translates the game's shaders on all cores, once. Updates that keep the shader translator skip this.", &p, &mut y);
+                if ready {
+                    p.text(pos2(x, y), Align2::LEFT_TOP, "Shaders up to date", font(15., "semibold"), SUCCESS);
+                    line(ui, &p, y + 26., "Nothing to prepare for this engine, driver and preset.", TEXT_MUTED);
+                } else if let Some(b) = self.build.clone().filter(|_| building) {
+                    let paused = self.paused();
+                    let count = if b.total > 0 { format!(" {} / {}", b.done, b.total) } else { String::new() };
+                    p.text(pos2(x, y), Align2::LEFT_TOP, format!("{}{count}", if paused { "Paused" } else { b.name }), font(15., "semibold"), TEXT);
+                    let eta = crate::flow::eta_secs(b.started.elapsed().as_secs(), b.overall).map(|s| format!("about {} left", crate::flow::duration(s))).unwrap_or_else(|| "estimating the time leftâ€¦".into());
+                    line(ui, &p, y + 24., &format!("Step {} of {}  Â·  {eta}  Â·  {} jobs  Â·  {}", b.phase, b.phases, b.jobs, b.current), TEXT_MUTED);
+                    progress(&p, Rect::from_min_size(pos2(x, y + 50.), vec2(tw, 3.)), Some(b.overall), time);
+                    if button(ui, Rect::from_min_size(pos2(x, y + 66.), vec2(150., 38.)), "wz-pause", if paused { "Resume" } else { "Pause" }, Kind::Secondary, true, Some(if paused { Icon::Play } else { Icon::Stop })) {
+                        self.toggle_pause();
+                    }
+                } else {
+                    let t = if self.status.is_empty() { "Not prepared yet.".to_string() } else { self.status.clone() };
+                    line(ui, &p, y, &t, TEXT_MUTED);
+                    if button(ui, Rect::from_min_size(pos2(x, y + 30.), vec2(190., 38.)), "wz-build", "Prepare now", Kind::Primary, self.engine_ready() && self.running.is_none(), Some(Icon::Download)) {
+                        self.start(RunKind::Precompile);
                     }
                 }
-                if button(ui, next, "wz-next3", "Next", Kind::Primary, true, Some(Icon::Chevron)) {
-                    self.wizard_step = 4;
+                if ready {
+                    if button(ui, next, "wz-next3", "Next", Kind::Primary, true, Some(Icon::Chevron)) {
+                        self.wizard_step = 4;
+                    }
+                } else {
+                    line(ui, &p, body.max.y - 92., "Playing without preparing works, but the game stutters while shaders compile live the first time.", TEXT_FAINT);
+                    if button(ui, Rect::from_min_size(pos2(x, body.max.y - 64.), vec2(250., 40.)), "wz-playnow", "Play now without preparing", Kind::Secondary, self.game_ok && self.engine_ready(), Some(Icon::Play)) {
+                        self.pause.store(false, std::sync::atomic::Ordering::Relaxed);
+                        self.config.wizard_done = true;
+                        self.save();
+                        self.go(Page::Play);
+                        if building {
+                            self.play_after_build = true;
+                            self.skip_prep();
+                        } else {
+                            self.prep_skip = true;
+                            self.start(RunKind::Play);
+                        }
+                    }
                 }
             }
             _ => {
                 heading("Ready", "Menus are not skipped: press A (or Enter) on the account screen. Loading takes 1 to 2 minutes.", &p, &mut y);
+                let name = if self.config.player_name.is_empty() { "default".to_string() } else { self.config.player_name.clone() };
                 let rows = [
+                    ("Player", name),
                     ("Game", if self.game_ok { self.config.game_path.clone() } else { "not set".into() }),
-                    ("Files", self.verify.as_ref().map(|v| if v.problems() == 0 { "verified".to_string() } else { format!("{} problem(s)", v.problems()) }).unwrap_or_else(|| "not verified".into())),
-                    ("Shaders", if self.stage() == Stage::Ready { "built".into() } else { "compile in game".into() }),
-                    ("Preset", format!("{}  ·  {}", presets::label(&self.config.preset), self.build_label())),
+                    ("Shaders", if self.prepared() { "up to date".into() } else { "compile in game".into() }),
+                    ("Preset", format!("{}  Â·  change it on the Play page", presets::label(&self.config.preset))),
                 ];
                 for (i, (k, v)) in rows.iter().enumerate() {
                     p.text(pos2(x, y + i as f32 * 24.), Align2::LEFT_TOP, *k, font(13., "semibold"), TEXT_FAINT);

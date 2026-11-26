@@ -102,6 +102,8 @@ pub struct Job {
     /// Some(N): stop a step that prints nothing for N seconds; its shaders compile in game.
     pub slow_secs: Option<u64>,
     pub stop: Arc<AtomicBool>,
+    /// Pause: the running engine process is suspended while set, and resumed when cleared.
+    pub pause: Arc<AtomicBool>,
     pub tx: Sender<Message>,
 }
 
@@ -157,6 +159,7 @@ fn run(mut cmd: Command, job: &Job, idle: Option<Duration>, mut on_line: impl Fn
     drop(ltx);
     let mut last = Instant::now();
     let mut exited: Option<Option<i32>> = None;
+    let mut suspended = false;
     loop {
         match lrx.recv_timeout(Duration::from_millis(250)) {
             Ok(l) => {
@@ -174,7 +177,18 @@ fn run(mut cmd: Command, job: &Job, idle: Option<Duration>, mut on_line: impl Fn
             Err(RecvTimeoutError::Timeout) => {}
         }
         on_line("");
+        let want = job.pause.load(Ordering::Relaxed);
+        if want != suspended && exited.is_none() && crate::firstrun::set_suspended(&child, want) {
+            suspended = want;
+            log(&job.tx, if want { "Paused: the preparation is suspended." } else { "Resumed." });
+        }
+        if suspended {
+            last = Instant::now();
+        }
         if job.stop.load(Ordering::Relaxed) {
+            if suspended {
+                crate::firstrun::set_suspended(&child, false);
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Ok(Outcome::Stopped);

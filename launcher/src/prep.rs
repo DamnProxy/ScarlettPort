@@ -1,6 +1,8 @@
 //! One-time shader and pipeline preparation before Play. A small stamp file in the preset's
-//! cache folder records what the cache was prepared for: the engine build, the GPU driver and
-//! the preset's cache key. Play prepares first only when the stamp does not match.
+//! cache folder records what the cache was prepared for: the shader key (the engine's
+//! translator fingerprint, `firstrun::shader_key`), the GPU driver and the preset's cache key.
+//! Play prepares first only when the stamp does not match, so an update that keeps the
+//! translator needs no preparation, and one that changes it only translates what is new.
 use std::path::{Path, PathBuf};
 
 pub const STAMP: &str = "prepared.txt";
@@ -8,24 +10,25 @@ pub const STAMP: &str = "prepared.txt";
 /// What a prepared cache is valid for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stamp {
-    pub engine: String,
+    /// `translator:<fingerprint>` (or `build:<exe hash>` for engines without one).
+    pub shaders: String,
     pub driver: String,
     pub cache_key: String,
 }
 
 impl Stamp {
     pub fn to_text(&self) -> String {
-        format!("engine={}\ndriver={}\ncache={}\n", self.engine.trim(), self.driver.trim(), self.cache_key.trim())
+        format!("shaders={}\ndriver={}\ncache={}\n", self.shaders.trim(), self.driver.trim(), self.cache_key.trim())
     }
 
     pub fn parse(text: &str) -> Option<Stamp> {
         let get = |k: &str| text.lines().find_map(|l| l.trim().strip_prefix(k).and_then(|r| r.strip_prefix('='))).map(|v| v.trim().to_string());
-        Some(Stamp { engine: get("engine")?, driver: get("driver")?, cache_key: get("cache")? })
+        Some(Stamp { shaders: get("shaders")?, driver: get("driver")?, cache_key: get("cache")? })
     }
 
-    /// A stamp without an engine hash never counts as prepared (the engine was not found yet).
+    /// A stamp without a shader key never counts as prepared (the engine was not found yet).
     pub fn valid(&self) -> bool {
-        !self.engine.trim().is_empty()
+        !self.shaders.trim().is_empty()
     }
 }
 
@@ -78,7 +81,7 @@ mod tests {
     use super::*;
 
     fn s(e: &str, d: &str, c: &str) -> Stamp {
-        Stamp { engine: e.into(), driver: d.into(), cache_key: c.into() }
+        Stamp { shaders: e.into(), driver: d.into(), cache_key: c.into() }
     }
 
     #[test]
@@ -89,7 +92,11 @@ mod tests {
         assert!(!matches(&d, &a), "no stamp yet");
         write(&d, &a).unwrap();
         assert!(matches(&d, &a));
-        assert!(!matches(&d, &s("abd", "32.0.15.6094", "stable|F:/c/scarlett")), "engine changed");
+        assert!(!matches(&d, &s("abd", "32.0.15.6094", "stable|F:/c/scarlett")), "translator changed");
+        // a stamp from launchers before 0.5.1 (keyed on the engine build) is not reused
+        std::fs::write(path(&d), "engine=abc\ndriver=32.0.15.6094\ncache=stable|F:/c/scarlett\n").unwrap();
+        assert!(!matches(&d, &a));
+        write(&d, &a).unwrap();
         assert!(!matches(&d, &s("abc", "32.0.15.7000", "stable|F:/c/scarlett")), "driver changed");
         assert!(!matches(&d, &s("abc", "32.0.15.6094", "look|F:/c/scarlett")), "preset changed");
         std::fs::write(path(&d), "garbage").unwrap();
