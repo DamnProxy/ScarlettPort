@@ -66,6 +66,12 @@ pub fn warm_args(game: &Path, jobs: usize) -> Vec<String> {
 /// Distinct shader programs `scarlett shaders` translates (runtimes since 0.4.6; refined as it runs).
 pub const SHADERS_TOTAL: u64 = 26_084;
 
+/// True when `scarlett shaders` ended with far fewer shaders than the title has (under 5%):
+/// a wrong folder or an engine that cannot read it, never a prepared cache.
+pub fn too_few_shaders(n: u64) -> bool {
+    n < SHADERS_TOTAL / 20
+}
+
 /// `shaders "<game>" --jobs N`: the translation step of runtimes since 0.4.6 (its `warm` no longer
 /// translates).
 pub fn shaders_args(game: &Path, jobs: usize) -> Vec<String> {
@@ -143,6 +149,13 @@ pub fn world_env(c: &Config, game: &Path, cache_dir: &str) -> Vec<(&'static str,
         v.push(("SCARLETT_PRECOMPILED_GRAPHICS", "1".to_string()));
     }
     v.extend(SPEED_SETTINGS.iter().map(|k| (*k, "1".to_string())));
+    // The engine's picture and residency settings, as in Stable (ambient and sky light, complete
+    // textures, buffers kept on the card); without them Custom ran darker and slower than Stable.
+    v.extend(crate::presets::CAND4.iter().map(|(k, x)| (*k, x.to_string())));
+    if c.raytracing {
+        // The switch the runtime reads for the title's own ray-traced light.
+        v.push(("SCARLETT_BVH_BUILDER", "1".to_string()));
+    }
     if c.debug_view {
         v.push(("SCARLETT_DEBUG_PS", "1".to_string()));
         v.push(("SCARLETT_SHOW_TARGET", "2560x1440-f28".to_string()));
@@ -253,6 +266,10 @@ mod tests {
         let e = world_env(&c, &g, "E:/c");
         assert_eq!(get(&e, "SCARLETT_AUTO_INPUT").as_deref(), Some("1"));
         assert_eq!(get(&e, "SCARLETT_RAYTRACING").as_deref(), Some("1"));
+        assert_eq!(get(&e, "SCARLETT_BVH_BUILDER").as_deref(), Some("1"));
+        for (k, v) in crate::presets::CAND4 {
+            assert_eq!(get(&e, k).as_deref(), Some(v), "Custom keeps the engine's settings: {k}");
+        }
     }
 
     #[test]
@@ -275,6 +292,9 @@ mod tests {
         assert_eq!(parse_shaders(end), Some(26084));
         assert_eq!(parse_shaders_failed(end), Some(3));
         assert_eq!(parse_shaders_failed("4000 shaders in the cache, 37 s"), None);
+        // v0.4.8 on an empty or unreadable folder: exit 0 with 0, or 29 shaders.
+        assert!(too_few_shaders(0) && too_few_shaders(29));
+        assert!(!too_few_shaders(26_084) && !too_few_shaders(20_000));
         assert_eq!(parse_warm_plan("120 pipelines known, 20 made before (ab12), 0 bad; 100 to make, 8 processes"), Some(100));
         assert_eq!(parse_warm_made("1000 of 5200, 40 s"), Some(1000));
         assert_eq!(parse_warm_made("pipeline 7 0123abcd: compiler ended of itself s"), None);

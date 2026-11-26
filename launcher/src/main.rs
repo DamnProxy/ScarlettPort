@@ -19,6 +19,7 @@ mod report;
 mod saves;
 mod update;
 mod controller;
+mod prep;
 mod shaderbuild;
 mod theme;
 mod view;
@@ -309,10 +310,29 @@ pub struct Launcher {
     pub tuning_at_start: Option<tuning::Tuning>,
     pub report_copied: Option<Instant>,
     pub shot_wait: u32,
+    /// The GPU driver version (part of the preparation stamp).
+    pub driver: String,
+    /// Play asked for the one-time preparation first: start the game when it ends.
+    pub play_after_build: bool,
+    /// "Skip this time": the preparation was stopped to play now; the next Play prepares again.
+    pub prep_skip: bool,
 }
 
 pub fn config_path() -> PathBuf {
     runtime::data_dir().join("launcher.json")
+}
+
+/// The settings file, or the defaults. A file that does not parse is kept as
+/// `launcher.json.bad` (the next save would otherwise overwrite it) and the defaults are used.
+pub fn load_config(path: &std::path::Path) -> Config {
+    let Ok(bytes) = std::fs::read(path) else { return Config::default() };
+    match serde_json::from_slice(&bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = std::fs::rename(path, path.with_extension("json.bad"));
+            Config::default()
+        }
+    }
 }
 
 pub fn valid_game(dir: &std::path::Path) -> bool {
@@ -343,10 +363,13 @@ impl Launcher {
             cc.egui_ctx.load_texture("mark", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR)
         };
         let art = cc.egui_ctx.load_texture("art", art::fallback(), egui::TextureOptions::LINEAR);
-        let mut config: Config = std::fs::read(config_path())
-            .ok()
-            .and_then(|v| serde_json::from_slice(&v).ok())
-            .unwrap_or_default();
+        let mut config = load_config(&config_path());
+        if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            // Settings moved over from the former data folder still point into it.
+            for p in [&mut config.cache_dir, &mut config.local_cache] {
+                *p = runtime::migrate_data_path(p, &base);
+            }
+        }
         if !config.engine_v2 {
             // The World engine is the default now: its shader build takes minutes, not hours.
             config.engine = engine::WORLD.to_string();
@@ -360,6 +383,7 @@ impl Launcher {
         let game_ok = !config.game_path.is_empty() && valid_game(std::path::Path::new(&config.game_path));
         let game_checks = if game_ok { game::verify(std::path::Path::new(&config.game_path)) } else { Vec::new() };
         let game_edit = config.game_path.clone();
+        let sys = report::system();
         let l = Launcher {
             page: Page::Play,
             // in the past: the first frame is fully drawn (no fade-in), even if frames are throttled
@@ -376,7 +400,10 @@ impl Launcher {
             presence: discord::Presence::new(),
             presence_last: None,
             run_started: 0,
-            gpu_name: report::system().gpu,
+            gpu_name: sys.gpu.clone(),
+            driver: sys.driver.clone(),
+            play_after_build: false,
+            prep_skip: false,
             update: None,
             update_note: update::staged().map(|v| format!("{v} is downloaded and will be used the next time you start the launcher.")).unwrap_or_default(),
             update_busy: false,
@@ -552,23 +579,47 @@ impl Launcher {
         let folders = [(self.config.game_path.as_str(), "<game>"), (self.config.cache_dir.as_str(), "<cache>")];
         let engine = if self.world_selected() { format!("World engine (ScarlettPort runtime), {}", self.world_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) } else { format!("Classic engine (XCL), {}", self.runtime_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) };
         let build = self.build.as_ref().map(|b| format!("\nLast shader build: {} in {}", b.name, flow::duration(b.started.elapsed().as_secs()))).unwrap_or_default();
-        let fields: Vec<(&str, String)> = vec![
+        // Every field is scrubbed (fps lines can hold paths too), the log as well.
+        let mut fields: Vec<(&str, String)> = vec![
             ("gpu", sys.gpu.clone()),
             ("driver", sys.driver.clone()),
             ("system", format!("{}; {} GB RAM; {}", sys.cpu, sys.ram_gb, sys.os)),
-            ("runtime", format!("Launcher v{VERSION}; {engine}{build}")),
+            ("runtime", format!("Launcher v{VERSION}; {engine}{build}; {} preset", presets::label(&self.config.preset))),
             ("fps", report::fps_summary(&lines)),
-            ("notes", report::scrub(&format!("Last {} log lines:\n`\n{tail}\n`", tail.lines().count()), &folders)),
         ];
+        for f in &mut fields {
+            f.1 = report::scrub(&f.1, &folders);
+        }
+        // The crash the last run left, and the newest entries of the crash list.
+        let mut head = String::new();
+        if let Some(r) = self.crash_report.as_ref().and_then(|r| r.file_name()) {
+            head += &format!("The last run crashed: {}\n", r.to_string_lossy());
+        }
+        if let Some(Ok(v)) = &self.crashes {
+            head += "Crashes:\n";
+            v.iter().rev().take(5).for_each(|l| head += &format!("  {l}\n"));
+        }
+        if !head.is_empty() {
+            head.push('\n');
+        }
+        let head = report::scrub(&head, &folders);
+        let scrubbed: Vec<String> = lines[lines.len().saturating_sub(200)..].iter().map(|l| report::scrub(l, &folders)).collect();
+        let full = report::scrub(&format!("{head}Last {} log lines:\n```\n{tail}\n```", tail.lines().count()), &folders);
+        // As many of the newest log lines as fit the URL; the rest is never silently lost.
+        let notes = report::notes_that_fit(&fields, &head, &scrubbed);
+        let trimmed = !notes.contains(&format!("Last {} log lines", scrubbed.len()));
+        fields.push(("notes", notes));
         let url = report::issue_url(&fields);
-        if url.len() <= report::MAX_URL {
-            ctx.open_url(egui::OpenUrl::new_tab(&url));
+        ctx.open_url(egui::OpenUrl::new_tab(&url));
+        if !trimmed {
             self.report_note = "Opened a prefilled hardware report in your browser. Check it, add how far the game got, then submit.".into();
         } else {
-            ctx.copy_text(report::as_text(&fields));
-            let short: Vec<(&str, String)> = fields[..5].to_vec();
-            ctx.open_url(egui::OpenUrl::new_tab(report::issue_url(&short)));
-            self.report_note = "The report is too long for a link: the full text (with the log) is on your clipboard. Paste it into the Notes field of the issue that opened.".into();
+            let mut all = fields.clone();
+            if let Some(n) = all.last_mut() {
+                n.1 = full;
+            }
+            ctx.copy_text(report::as_text(&all));
+            self.report_note = "Opened a prefilled hardware report with the newest log lines; the full log is on your clipboard to paste if needed.".into();
         }
         self.log(self.report_note.clone(), LogKind::Info);
     }
@@ -677,6 +728,12 @@ impl Launcher {
         if kind == RunKind::Precompile {
             return self.start_build(game);
         }
+        if kind == RunKind::Play && self.world_selected() && !std::mem::take(&mut self.prep_skip) && !self.prepared() {
+            // One-time preparation for this engine, driver and preset; the game starts after it.
+            self.log("The shader cache is not prepared for this engine, driver and preset: preparing it once before the game starts.", LogKind::Info);
+            self.play_after_build = true;
+            return self.start_build(game);
+        }
         if kind == RunKind::Play {
             self.save_note = self.backup_saves().unwrap_or_default();
             self.play_since = Some(std::time::SystemTime::now());
@@ -744,6 +801,8 @@ impl Launcher {
     fn start_build(&mut self, game: PathBuf) {
         let world = self.world_selected();
         let hash = if world { self.effective_world_hash().map(str::to_string) } else { self.runtime_hash.clone() }.unwrap_or_default();
+        // Each preset has its own cache folder, so what was built is kept per folder too.
+        let hash = if world { shaderbuild::state_key(&hash, &self.scarlett_cache()) } else { hash };
         let stop = Arc::new(AtomicBool::new(false));
         let env = if world { self.play_env(&game) } else { Vec::new() };
         let job = shaderbuild::Job {
@@ -765,6 +824,28 @@ impl Launcher {
         self.pipelines = None;
         self.status = "Building shaders…".into();
         std::thread::spawn(move || shaderbuild::build(job));
+    }
+
+    /// What the selected preset's cache must have been prepared for.
+    pub fn prep_stamp(&self) -> prep::Stamp {
+        prep::Stamp {
+            engine: self.effective_world_hash().unwrap_or_default().to_string(),
+            driver: self.driver.clone(),
+            cache_key: format!("{}|{}", self.config.preset, self.scarlett_cache().display()),
+        }
+    }
+
+    /// True when the preset's cache was prepared for this engine build, driver and preset.
+    pub fn prepared(&self) -> bool {
+        prep::matches(&self.scarlett_cache(), &self.prep_stamp())
+    }
+
+    /// "Skip this time": stop the preparation Play started and start the game now.
+    pub fn skip_prep(&mut self) {
+        if self.play_after_build {
+            self.prep_skip = true;
+            self.stop_run();
+        }
     }
 
     /// True when the selected engine was found beside the launcher.
@@ -933,7 +1014,9 @@ impl Launcher {
         self.saves_busy = true;
         let (exe, env, tx) = (self.scarlett_path(), self.tool_env(), self.tx.clone());
         std::thread::spawn(move || {
-            let r = cli::run(&exe, &["saves".into(), "list".into()], &env).map(|t| cli::parse_saves(&t));
+            let r = cli::run(&exe, &["saves".into(), "list".into()], &env).map(|t| cli::parse_saves(&t)).map_err(|e| {
+                if cli::unknown_command(&e) { "This runtime build has no `saves` command; the launcher still backs up the save files before every Play.".to_string() } else { e }
+            });
             let _ = tx.send(Message::Saves(r));
         });
     }
@@ -1219,8 +1302,13 @@ impl Launcher {
                 Message::BuildEnded(r) => {
                     self.running = None;
                     self.stop = None;
+                    let then_play = std::mem::take(&mut self.play_after_build);
+                    let ok = r.is_ok();
                     match r {
                         Ok(note) => {
+                            if self.world_selected() {
+                                let _ = prep::write(&self.scarlett_cache(), &self.prep_stamp());
+                            }
                             if self.world_selected() && self.local_selected() {
                                 self.config.local_shaders_hash = self.local_hash.clone().unwrap_or_default();
                             } else if self.world_selected() {
@@ -1237,6 +1325,14 @@ impl Launcher {
                             self.status = e;
                         }
                     }
+                    if then_play && (ok || self.prep_skip) {
+                        if !ok {
+                            self.log("Preparation skipped this time; shaders compile in game. The next Play prepares again.", LogKind::Info);
+                        }
+                        self.prep_skip = !ok;
+                        self.start(RunKind::Play);
+                    }
+                    self.prep_skip = false;
                 }
                 Message::RuntimeReady(r) => match r {
                     Ok(found) => {
@@ -1311,7 +1407,7 @@ impl Launcher {
                 Message::SavesDone(r) => {
                     self.saves_busy = false;
                     self.saves_msg = match r {
-                        Ok(t) => t.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("Done.").trim().to_string(),
+                        Ok(t) => t.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("Done.").trim().to_string(),
                         Err(e) => format!("Failed: {e}"),
                     };
                     self.log(format!("Saves: {}", self.saves_msg), LogKind::Info);
@@ -1431,6 +1527,31 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_settings_are_kept_and_defaults_used() {
+        let d = std::env::temp_dir().join(format!("sp-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("launcher.json");
+        let fresh = load_config(&p);
+        assert_eq!(fresh.preset, presets::STABLE, "fresh install: defaults");
+        assert!(fresh.auto_update && fresh.console_s && !fresh.wizard_done);
+        std::fs::write(&p, br#"{"game_path": "D:/g", "preset": 3"#).unwrap();
+        let c = load_config(&p);
+        assert!(c.game_path.is_empty() && c.console_s);
+        assert!(d.join("launcher.json.bad").is_file(), "the broken file is kept");
+        let mut c = Config::default();
+        c.game_path = "D:/Spiele/Zoë's game".into();
+        c.preset = presets::LOOK.into();
+        c.tuning.overlay = true;
+        std::fs::write(&p, serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        let back = load_config(&p);
+        assert_eq!((back.game_path.as_str(), back.preset.as_str(), back.tuning.overlay), ("D:/Spiele/Zoë's game", presets::LOOK, true));
+        std::fs::write(&p, b"{}").unwrap();
+        assert!(load_config(&p).fallback_light, "missing fields take their defaults");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn parse(s: &str) -> Vec<String> {
         let (tx, rx) = channel();

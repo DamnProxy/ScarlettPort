@@ -116,6 +116,11 @@ pub fn duration(secs: u64) -> String {
     }
 }
 
+/// Seconds left from the time so far and the fraction done (None until 2% is done).
+pub fn eta_secs(elapsed: u64, fraction: f32) -> Option<u64> {
+    (0.02..1.).contains(&fraction).then(|| (elapsed as f32 * (1. - fraction) / fraction).round() as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +181,12 @@ mod tests {
         assert_eq!(world(Stage::Ready, false, Some(99), 99), World::Done);
         assert_eq!(world(Stage::Ready, false, Some(120), 99), World::Available);
         assert_eq!(world(Stage::Ready, true, Some(99), 0), World::Building);
+    }
+
+    #[test]
+    fn eta_from_progress() {
+        assert_eq!(super::eta_secs(60, 0.25), Some(180));
+        assert_eq!(super::eta_secs(5, 0.01), None);
+        assert_eq!(super::eta_secs(100, 1.0), None);
     }
 }

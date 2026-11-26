@@ -53,9 +53,10 @@ impl Launcher {
         let Some(b) = &self.build else { return self.status.clone() };
         let count = if b.total > 0 { format!("  ·  {} of {}", b.done, b.total) } else { String::new() };
         let quiet = b.last_output.elapsed().as_secs();
+        let eta = crate::flow::eta_secs(b.started.elapsed().as_secs(), b.overall).map(|s| format!("  ·  about {} left", flow::duration(s))).unwrap_or_default();
         let note = if quiet >= 20 { format!("  ·  no output for {quiet} s (large shaders take minutes; still working)") } else { String::new() };
         format!(
-            "Phase {}/{}: {}{count}  ·  now: {} ({} s)  ·  {} total{note}",
+            "Phase {}/{}: {}{count}  ·  now: {} ({} s)  ·  {} total{eta}{note}",
             b.phase,
             b.phases,
             b.name,
@@ -343,7 +344,9 @@ impl Launcher {
             format!("Game folder incomplete  ·  missing {}", game::missing(&self.game_checks).join(", "))
         } else if stage == Stage::ShadersNotBuilt {
             meta_color = WARNING;
-            if self.shaders_stale() { "Runtime updated  ·  rebuild the shaders before playing".to_string() } else { format!("Step 2: build the shaders once ({})  ·  then press Play", self.build_estimate()) }
+            if self.world_selected() {
+                format!("Play prepares the shaders once first ({})  ·  or Skip this time", self.build_estimate())
+            } else if self.shaders_stale() { "Runtime updated  ·  rebuild the shaders before playing".to_string() } else { format!("Step 2: build the shaders once ({})  ·  then press Play", self.build_estimate()) }
         } else if !self.status.is_empty() {
             self.status.clone()
         } else {
@@ -357,9 +360,14 @@ impl Launcher {
             if button_font(ui, button_rect, "hdr-stop", "Stop", Kind::Secondary, true, Some(Icon::Stop), font(15., "bold"), 0.) {
                 self.stop_run();
             }
+            if self.play_after_build && !self.prep_skip && link(ui, pos2(button_rect.center().x - 44., button_rect.max.y + 12.), Align2::LEFT_CENTER, "hdr-skip", "skip this time") {
+                self.skip_prep();
+            }
         } else {
             let (text, kind_font, tracking) = match stage {
                 Stage::GameNotSet => ("SELECT GAME", font(13., "black"), 1.5),
+                // The World engine prepares on Play by itself (once per engine, driver and preset).
+                Stage::ShadersNotBuilt if self.world_selected() => ("PLAY", font(15., "black"), 2.),
                 Stage::ShadersNotBuilt | Stage::BuildingShaders => ("BUILD SHADERS", font(13., "black"), 1.5),
                 Stage::Ready => ("PLAY", font(15., "black"), 2.),
             };
@@ -371,12 +379,13 @@ impl Launcher {
             if button_font(ui, button_rect, "hdr-play", text, Kind::Primary, enabled, Some(icon), kind_font, tracking) {
                 match stage {
                     Stage::GameNotSet => self.pick_folder(),
+                    Stage::ShadersNotBuilt if self.world_selected() => self.start(RunKind::Play),
                     Stage::ShadersNotBuilt => self.confirm_precompile = true,
                     Stage::Ready => self.start(RunKind::Play),
                     Stage::BuildingShaders => {}
                 }
             }
-            if stage != Stage::Ready && self.game_ok && self.engine_ready() && link(ui, pos2(button_rect.center().x - 28., button_rect.max.y + 12.), Align2::LEFT_CENTER, "hdr-anyway", "play anyway") {
+            if stage != Stage::Ready && !(stage == Stage::ShadersNotBuilt && self.world_selected()) && self.game_ok && self.engine_ready() && link(ui, pos2(button_rect.center().x - 28., button_rect.max.y + 12.), Align2::LEFT_CENTER, "hdr-anyway", "play anyway") {
                 self.start(RunKind::Play);
             }
         }
@@ -638,10 +647,10 @@ impl Launcher {
         let rows = [
             ("Engine", engine_sub.as_str()),
             ("Console profile", "World engine. Series S reports the smaller console to the game."),
-            ("Ray tracing", "World engine. Hardware ray-traced lighting."),
-            ("Fallback lighting", "World engine. Simple lighting where the game's own is missing."),
-            ("Debug view", "World engine. Shows a debug render target (slower)."),
-            ("Auto-advance menus", "Presses through the title and account screens."),
+            ("Ray tracing", "Custom preset. The game's own ray-traced light (SCARLETT_BVH_BUILDER): costs about a third of the frame rate."),
+            ("Fallback lighting", "Custom preset, local builds only (the bundled runtime ignores it). Simple light where the game's is missing."),
+            ("Debug view", "Custom preset, local builds only (the bundled runtime ignores it). Shows a debug render target (slower)."),
+            ("Auto-advance menus", "Classic engine; World only with a local build that has it. Presses through the title screens."),
         ];
         for (i, (title, sub)) in rows.iter().enumerate() {
             let row = row_at(i);
@@ -947,7 +956,7 @@ impl Launcher {
             self.save();
         }
         let dir = self.config.cache_dir.trim().to_string();
-        let drive = if dir.as_bytes().get(1) == Some(&b':') { format!("{}:", &dir[..1].to_uppercase()) } else { "That drive".to_string() };
+        let drive = if dir.as_bytes().get(1) == Some(&b':') { format!("{}:", dir[..1].to_uppercase()) } else { "That drive".to_string() };
         let (text, color) = match self.cache_free.and_then(|(_, f)| f) {
             Some(f) if f < game::LOW_SPACE => (format!("{drive} has only {} free. The shader cache needs about 40 GB.", game::human(f)), WARNING),
             Some(f) => (format!("{drive} has {} free.", game::human(f)), SUCCESS),
@@ -1040,7 +1049,7 @@ impl Launcher {
         p.text(pos2(c.min.x, y + CONTROL + 14.), Align2::LEFT_TOP, format!("Runtime folder: {}", self.runtime_note), font(12.5, "regular"), TEXT_MUTED);
         let y = y + 100.;
         p.line_segment([pos2(c.min.x, y), pos2(c.max.x, y)], Stroke::new(1.0_f32, LINE));
-        let text = "The launcher makes no network connections. The only outside access is the links you click, which open in your browser. Settings live in %LOCALAPPDATA%\\ScarlettPort\\launcher.json.";
+        let text = "The launcher connects only to GitHub, to check for a newer release (at start, unless turned off in Options) and to download one when you click Update. Discord presence talks to the Discord app on this PC when it is on. Reports open in your browser for you to check and submit. Settings live in %LOCALAPPDATA%\\ScarlettPort\\launcher.json.";
         let g = p.layout(text.into(), font(13., "regular"), TEXT_MUTED, c.width().min(560.));
         p.galley(pos2(c.min.x, y + 20.), g, TEXT_MUTED);
         if link(ui, pos2(c.min.x, y + 100.), Align2::LEFT_CENTER, "site", "github.com/ZigZagBoi1/ScarlettPort") {

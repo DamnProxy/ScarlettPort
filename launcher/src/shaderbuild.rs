@@ -79,6 +79,12 @@ impl State {
     }
 }
 
+/// The state file's key for a World build: the engine hash and the preset's cache folder, so a
+/// build for one preset's cache never counts for another's.
+pub fn state_key(hash: &str, cache: &Path) -> String {
+    format!("{hash} {}", cache.display())
+}
+
 pub fn state_path(cache_dir: &str, world: bool) -> PathBuf {
     Path::new(cache_dir.trim()).join(if world { "build-world.json" } else { "build-classic.json" })
 }
@@ -116,7 +122,7 @@ pub fn free_mb() -> Option<u64> {
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a correctly sized, zeroed MEMORYSTATUSEX.
-    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then(|| m.ullAvailPhys / (1024 * 1024))
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPhys / (1024 * 1024))
 }
 
 #[cfg(not(windows))]
@@ -200,6 +206,11 @@ fn send(job: &Job, p: &Progress) {
 /// `precompile-graphics`). The 0.4.6 runtime translates with `shaders` and its `warm` makes the
 /// pipelines earlier runs recorded.
 fn older_commands(job: &Job) -> bool {
+    help(job).is_none_or(|h| h.contains("precompile-graphics"))
+}
+
+/// The engine's `--help` text, None when it does not run.
+fn help(job: &Job) -> Option<String> {
     let mut cmd = Command::new(&job.exe);
     cmd.current_dir(&job.runtime).arg("--help").stdin(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
@@ -207,7 +218,7 @@ fn older_commands(job: &Job) -> bool {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    cmd.output().map_or(true, |o| String::from_utf8_lossy(&o.stdout).contains("precompile-graphics"))
+    cmd.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 fn world(job: &Job) -> Result<String, String> {
@@ -381,11 +392,14 @@ fn world_split(job: &Job) -> Result<String, String> {
         base(&mut cmd);
         cmd.args(engine::shaders_args(&job.game, p.jobs));
         log(&job.tx, format!("> scarlett shaders \"{}\" --jobs {}  (phase 1 of 2: translate every shader, a few minutes; already translated ones are skipped)", job.game.display(), p.jobs));
-        p.current = "translating (the engine reports every 1,000 shaders)".into();
+        // The engine reads the game files first and prints its first count only after that.
+        p.name = "Scanning game files";
+        p.current = "reading the game files first; the shader count starts after that (a few minutes)".into();
         send(job, &p);
         let mut tick = Instant::now();
         let out = run(cmd, job, None, |l| {
             if let Some(n) = engine::parse_shaders(l) {
+                p.name = "Translating shaders";
                 p.done = n;
                 p.total = p.total.max(n);
                 p.current = format!("translating shaders {}–{}", n, (n + 1000).min(p.total));
@@ -404,11 +418,19 @@ fn world_split(job: &Job) -> Result<String, String> {
             }
         })?;
         match out {
+            Outcome::Exit(Some(0)) if engine::too_few_shaders(p.done) => {
+                return Err(format!(
+                    "Preparation translated only {} shaders (about {} expected) from {}: wrong game folder, or the engine cannot read it. Nothing was marked as prepared; see Logs.",
+                    p.done,
+                    engine::SHADERS_TOTAL,
+                    job.game.display()
+                ));
+            }
             Outcome::Exit(Some(0)) => {
                 st.warm = true;
                 st.save(&path);
             }
-            Outcome::Exit(c) => return Err(format!("scarlett shaders failed (exit code {c:?}); see Logs")),
+            Outcome::Exit(c) => return Err(format!("scarlett shaders failed (exit code {c:?}){}; see Logs", agility_note(&job.exe))),
             Outcome::Stopped | Outcome::Idle => return Err("Stopped. Press Build shaders again to resume.".into()),
         }
     }
@@ -420,16 +442,52 @@ fn world_split(job: &Job) -> Result<String, String> {
     p.current = "reading the pipelines earlier runs recorded".into();
     p.current_since = Instant::now();
     p.overall = share;
+    // The most complete pipeline step this engine offers; `warm` when there is nothing better.
+    let cmds = help(job).map(|h| crate::prep::commands(&h)).unwrap_or_default();
+    let step = crate::prep::pipeline_command(&cmds).unwrap_or("warm");
+    let mut planned = None;
+    let mut out = pipelines(job, &base, &mut p, share, step, &mut planned)?;
+    if step != "warm" && matches!(out, Outcome::Exit(Some(c)) if c != 0) {
+        log(&job.tx, format!("`scarlett {step}` failed; falling back to `scarlett warm`."));
+        planned = None;
+        out = pipelines(job, &base, &mut p, share, "warm", &mut planned)?;
+    }
+    match out {
+        Outcome::Exit(Some(0)) => {}
+        // The 0.4.6 runtime's warm fails after "0 to make" when no run recorded pipelines (its
+        // pipelines folder is missing); nothing was left undone.
+        Outcome::Exit(_) if planned == Some(0) => {}
+        Outcome::Exit(c) => return Err(format!("scarlett {step} failed (exit code {c:?}); see Logs")),
+        Outcome::Stopped | Outcome::Idle => return Err("Stopped. Press Build shaders again to resume.".into()),
+    }
+    let took = flow::duration(p.started.elapsed().as_secs());
+    Ok(if untranslated == 0 {
+        format!("Shaders built in {took}.")
+    } else {
+        format!("Shaders built in {took}; {untranslated} do not translate yet (see Logs).")
+    })
+}
+
+/// A hint when the D3D12 Agility folder is missing beside the engine (D3D12 then fails to start,
+/// 0x887E0003); the release ZIP has it in runtime\D3D12.
+fn agility_note(exe: &Path) -> String {
+    match exe.parent() {
+        Some(d) if !d.join("D3D12").join("D3D12Core.dll").is_file() => format!(". No D3D12/D3D12Core.dll beside {}: keep the D3D12 folder from the release next to it", exe.display()),
+        _ => String::new(),
+    }
+}
+
+/// Phase 2: `scarlett <step> --jobs N` (`warm`, or a command that builds every pipeline).
+fn pipelines(job: &Job, base: &dyn Fn(&mut Command), p: &mut Progress, share: f32, step: &str, planned: &mut Option<u64>) -> Result<Outcome, String> {
     let mut cmd = Command::new(&job.exe);
     base(&mut cmd);
-    cmd.args(engine::warm_book_args(p.jobs));
-    log(&job.tx, format!("> scarlett warm --jobs {}  (phase 2 of 2: makes the pipelines earlier runs recorded, at low priority; none on a first build)", p.jobs));
-    send(job, &p);
+    cmd.arg(step).args(&engine::warm_book_args(p.jobs)[1..]);
+    log(&job.tx, format!("> scarlett {step} --jobs {}  (phase 2 of 2: makes the pipelines ahead of time, at low priority)", p.jobs));
+    send(job, p);
     let mut tick = Instant::now();
-    let mut planned = None;
-    let out = run(cmd, job, None, |l| {
+    run(cmd, job, None, |l| {
         if let Some(t) = engine::parse_warm_plan(l) {
-            planned = Some(t);
+            *planned = Some(t);
             p.total = t;
             p.current = if t == 0 { "no recorded pipelines to make".into() } else { format!("{t} pipelines (the engine reports every 1,000)") };
             p.current_since = Instant::now();
@@ -443,22 +501,8 @@ fn world_split(job: &Job) -> Result<String, String> {
         p.overall = share + (1. - share) * if p.total == 0 { 0. } else { p.done as f32 / p.total as f32 };
         if !l.is_empty() || tick.elapsed() >= Duration::from_secs(1) {
             tick = Instant::now();
-            send(job, &p);
+            send(job, p);
         }
-    })?;
-    match out {
-        Outcome::Exit(Some(0)) => {}
-        // The 0.4.6 runtime's warm fails after "0 to make" when no run recorded pipelines (its
-        // pipelines folder is missing); nothing was left undone.
-        Outcome::Exit(_) if planned == Some(0) => {}
-        Outcome::Exit(c) => return Err(format!("scarlett warm failed (exit code {c:?}); see Logs")),
-        Outcome::Stopped | Outcome::Idle => return Err("Stopped. Press Build shaders again to resume.".into()),
-    }
-    let took = flow::duration(p.started.elapsed().as_secs());
-    Ok(if untranslated == 0 {
-        format!("Shaders built in {took}.")
-    } else {
-        format!("Shaders built in {took}; {untranslated} do not translate yet (see Logs).")
     })
 }
 
@@ -542,6 +586,18 @@ fn classic(job: &Job) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_is_kept_per_preset_cache() {
+        let d = std::env::temp_dir().join(format!("sp-state-{}", std::process::id()));
+        let path = d.join("build-world.json");
+        let stable = state_key("abc", Path::new("F:/c/scarlett"));
+        let exp = state_key("abc", Path::new("F:/c/scarlett-experimental"));
+        State { hash: stable.clone(), warm: true, ..Default::default() }.save(&path);
+        assert!(State::load(&path, &stable).warm);
+        assert!(!State::load(&path, &exp).warm, "another preset's cache is not built");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn state_resets_for_another_engine_build() {

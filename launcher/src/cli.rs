@@ -24,9 +24,16 @@ pub fn run(exe: &Path, args: &[String], env: &[(&'static str, String)]) -> Resul
     if out.status.success() {
         Ok(so)
     } else {
-        let msg = se.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+        let msg = error_line(&se);
         Err(if msg.is_empty() { format!("exit code {:?}", out.status.code()) } else { msg })
     }
+}
+
+/// The line of `stderr` that says what went wrong: the `error:` line when there is one (clap
+/// ends its message with a "For more information" hint), else the last non-empty line.
+pub fn error_line(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines.iter().find(|l| l.to_ascii_lowercase().starts_with("error")).or(lines.last()).copied().unwrap_or("").to_string()
 }
 
 /// True when an error says the subcommand does not exist in this build.
@@ -191,6 +198,24 @@ pub fn describe(exe: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_command_from_the_runtimes_real_output() {
+        // What the 0.4.8 runtime prints for `crashes list` (exit code 2).
+        let se = "error: unrecognized subcommand 'crashes'
+
+Usage: ScarlettPort-Runtime.exe <COMMAND>
+
+For more information, try '--help'.
+";
+        let e = super::error_line(se);
+        assert_eq!(e, "error: unrecognized subcommand 'crashes'");
+        assert!(super::unknown_command(&e));
+        assert_eq!(super::error_line("first
+last
+"), "last");
+        assert_eq!(super::error_line(""), "");
+    }
+
     use super::*;
 
     #[test]

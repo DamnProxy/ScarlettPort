@@ -82,6 +82,55 @@ pub const EXPERIMENTAL_OFF: [(&str, &str); 6] = [
     ("SCARLETT_EARLY_PIPELINES=0", "diagnostic only"),
 ];
 
+/// Switches the launcher can set that the bundled runtime (engine/ in this repository) does not
+/// read: they matter only to a local build that has them (Settings, Runtime). Kept exact by the
+/// `bundled_runtime_reads_every_other_switch` test, which reads the engine's sources.
+pub const NOT_IN_BUNDLED: [&str; 34] = [
+    // C1 and play.ps1's fixed settings (fx- builds)
+    "SCARLETT_PRECOMPILED_GRAPHICS",
+    "SCARLETT_READFIX",
+    "SCARLETT_COPY_BACK_ONLY_READBACK",
+    "SCARLETT_NARROW_ROOT",
+    "SCARLETT_NARROW_VIEWS",
+    "SCARLETT_NARROW_BVH",
+    "SCARLETT_PREP_BARRIERS",
+    "SCARLETT_PREP_TABLES",
+    "SCARLETT_PREP_REUSE",
+    "SCARLETT_OWN_UPSCALER",
+    "SCARLETT_NO_WATCHDOG",
+    "SCARLETT_SYNC_PRECISE",
+    "SCARLETT_READ_SETTLE_PRECISE",
+    // Look and Experimental
+    "SCARLETT_LOOK",
+    "SCARLETT_SHADER_FIXES",
+    "SCARLETT_INDIRECT_KEEP",
+    "SCARLETT_TABLED_SKIP_FRAMES",
+    // Custom
+    "SCARLETT_RAYTRACING",
+    "SCARLETT_FALLBACK_LIGHT",
+    "SCARLETT_PAD_PS",
+    "SCARLETT_DEBUG_PS",
+    "SCARLETT_SHOW_TARGET",
+    "SCARLETT_AUTO_INPUT",
+    // Settings, Features
+    "SCARLETT_TEXTURES",
+    "SCARLETT_HDR",
+    "SCARLETT_RUMBLE",
+    "SCARLETT_RUMBLE_STRENGTH",
+    "SCARLETT_KBM_HINTS",
+    "SCARLETT_PACE",
+    "SCARLETT_PACE_FPS",
+    "SCARLETT_UPSCALER",
+    "SCARLETT_UPSCALE_QUALITY",
+    "SCARLETT_UPSCALE_SHARPNESS",
+    "SCARLETT_FRAMEGEN",
+];
+
+/// True when `text` (a row's explanation) names a switch the bundled runtime does not read.
+pub fn names_unread_switch(text: &str) -> bool {
+    NOT_IN_BUNDLED.iter().any(|n| text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| w == *n))
+}
+
 pub fn label(preset: &str) -> &'static str {
     match preset {
         EXPERIMENTAL => "Experimental",
@@ -93,9 +142,9 @@ pub fn label(preset: &str) -> &'static str {
 
 pub fn blurb(preset: &str) -> &'static str {
     match preset {
-        EXPERIMENTAL => "C1 plus the safe fx-cand2 switches (indirect window and keep, tabled skip frames). Own cache.",
-        LOOK => "Stable plus the picture fixes (SCARLETT_LOOK) and the shader translation fixes (SCARLETT_SHADER_FIXES). Opt-in, not yet measured on the RTX 3060; the first run rebuilds shaders.",
-        CUSTOM => "Your World options from Settings (ray tracing, stand-in light, debug view).",
+        EXPERIMENTAL => "Stable plus the fx-cand2 switches (indirect keep, tabled skip frames) for a local fx build that has them; the bundled runtime ignores them. Own cache.",
+        LOOK => "Stable plus the picture fixes (SCARLETT_LOOK) and the shader translation fixes (SCARLETT_SHADER_FIXES) for a local build that has them; the bundled runtime ignores both. Not measured yet.",
+        CUSTOM => "Stable plus your World options from Settings, Game (console profile, ray tracing; stand-in light and debug view need a local build).",
         _ => "The engine's default setup: full picture (ambient and sky light, complete textures), threaded submissions, buffers kept on the card.",
     }
 }
@@ -205,6 +254,62 @@ mod tests {
         assert_eq!(e.len(), stable_env(Path::new("D:/dump"), Path::new("F:/c")).len() + LOOK_ON.len());
         assert_eq!(get(&e, "SCARLETT_LOOK").as_deref(), Some("1"));
         assert_eq!(get(&e, "SCARLETT_SHADER_FIXES").as_deref(), Some("1"));
+    }
+
+    /// Every `SCARLETT_*` name in the engine's Rust sources (the former spelling counts too).
+    fn engine_names() -> std::collections::HashSet<String> {
+        fn walk(d: &Path, out: &mut std::collections::HashSet<String>) {
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if p.file_name().is_some_and(|n| n != "target") {
+                        walk(&p, out);
+                    }
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let t = std::fs::read_to_string(&p).unwrap_or_default();
+                    for w in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                        for pre in ["SCARLETT_", concat!("VIC", "TORY_")] {
+                            if let Some(rest) = w.strip_prefix(pre) {
+                                out.insert(format!("SCARLETT_{rest}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = std::collections::HashSet::new();
+        walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("engine"), &mut out);
+        out
+    }
+
+    #[test]
+    fn bundled_runtime_reads_every_other_switch() {
+        let read = engine_names();
+        if read.is_empty() {
+            return; // the launcher was built outside the repository
+        }
+        let (g, c) = (Path::new("D:/dump"), Path::new("F:/c"));
+        let mut cfg = crate::Config::default();
+        (cfg.raytracing, cfg.debug_view, cfg.auto_menu) = (true, true, true);
+        let mut t = crate::tuning::Tuning { full_textures: true, hdr: true, pad_ps: true, rumble: false, frame_cap: 30, upscaler: "fsr".into(), ray_tracing: true, overlay: true, ..Default::default() };
+        t.kbm_hints = "off".into();
+        let mut set: Vec<&str> = Vec::new();
+        for e in [stable_env(g, c), look_env(g, c), experimental_env(g, c), crate::engine::world_env(&cfg, g, "F:/c"), t.env(true)] {
+            set.extend(e.iter().map(|(k, _)| *k));
+        }
+        t.rumble = true;
+        t.rumble_strength = 2.0;
+        set.extend(t.env(true).iter().map(|(k, _)| *k));
+        for k in set {
+            let listed = NOT_IN_BUNDLED.contains(&k);
+            assert_eq!(read.contains(k), !listed, "{k}: {}", if listed { "listed as unread, but the engine reads it" } else { "the engine does not read it; add it to NOT_IN_BUNDLED" });
+        }
+        for k in NOT_IN_BUNDLED {
+            assert!(!read.contains(k), "{k} is read by the engine now");
+        }
+        assert!(names_unread_switch("Ray tracing (SCARLETT_RAYTRACING)."));
+        assert!(!names_unread_switch("overlay (SCARLETT_PANEL)."));
+        assert!(!names_unread_switch("SCARLETT_PACE_FPSX"));
     }
 
     #[test]
