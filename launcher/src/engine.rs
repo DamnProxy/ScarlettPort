@@ -93,6 +93,7 @@ pub fn world_env(c: &Config, game: &Path, cache_dir: &str) -> Vec<(&'static str,
         ("VICTORY_PIPELINE_WAIT_MS", "0".to_string()),
         ("VICTORY_RAYTRACING", flag(c.raytracing)),
         ("VICTORY_FALLBACK_LIGHT", flag(c.fallback_light)),
+        ("VICTORY_PAD_PS", "1".to_string()),
     ]);
     if PRECOMPILED_GRAPHICS {
         v.push(("VICTORY_PRECOMPILED_GRAPHICS", "1".to_string()));

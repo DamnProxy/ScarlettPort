@@ -27,12 +27,14 @@ pub const C1: [&str; 9] = [
 ];
 
 /// fx-cand4 additions to Stable: sub-page memory, copies without the extra query, and a 4 GB
-/// card-buffer pool. Lazy remapping (`VICTORY_REMAP_LAZY`) is left out: a moving A/B showed it
+/// card-buffer pool, and PlayStation pads read natively over USB (`VICTORY_PAD_PS`). `VICTORY_FRIENDLY`
+/// (play.ps1) is left out: the vendored runtime does not have it yet. Lazy remapping (`VICTORY_REMAP_LAZY`) is left out: a moving A/B showed it
 /// now slows the world down. Fast boot stays optional (not set here).
-pub const CAND4: [(&str, &str); 3] = [
+pub const CAND4: [(&str, &str); 4] = [
     ("VICTORY_MEM_SUBPAGE", "1"),
     ("VICTORY_COPY_NOQUERY", "1"),
     ("VICTORY_CARD_BUFFERS_MB", "4096"),
+    ("VICTORY_PAD_PS", "1"),
 ];
 
 /// Variables play.ps1 clears before a plain run (so nothing left in the launcher's own
@@ -74,7 +76,7 @@ pub fn blurb(preset: &str) -> &'static str {
     match preset {
         EXPERIMENTAL => "C1 plus the safe fx-cand2 switches (indirect window and keep, tabled skip frames). Own cache.",
         CUSTOM => "Your World options from Settings (ray tracing, stand-in light, debug view).",
-        _ => "The verified fx-cand4 setup: precise syncs, the speed switches, lazy remap, sub-page memory, copy cuts.",
+        _ => "The verified fx-cand4 setup: precise syncs, the speed switches, sub-page memory, copy cuts, PlayStation pads.",
     }
 }
 
@@ -133,7 +135,8 @@ mod tests {
     #[test]
     fn stable_matches_play_ps1() {
         let e = stable_env(Path::new("D:/dump"), Path::new("F:/c"));
-        assert_eq!(e.len(), 10 + 9 + 3);
+        assert_eq!(e.len(), 10 + 9 + 4);
+        assert!(get(&e, "VICTORY_REMAP_LAZY").is_none());
         for (k, v) in [
             ("VICTORY_SAVE_SLOT", "default"),
             ("VICTORY_OWN_UPSCALER", "1"),

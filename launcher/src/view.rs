@@ -273,6 +273,11 @@ impl Launcher {
             self.start(RunKind::Pipelines);
         }
         let _ = (PLAYABLE_PERCENT, time);
+        let pads = crate::controller::detected();
+        let (meta, status) = crate::controller::line(&pads);
+        let color = if status == "None" { None } else { Some(SUCCESS) };
+        section_row(ui, row(52.), "row-pad", Icon::Play, "Controller", &meta, Status { text: status, color }, false);
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(2));
         self.preset_row(ui, row(52.));
         let (status, color) = match self.fps {
             Some(f) => (format!("{f:.1} fps"), Some(SUCCESS)),
@@ -683,6 +688,9 @@ impl Launcher {
 
         caption(&p, pos2(c.min.x, c.min.y), Align2::LEFT_TOP, "Game folder");
         p.text(pos2(c.min.x, c.min.y + 20.), Align2::LEFT_TOP, format!("The folder that contains {GAME_EXE}. It is used read-only."), font(12.5, "regular"), TEXT_MUTED);
+        let c = c.translate(vec2(0., 20.));
+        let ssd = "Keep it on an internal NVMe or SSD: a USB or hard drive makes loads much longer and the world stutter.";
+        p.text(pos2(c.min.x, c.min.y + 20.), Align2::LEFT_TOP, fit(ui, ssd, font(12.5, "semibold"), c.width()), font(12.5, "semibold"), WARNING);
         let field = Rect::from_min_size(pos2(c.min.x, c.min.y + 46.), vec2(c.width(), 44.));
         text_field(ui, field, "game-edit", &mut self.game_edit, "Folder", Some(Icon::Folder), !self.folder_busy);
         let by = field.max.y + 10.;

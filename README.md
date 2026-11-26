@@ -122,6 +122,9 @@ Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about
 | Frame generation | 📋 planned | only once the base frame rate is high enough for it to make sense |
 | Save safety | 🧪 in testing | protects your save folder from being overwritten by test runs |
 | One-command benchmark queue | 🧪 in testing | queues A/B runs of switch sets and collects the frame-time logs in one command |
+| Launcher: Controller line | 🧪 in testing | the Play page shows a connected Xbox pad or PlayStation pad (DualShock 4, DualSense, Edge); PlayStation pads are read natively over USB (`VICTORY_PAD_PS`) |
+| Launcher: Prepare shaders | 🧪 in testing | after the shader translation, `victory precompile-graphics` makes the graphics pipelines at low priority, with progress and Stop/resume, so moving in the world does not stutter on first use |
+| Launcher: drive note | 🧪 in testing | Settings says to keep the game folder on an internal NVMe/SSD for load times |
 
 ---
 
@@ -242,6 +245,9 @@ Every task is sized for **one person + one AI coding agent**. Pick one, comment 
 
 - [ ] **#7 Hardware reports.** Run it on your GPU and post results (GPU, driver, fps, how far it got).
 - [x] **#8 One-click launcher** for the VIctory-based runtime (done: it is the launcher's default engine).
+- [x] **Launcher 0.4.1.** Done: Controller line on the Play page, the Prepare shaders step, the NVMe/SSD note, and the Stable preset matched to the measured best (native PlayStation pads, no lazy remap).
+- [ ] **Controller hot-plug report.** Try the Controller line with wireless (Bluetooth) PlayStation pads and other Xbox-compatible pads, and report what it shows. `launcher/src/controller.rs`.
+- [ ] **Bring `VICTORY_FRIENDLY` to the vendored runtime.** The measured setup uses it; sync it from the fork and add it to the Stable preset. `launcher/src/presets.rs`.
 
 ---
 

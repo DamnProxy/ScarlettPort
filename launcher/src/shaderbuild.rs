@@ -261,7 +261,7 @@ fn world(job: &Job) -> Result<String, String> {
     }
     if phases == 2 {
         p.phase = 2;
-        p.name = "Building graphics pipelines";
+        p.name = "Preparing shaders";
         p.total = st.total.unwrap_or(engine::GRAPHICS_TOTAL);
         p.jobs = engine::jobs(cores(), free_mb(), 1024);
         let idle = job.slow_secs.map(Duration::from_secs);
@@ -270,7 +270,7 @@ fn world(job: &Job) -> Result<String, String> {
             let mut cmd = Command::new(&job.exe);
             base(&mut cmd);
             cmd.args(engine::graphics_args(&job.game, p.jobs, skip, engine::CHUNK));
-            log(&job.tx, format!("> victory.exe precompile-graphics --jobs {} --skip {skip} --limit {}  (phase 2 of 2)", p.jobs, engine::CHUNK));
+            log(&job.tx, format!("> victory.exe precompile-graphics --jobs {} --skip {skip} --limit {}  (phase 2 of 2, prepare shaders: makes the graphics pipelines now, at low priority, so moving in the world does not stutter on first use; Stop resumes later)", p.jobs, engine::CHUNK));
             p.current = format!("pipeline records {}–{}", skip + 1, skip + engine::CHUNK);
             p.current_since = Instant::now();
             p.done = skip;

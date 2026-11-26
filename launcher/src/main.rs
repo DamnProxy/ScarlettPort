@@ -18,6 +18,7 @@ mod discord;
 mod report;
 mod saves;
 mod update;
+mod controller;
 mod shaderbuild;
 mod theme;
 mod view;
