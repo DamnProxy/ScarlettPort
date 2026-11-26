@@ -563,23 +563,47 @@ impl Launcher {
         let folders = [(self.config.game_path.as_str(), "<game>"), (self.config.cache_dir.as_str(), "<cache>")];
         let engine = if self.world_selected() { format!("World engine (ScarlettPort runtime), {}", self.world_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) } else { format!("Classic engine (XCL), {}", self.runtime_hash.as_deref().map(|h| &h[..12]).unwrap_or("?")) };
         let build = self.build.as_ref().map(|b| format!("\nLast shader build: {} in {}", b.name, flow::duration(b.started.elapsed().as_secs()))).unwrap_or_default();
-        let fields: Vec<(&str, String)> = vec![
+        // Every field is scrubbed (fps lines can hold paths too), the log as well.
+        let mut fields: Vec<(&str, String)> = vec![
             ("gpu", sys.gpu.clone()),
             ("driver", sys.driver.clone()),
             ("system", format!("{}; {} GB RAM; {}", sys.cpu, sys.ram_gb, sys.os)),
-            ("runtime", format!("Launcher v{VERSION}; {engine}{build}")),
+            ("runtime", format!("Launcher v{VERSION}; {engine}{build}; {} preset", presets::label(&self.config.preset))),
             ("fps", report::fps_summary(&lines)),
-            ("notes", report::scrub(&format!("Last {} log lines:\n`\n{tail}\n`", tail.lines().count()), &folders)),
         ];
+        for f in &mut fields {
+            f.1 = report::scrub(&f.1, &folders);
+        }
+        // The crash the last run left, and the newest entries of the crash list.
+        let mut head = String::new();
+        if let Some(r) = self.crash_report.as_ref().and_then(|r| r.file_name()) {
+            head += &format!("The last run crashed: {}\n", r.to_string_lossy());
+        }
+        if let Some(Ok(v)) = &self.crashes {
+            head += "Crashes:\n";
+            v.iter().rev().take(5).for_each(|l| head += &format!("  {l}\n"));
+        }
+        if !head.is_empty() {
+            head.push('\n');
+        }
+        let head = report::scrub(&head, &folders);
+        let scrubbed: Vec<String> = lines[lines.len().saturating_sub(200)..].iter().map(|l| report::scrub(l, &folders)).collect();
+        let full = report::scrub(&format!("{head}Last {} log lines:\n```\n{tail}\n```", tail.lines().count()), &folders);
+        // As many of the newest log lines as fit the URL; the rest is never silently lost.
+        let notes = report::notes_that_fit(&fields, &head, &scrubbed);
+        let trimmed = !notes.contains(&format!("Last {} log lines", scrubbed.len()));
+        fields.push(("notes", notes));
         let url = report::issue_url(&fields);
-        if url.len() <= report::MAX_URL {
-            ctx.open_url(egui::OpenUrl::new_tab(&url));
+        ctx.open_url(egui::OpenUrl::new_tab(&url));
+        if !trimmed {
             self.report_note = "Opened a prefilled hardware report in your browser. Check it, add how far the game got, then submit.".into();
         } else {
-            ctx.copy_text(report::as_text(&fields));
-            let short: Vec<(&str, String)> = fields[..5].to_vec();
-            ctx.open_url(egui::OpenUrl::new_tab(report::issue_url(&short)));
-            self.report_note = "The report is too long for a link: the full text (with the log) is on your clipboard. Paste it into the Notes field of the issue that opened.".into();
+            let mut all = fields.clone();
+            if let Some(n) = all.last_mut() {
+                n.1 = full;
+            }
+            ctx.copy_text(report::as_text(&all));
+            self.report_note = "Opened a prefilled hardware report with the newest log lines; the full log is on your clipboard to paste if needed.".into();
         }
         self.log(self.report_note.clone(), LogKind::Info);
     }

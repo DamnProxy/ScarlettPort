@@ -156,6 +156,31 @@ pub fn issue_url(fields: &[(&str, String)]) -> String {
     url
 }
 
+/// The `notes` field with as many of the newest `lines` as keep the issue URL (with `fields`)
+/// within `MAX_URL`; `head` (e.g. the crash list) always comes first. Both are scrubbed by the caller.
+pub fn notes_that_fit(fields: &[(&str, String)], head: &str, lines: &[String]) -> String {
+    let notes = |n: usize| {
+        let tail = lines[lines.len() - n..].join("
+");
+        format!("{head}Last {n} log lines:
+```
+{tail}
+```")
+    };
+    let fits = |n: usize| {
+        let mut all = fields.to_vec();
+        all.push(("notes", notes(n)));
+        issue_url(&all).len() <= MAX_URL
+    };
+    // The URL grows with n: the largest n that fits, by bisection.
+    let (mut lo, mut hi) = (0, lines.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) { lo = mid } else { hi = mid - 1 }
+    }
+    notes(lo)
+}
+
 /// The whole report as plain text (for the clipboard when it is too long for a URL).
 pub fn as_text(fields: &[(&str, String)]) -> String {
     fields.iter().map(|(k, v)| format!("### {k}\n\n{v}\n")).collect::<Vec<_>>().join("\n")
@@ -192,5 +217,23 @@ mod tests {
         let logs = vec!["D3D12.X: 600 frames presented, 4.0 fps over the last 300".to_string(), "frame p99 410 ms".into(), "x".into()];
         let s = fps_summary(&logs);
         assert!(s.contains("average 4.0") && s.contains("p99"));
+    }
+
+    #[test]
+    fn notes_keep_the_newest_lines_within_the_url_limit() {
+        let fields = vec![("gpu", "RTX 3060".to_string())];
+        let lines: Vec<String> = (0..400).map(|i| format!("log line {i} with some text to make it long enough")).collect();
+        let notes = notes_that_fit(&fields, "Crashes:
+  crash-1.zip
+
+", &lines);
+        let mut all = fields.clone();
+        all.push(("notes", notes.clone()));
+        assert!(issue_url(&all).len() <= MAX_URL);
+        assert!(notes.starts_with("Crashes:"));
+        assert!(notes.contains("log line 399"), "the newest line is kept");
+        assert!(!notes.contains("log line 0 "), "the oldest lines are dropped");
+        let short = notes_that_fit(&fields, "", &lines[..3]);
+        assert!(short.contains("Last 3 log lines"));
     }
 }
