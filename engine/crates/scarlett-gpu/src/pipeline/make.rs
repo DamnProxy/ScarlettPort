@@ -48,6 +48,8 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// Left out while ray tracing is off (`ray_tracing`, live).
+    ray_pass: Option<&'static str>,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -107,6 +109,11 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    /// Left out for good, or a ray tracing pass while ray tracing is off.
+    fn skipped(&self) -> bool {
+        self.left_out.is_some() || (self.ray_pass.is_some() && super::ray_tracing::off_now())
+    }
+
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
@@ -119,10 +126,12 @@ impl Pending {
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders);
+        let ray_pass = super::ray_tracing::omission(&shaders);
         Pending {
             screen,
             scene_input,
             left_out,
+            ray_pass,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -221,7 +230,7 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.left_out.is_some() {
+    if p.skipped() {
         return None;
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
@@ -239,7 +248,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    if p.left_out.is_some() {
+    if p.skipped() {
         return false;
     }
     p.make();
@@ -250,7 +259,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// run drew with it (during loading, so the world's first frames find it),
 /// or if it is a confirmed opening-scene / bake producer.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if p.left_out.is_some() {
+    if p.skipped() {
         return;
     }
     if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {

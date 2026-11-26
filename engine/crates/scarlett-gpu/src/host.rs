@@ -7949,6 +7949,23 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("SCARLETT_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
+/// `SCARLETT_FILLS_HERE=1` (off by default; live with `SCARLETT_AB`): a
+/// submission's fills of upload memory are copied on the submitting thread,
+/// in order, never handed to the `scarlett-wide` threads. The bytes and the
+/// point where they are done are the same as with the threads (before the
+/// next step that writes title memory and before the submission goes on),
+/// so the picture is the same; only who copies them changes. The frame
+/// timeline showed the submitting thread blocked in its deferred steps for
+/// most of the frame with 3 ms of its own work (`cli\cfbase-frame.md`).
+fn fills_here() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("SCARLETT_FILLS_HERE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("SCARLETT_FILLS_HERE"))
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -8175,7 +8192,7 @@ impl Batch {
             return;
         }
         let started = std::time::Instant::now();
-        if self.fills.len() < FEW {
+        if self.fills.len() < FEW || fills_here() {
             for (dst, src, len) in self.fills.drain(..) {
                 copy_mapped(dst as *mut u8, src as *const u8, len, false);
             }

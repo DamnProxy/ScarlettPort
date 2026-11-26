@@ -101,6 +101,8 @@ mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
+mod bench_tests;
+#[cfg(all(test, windows))]
 mod probe_tests;
 #[cfg(all(test, windows))]
 mod size_tests;
@@ -214,13 +216,27 @@ pub fn builder_bounds() -> bool {
 ///   32 a first-lane read of two host waves without the round that asks
 ///   which half has a lane (where every lane has one).
 ///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   (not on unless asked: `127` is every pass with it), 128 one guard
+///   select for a run of guarded writes (not on unless asked).
 ///
 /// Part of the translation: the shader cache keys on it (`scarlett-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("SCARLETT_SHADER_OPT").ok().as_deref()))
+    *PASSES.get_or_init(|| {
+        let mut passes = parse_shader_opt(std::env::var("SCARLETT_SHADER_OPT").ok().as_deref());
+        // `SCARLETT_GUARD_SINK=1`: one guard select per run of guarded writes
+        // (`bitcode::opt::GUARDS`); `SCARLETT_LOADS_WIDE=1`: a console load's
+        // dwords four to a call (`bitcode::opt::WIDE`). Both on by default since
+        // 0.5.0 (REL050-ON), `=0` turns one off; both change the passes, which
+        // the shader cache keys on.
+        for (name, bit) in [("SCARLETT_GUARD_SINK", bitcode::opt::GUARDS), ("SCARLETT_LOADS_WIDE", bitcode::opt::WIDE)] {
+            if std::env::var_os(name).is_none_or(|v| v != "0") {
+                passes |= bit;
+            }
+        }
+        passes
+    })
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -1183,7 +1199,8 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("127")), all & !super::bitcode::opt::GUARDS);
+        assert_eq!(parse_shader_opt(Some("255")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }

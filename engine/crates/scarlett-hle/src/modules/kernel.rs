@@ -445,6 +445,9 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
+            // Only for the wait log's shims (`SCARLETT_WAIT_LOG`); with none
+            // bound these are the host's, as before.
+            "api-ms-win-core-synch-*",
         ],
         exports: vec![
             hle_export!(__p___argc),
@@ -469,8 +472,19 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
-        ],
+        ]
+        .into_iter()
+        .chain(wait_log_exports())
+        .collect(),
     }
+}
+
+/// The wait log's shims, if it is asked for.
+fn wait_log_exports() -> Vec<crate::HleExport> {
+    #[cfg(windows)]
+    return super::waitlog::exports();
+    #[cfg(not(windows))]
+    Vec::new()
 }
 
 /// The return addresses above the caller, as `module+rva`, for logs.

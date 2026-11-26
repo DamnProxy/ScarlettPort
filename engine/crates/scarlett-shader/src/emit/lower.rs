@@ -1128,6 +1128,14 @@ pub fn host_settings() -> [u32; 4] {
     [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
 }
 
+/// The spin-wait cut of fx-shaderperf (`SCARLETT_SPIN_LIMIT`) is not taken on
+/// this branch (approximate: a wait cut short reads tiles before they are
+/// written); loops keep the 4,096 turns. Kept as a stub so `Lower::is_spin`'s
+/// caller stays as picked, and the cache key keeps its four values.
+pub fn spin_limit() -> Option<u32> {
+    None
+}
+
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tells the translator that the host's shaders run on AMD RDNA hardware
@@ -12428,7 +12436,7 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
+                let ok = self.count_iteration(t, b, pred::IULT);
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
@@ -12466,10 +12474,10 @@ impl<'a> Lower<'a> {
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
                 let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
+                    let ok = self.count_iteration(taken, b, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
+                    let stop = self.count_iteration(not_taken, b, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
@@ -12518,7 +12526,7 @@ impl<'a> Lower<'a> {
     /// A back edge to header `to` (a back edge keeps its block, no
     /// critical-edge block): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
+    fn count_iteration(&mut self, to: usize, latch: usize, p: u8) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
@@ -12539,7 +12547,10 @@ impl<'a> Lower<'a> {
         let limit = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
+            LOOP_LIMIT => match spin_limit() {
+                Some(n) if self.is_spin(to, latch) => n,
+                _ => 1 << 12,
+            },
             named => named,
         };
         let limit = self.s.m.i32(limit);
@@ -12551,6 +12562,38 @@ impl<'a> Lower<'a> {
         let over = self.s.m.cmp(c, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
         over
+    }
+
+    /// Whether the loop of header `to` closed in IR block `latch` only waits
+    /// for memory ([`spin_limit`]): its blocks (header to latch in reverse
+    /// postorder) hold at most 48 instructions, a coherent (`glc` or `dlc`)
+    /// buffer, global or scalar load, and no store, atomic, export or LDS
+    /// write.
+    fn is_spin(&self, to: usize, latch: usize) -> bool {
+        let (lo, hi) = (self.rpo[to], self.rpo[latch]);
+        if lo > hi {
+            return false;
+        }
+        let blocks = (0..self.x.p.blocks.len()).filter(|&b| self.rpo[b] >= lo && self.rpo[b] <= hi);
+        let (mut n, mut coherent) = (0, false);
+        for b in blocks {
+            for inst in &self.x.p.blocks[b].insts {
+                n += 1;
+                let name = inst.name();
+                let writes = name.contains("_store") || name.contains("_atomic") || name.starts_with("ds_write") || name.starts_with("ds_add") || name.contains("exp");
+                if writes || n > 48 {
+                    return false;
+                }
+                let cache = match &inst.fields {
+                    Fields::Buffer { cache, .. } | Fields::Flat { cache, .. } | Fields::Smem { cache, .. } => Some(*cache),
+                    _ => None,
+                };
+                if cache.is_some_and(|c| c.glc || c.dlc) && name.contains("load") {
+                    coherent = true;
+                }
+            }
+        }
+        coherent
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

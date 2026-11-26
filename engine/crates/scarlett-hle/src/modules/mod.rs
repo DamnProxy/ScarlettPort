@@ -26,6 +26,8 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
+#[cfg(windows)]
+pub mod prefetch;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
@@ -37,6 +39,8 @@ pub mod xgamesave;
 pub mod xgameui;
 #[cfg(windows)]
 pub mod xmem;
+#[cfg(windows)]
+pub(crate) mod waitlog;
 pub mod xnetworking;
 pub mod xpackage;
 pub mod xstore;

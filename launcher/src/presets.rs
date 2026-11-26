@@ -15,7 +15,7 @@ pub const ALL: [&str; 4] = [STABLE, LOOK, EXPERIMENTAL, CUSTOM];
 pub const LOOK_ON: [(&str, &str); 2] = [("SCARLETT_LOOK", "1"), ("SCARLETT_SHADER_FIXES", "1")];
 
 /// The runtime build the bundled runtime folder is made from (see the repository's runtime/).
-pub const BUNDLED_BUILD: &str = "v0.4.7 runtime";
+pub const BUNDLED_BUILD: &str = "v0.5.0 runtime";
 /// The build the Experimental switches were merged into (fx-cand2); older builds ignore them.
 pub const EXPERIMENTAL_BUILD: &str = "fx-cand2";
 
@@ -70,7 +70,26 @@ pub const CLEARED: [&str; 8] = [
 
 /// fx-cand2 switches Experimental adds to C1: the GPU step of the A/B plan (C1 is GPU-bound)
 /// and the world-entry crash guard (2 clean runs against 3 crashes upstream).
-pub const EXPERIMENTAL_ON: [(&str, &str); 3] = [("SCARLETT_INDIRECT_WINDOW", "1"), ("SCARLETT_INDIRECT_KEEP", "1"), ("SCARLETT_TABLED_SKIP_FRAMES", "2")];
+pub const EXPERIMENTAL_ON: [(&str, &str); 6] = [
+    ("SCARLETT_INDIRECT_WINDOW", "1"),
+    ("SCARLETT_INDIRECT_KEEP", "1"),
+    ("SCARLETT_TABLED_SKIP_FRAMES", "2"),
+    // 0.5.0 load work: booted cleanly in the REL050-ON run, but its load-time gain is inside the
+    // boot-to-boot spread (199-404 s), so it stays opt-in.
+    ("SCARLETT_LOAD_UNPACED", "1"),
+    ("SCARLETT_PREFETCH", "1"),
+    ("SCARLETT_PIPELINE_BOOK", "1"),
+];
+
+/// 0.5.0 switches the engine turns on by default (measured on the RTX 3060 in REL050-ON: world
+/// at 178 s against 244 s, the upscaler's slowest pass 0.1-0.3 ms/frame against 55-71 ms, picture
+/// kept). Stable sets them explicitly so an older local build behaves the same.
+pub const STABLE_050: [(&str, &str); 4] = [
+    ("SCARLETT_SAVE_NO_WAIT", "1"),
+    ("SCARLETT_CARD_BIG_ROOM", "1"),
+    ("SCARLETT_GUARD_SINK", "1"),
+    ("SCARLETT_LOADS_WIDE", "1"),
+];
 
 /// fx-cand2 switches left out of Experimental, and why.
 pub const EXPERIMENTAL_OFF: [(&str, &str); 6] = [
@@ -85,7 +104,7 @@ pub const EXPERIMENTAL_OFF: [(&str, &str); 6] = [
 /// Switches the launcher can set that the bundled runtime (engine/ in this repository) does not
 /// read: they matter only to a local build that has them (Settings, Runtime). Kept exact by the
 /// `bundled_runtime_reads_every_other_switch` test, which reads the engine's sources.
-pub const NOT_IN_BUNDLED: [&str; 34] = [
+pub const NOT_IN_BUNDLED: [&str; 33] = [
     // C1 and play.ps1's fixed settings (fx- builds)
     "SCARLETT_PRECOMPILED_GRAPHICS",
     "SCARLETT_READFIX",
@@ -120,7 +139,6 @@ pub const NOT_IN_BUNDLED: [&str; 34] = [
     "SCARLETT_KBM_HINTS",
     "SCARLETT_PACE",
     "SCARLETT_PACE_FPS",
-    "SCARLETT_UPSCALER",
     "SCARLETT_UPSCALE_QUALITY",
     "SCARLETT_UPSCALE_SHARPNESS",
     "SCARLETT_FRAMEGEN",
@@ -142,10 +160,10 @@ pub fn label(preset: &str) -> &'static str {
 
 pub fn blurb(preset: &str) -> &'static str {
     match preset {
-        EXPERIMENTAL => "Stable plus the fx-cand2 switches (indirect keep, tabled skip frames) for a local fx build that has them; the bundled runtime ignores them. Own cache.",
+        EXPERIMENTAL => "Stable plus unproven switches: loading frames without the frame wait (SCARLETT_LOAD_UNPACED), boot read-ahead (SCARLETT_PREFETCH), pipeline list recording (SCARLETT_PIPELINE_BOOK), and the fx-cand2 indirect keep and tabled skip frames for a local fx build. Booted cleanly, load gain not proven. Own cache.",
         LOOK => "Stable plus the picture fixes (SCARLETT_LOOK) and the shader translation fixes (SCARLETT_SHADER_FIXES) for a local build that has them; the bundled runtime ignores both. Not measured yet.",
         CUSTOM => "Stable plus your World options from Settings, Game (console profile, ray tracing; stand-in light and debug view need a local build).",
-        _ => "The engine's default setup: full picture (ambient and sky light, complete textures), threaded submissions, buffers kept on the card.",
+        _ => "The engine's default setup: full picture (ambient and sky light, complete textures), threaded submissions, buffers kept on the card, the upscaler's network in card memory, no save-folder retry wait.",
     }
 }
 
@@ -165,6 +183,7 @@ pub fn stable_env(game: &Path, scarlett_cache: &Path) -> Vec<(&'static str, Stri
     ];
     v.extend(C1.iter().map(|k| (*k, "1".to_string())));
     v.extend(CAND4.iter().map(|(k, x)| (*k, x.to_string())));
+    v.extend(STABLE_050.iter().map(|(k, x)| (*k, x.to_string())));
     v
 }
 
@@ -209,7 +228,7 @@ mod tests {
     #[test]
     fn stable_matches_play_ps1() {
         let e = stable_env(Path::new("D:/dump"), Path::new("F:/c"));
-        assert_eq!(e.len(), 9 + C1.len() + CAND4.len());
+        assert_eq!(e.len(), 9 + C1.len() + CAND4.len() + STABLE_050.len());
         assert!(get(&e, "SCARLETT_SAVE_SLOT").is_none());
         assert!(get(&e, "SCARLETT_REMAP_LAZY").is_none());
         for (k, v) in [
@@ -226,9 +245,10 @@ mod tests {
         for k in C1 {
             assert_eq!(get(&e, k).as_deref(), Some("1"), "{k}");
         }
-        for (k, v) in CAND4 {
-            assert_eq!(get(&e, k).as_deref(), Some(v), "{k}");
+        for (k, v) in CAND4.iter().chain(STABLE_050.iter()) {
+            assert_eq!(get(&e, k).as_deref(), Some(*v), "{k}");
         }
+        assert!(get(&e, "SCARLETT_LOAD_UNPACED").is_none());
         assert!(get(&e, "SCARLETT_FAST_BOOT").is_none());
         assert!(get(&e, "SCARLETT_LOOK").is_none());
         assert!(get(&e, "SCARLETT_SHADER_FIXES").is_none());

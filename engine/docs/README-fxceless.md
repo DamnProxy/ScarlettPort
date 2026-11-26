@@ -310,6 +310,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 |----------|--------|
 | `SCARLETT_LOG=<target>=debug,...` | debug and trace output |
 | `SCARLETT_STACKS=20,60` | every thread's stack at those seconds |
+| `SCARLETT_WAIT_LOG=<ms>` | every 5 s, the title's call sites that stood blocked that long in `Sleep`/`WaitFor*` (threads, waits, the longest, callers), with blocked connections, delayed callbacks and save leftovers not removed; `1` is 100 |
+| `SCARLETT_SAVE_NO_WAIT=1` | an old save version's folder is removed file by file where `remove_dir_all` fails, once, without the two seconds of retries (not a debugging switch: works in a plain build) |
 | `SCARLETT_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `SCARLETT_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `SCARLETT_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |

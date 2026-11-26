@@ -375,6 +375,41 @@ fn card_all() -> bool {
     *ON.get_or_init(|| std::env::var_os("SCARLETT_CARD_ALL").is_some_and(|v| v == "1"))
 }
 
+/// Buffers of this size or more may use [`card_big_room`].
+const BIG_COPY: u64 = 16 << 20;
+
+/// Card copies made with [`card_big_room`] past [`card_limits`]' cap.
+static BIG_PAST_CAP: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of card copies beyond [`card_limits`]' second number that only
+/// title buffers of 16 MiB or more may take (`SCARLETT_CARD_BIG_ROOM=<MB>`,
+/// or `SCARLETT_CARD_BIG_ROOM`; `1` means 256 MB; 256 MB by default, `0` off).
+///
+/// Copies are made first come, first served. With small copies allowed
+/// (`SCARLETT_CARD_BUFFERS_MIN_KB=64`) the 891 copies of the world load took
+/// the 512 MB before the upscaler's buffers were made (frame 4147), and its
+/// 24 MB tensor at 0xaee5f0000 stayed in the PC's memory: its three 3x3
+/// convolutions read it over the bus, 31-41 ms each against 0.2-0.9 ms in
+/// the card's memory (shader-heavy9.md). A copy made through this room is
+/// an ordinary card copy (CPU side, sends, the compare and fetch of what
+/// shaders wrote), and the budget rule (four fifths of the card) still holds.
+fn card_big_room() -> u64 {
+    static ROOM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ROOM.get_or_init(|| {
+        let v = std::env::var("SCARLETT_CARD_BIG_ROOM").or_else(|_| std::env::var("SCARLETT_CARD_BIG_ROOM")).ok();
+        let mb = match v.as_deref().map(str::trim) {
+            // On (256 MB) by default since 0.5.0 (REL050-ON); `=0` turns it off.
+            Some("0") => 0,
+            None | Some("" | "1") => 256,
+            Some(s) => s.parse::<u64>().unwrap_or(0),
+        };
+        if mb > 0 {
+            tracing::info!(big_room_mb = mb, least_mb = BIG_COPY >> 20, "room for big card copies past the cap");
+        }
+        mb << 20
+    })
+}
+
 /// [`card_for`] in the card's own memory.
 fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() {
@@ -422,9 +457,41 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+    let big_room = card_big_room();
+    let most_here = if big_room > 0 && size >= BIG_COPY { most + big_room } else { most };
+    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most_here {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        // Said: this refusal used to be silent, and it is what kept the
+        // upscaler's 24 MB tensor (0xaee5f0000 in CFBASE-PROF) in the PC's
+        // memory once 891 small copies (CARD_BUFFERS_MIN_KB=64) had taken
+        // the 512 MB.
+        let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 64 || n.is_multiple_of(32) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the copies made hold {} MB of at most {} MB (big copies' room {} MB, \
+                 SCARLETT_CARD_BIG_ROOM); {} buffers turned down so far, frame {}",
+                size >> 10,
+                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                most_here >> 20,
+                big_room >> 20,
+                n,
+                crate::frame::current()
+            );
+        }
         return None;
+    }
+    if most_here > most && CARD_BYTES[0].load(Ordering::Relaxed) > most {
+        BIG_PAST_CAP.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            "card copy of a big title buffer made past the copies' cap (SCARLETT_CARD_BIG_ROOM): {} KiB ({} MB), \
+             copies now {} MB of {} MB + {} MB for big ones, frame {}",
+            size >> 10,
+            size >> 20,
+            CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+            most >> 20,
+            big_room >> 20,
+            crate::frame::current()
+        );
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {

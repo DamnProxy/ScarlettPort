@@ -617,6 +617,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
 
 /// A root argument for [`Host::draw`].
 #[cfg(test)]
+#[derive(Clone)]
 pub enum Root {
     Constants(Vec<u32>),
     /// A table starting at this heap index.
@@ -1040,6 +1041,14 @@ pub struct Dispatch<'a> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// How many times [`Host::dispatch`] records its dispatch (timing tests).
+    pub static DISPATCH_REPEAT: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+    /// Whether [`Host::dispatch`] puts raw UAVs in system memory (timing tests).
+    pub static RAW_UAV_IN_SYSTEM_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
 impl Host {
     /// Runs a compute pipeline and returns each UAV's contents in heap
     /// order (texels as float bits, row by row).
@@ -1261,11 +1270,31 @@ impl Host {
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
-                        let b = make(
-                            D3D12_HEAP_TYPE_DEFAULT,
-                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
-                        )?;
+                        let b = if RAW_UAV_IN_SYSTEM_MEMORY.get() && matches!(*v, View::RawUav(_)) {
+                            // (timing tests: a buffer the card reads over the bus)
+                            let mut r: Option<ID3D12Resource> = None;
+                            dev.CreateCommittedResource(
+                                &D3D12_HEAP_PROPERTIES {
+                                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                                    ..Default::default()
+                                },
+                                D3D12_HEAP_FLAG_NONE,
+                                &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                D3D12_RESOURCE_STATE_COMMON,
+                                None,
+                                &mut r,
+                            )
+                            .map_err(err)?;
+                            r.ok_or_else(|| "no resource".to_string())?
+                        } else {
+                            make(
+                                D3D12_HEAP_TYPE_DEFAULT,
+                                &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                D3D12_RESOURCE_STATE_COMMON,
+                            )?
+                        };
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
                             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -1455,7 +1484,17 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            // (`DISPATCH_REPEAT`: timing tests run the dispatch again, a
+            // UAV barrier between each)
+            for n in 0..DISPATCH_REPEAT.get().max(1) {
+                if n > 0 {
+                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        ..Default::default()
+                    }]);
+                }
+                list.Dispatch(x, y, z);
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(

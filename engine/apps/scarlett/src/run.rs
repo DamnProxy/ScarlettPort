@@ -90,12 +90,22 @@ pub fn run(
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let title = scarlett_hle::runtime::Title::from_manifest(&manifest);
     let slot = scarlett_core::saves::slot_from_env()?;
-    let rel = scarlett_core::saves::storage(Path::new(&format!("{:08X}", title.id)), slot.as_deref())?;
+    let title_rel = format!("{:08X}", title.id);
+    // Slot `default` is the pre-slot place while that holds the saves and no
+    // `slots/default` exists (so an accepted profile stays accepted).
+    let pre_slot =
+        scarlett_core::saves::default_is_pre_slot(&cfg.data_subdir(&title_rel)?, slot.as_deref());
+    let rel = if pre_slot {
+        Path::new(&title_rel).join("storage")
+    } else {
+        scarlett_core::saves::storage(Path::new(&title_rel), slot.as_deref())?
+    };
     let storage = cfg.data_subdir(&rel.to_string_lossy().replace('\\', "/"))?;
     println!(
-        "title          {:08X}, save slot {}, storage {} ({} MB)",
+        "title          {:08X}, save slot {}{}, storage {} ({} MB)",
         title.id,
         slot.as_deref().unwrap_or("(none)"),
+        if pre_slot { " (pre-slot location)" } else { "" },
         storage.display(),
         title.storage_bytes >> 20
     );
@@ -170,6 +180,14 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { scarlett_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+    }
+    // The output size and render scale (SCARLETT_OUTPUT, SCARLETT_RENDER_SCALE,
+    // SCARLETT_UPSCALER, or the SCARLETT_* names; each off without it).
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { scarlett_loader::resolution::apply_asked(image.base(), size) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");

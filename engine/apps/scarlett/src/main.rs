@@ -142,6 +142,19 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// Build everything ahead of a run, no game window, on every core: all
+    /// shader translations, then the host pipelines earlier runs drew with
+    /// into the pipeline library (with --all, every other known pipeline for
+    /// the driver's cache too). Progress: `prepare step|progress|done` lines.
+    #[cfg(windows)]
+    Prepare {
+        /// Threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Also every other pipeline the title ever created (long).
+        #[arg(long)]
+        all: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -233,6 +246,8 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::Prepare { jobs, all } => warm::prepare(jobs, all),
         Command::Run {
             exe,
             unimplemented,

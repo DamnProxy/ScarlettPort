@@ -132,6 +132,18 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    // `SCARLETT_LOAD_UNPACED=1`: loading and menu frames do not wait. No
+    // tick is taken, so pacing goes on from the clock when the world shows.
+    if crate::fastboot::skip_pacing() {
+        if origin {
+            let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+            if !token.is_null() {
+                // SAFETY: checked non-null; the title passes its token.
+                unsafe { token.write(frame) };
+            }
+        }
+        return S_OK;
+    }
     let (mut tick, mut wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait

@@ -81,9 +81,34 @@ pub fn frame() -> u64 {
 
 /// A frame bound render targets (called per bind).
 pub fn note_render_targets() {
-    if enabled() {
+    if enabled() || unpaced_loading() {
         BINDS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// `SCARLETT_LOAD_UNPACED=1` (or `SCARLETT_LOAD_UNPACED`; off by default):
+/// while the title draws loading screens, logos and menus (frames that bind
+/// fewer than [`THRESHOLD`] render targets), its frame waits end at once, so
+/// those frames are not held to the title's 30 fps interval. World frames
+/// are paced as before.
+pub fn unpaced_loading() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = truthy(env("SCARLETT_LOAD_UNPACED").or_else(|| env("SCARLETT_LOAD_UNPACED")));
+        if on {
+            tracing::info!("load unpaced: frame waits end at once on loading and menu frames");
+        }
+        on
+    })
+}
+
+/// Binds of the last presented frame (only kept with fast boot or
+/// unpaced loading).
+static LAST_BINDS: AtomicU32 = AtomicU32::new(0);
+
+/// Unpaced loading is on and the last frame was a light one (not a world frame).
+pub fn skip_pacing() -> bool {
+    unpaced_loading() && LAST_BINDS.load(Ordering::Relaxed) < THRESHOLD
 }
 
 /// Pure rule: the world run length after a frame with `binds` binds.
@@ -94,11 +119,16 @@ pub fn next_run(run: u32, binds: u32) -> u32 {
 /// A frame was presented: updates the detector; returns the log line once,
 /// when fast boot ends.
 pub fn frame_presented() -> Option<String> {
+    if unpaced_loading() && !active() {
+        LAST_BINDS.store(BINDS.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+        return None;
+    }
     if !active() {
         return None;
     }
     let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
     let binds = BINDS.swap(0, Ordering::Relaxed);
+    LAST_BINDS.store(binds, Ordering::Relaxed);
     let run = next_run(RUN.load(Ordering::Relaxed), binds);
     RUN.store(run, Ordering::Relaxed);
     let max = *MAX.get_or_init(|| {

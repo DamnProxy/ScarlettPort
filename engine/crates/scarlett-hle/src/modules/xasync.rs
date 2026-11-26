@@ -223,6 +223,14 @@ impl Queue {
             self.deliver(port, task);
             return S_OK;
         }
+        #[cfg(windows)]
+        if super::waitlog::threshold_ms().is_some_and(|ms| u64::from(delay_ms) >= ms) {
+            tracing::warn!(
+                "wait log: a callback delayed {delay_ms} ms on port {port} (work 0, completion 1): {} with {:#x}",
+                scarlett_loader::locate(task.callback),
+                task.context
+            );
+        }
         let id = NEXT_DELAYED.fetch_add(1, Ordering::Relaxed);
         {
             // Checked again under the lock termination drains: the callback

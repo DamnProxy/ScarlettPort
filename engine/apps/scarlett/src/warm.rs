@@ -129,6 +129,57 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     Ok(())
 }
 
+/// `scarlett prepare`: everything that can be built ahead of a run, with no
+/// game window, on every core. Machine-readable progress on stdout, one line
+/// each: `prepare step <n>/<steps> <name>`, `prepare progress <name> <done>
+/// <total>` (total 0 when unknown) and at the end `prepare done <seconds>`.
+/// 1. shaders: every shader container in the game folder translated into
+///    the shader cache (as `scarlett shaders`);
+/// 2. library: the host pipelines of every pipeline earlier runs drew with
+///    (`early-pipelines.txt`) made into the pipeline library runs load from;
+/// 3. (`--all`) driver: every other pipeline the title ever created, made
+///    for the driver's cache on disk (as `scarlett warm`).
+pub fn prepare(jobs: Option<usize>, all: bool) -> Result<()> {
+    let began = Instant::now();
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let jobs = jobs.unwrap_or(cores).max(1);
+    let steps = if all { 3 } else { 2 };
+    println!("prepare step 1/{steps} shaders");
+    crate::translate::precompile(Vec::new(), Some(jobs))?;
+    println!("prepare step 2/{steps} library");
+    let dir = folder()?;
+    scarlett_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
+    let keys = known::keys(&dir);
+    let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
+    let early: HashSet<&str> = early.lines().collect();
+    let used: Vec<usize> = (0..keys.len()).filter(|&n| early.contains(keys[n].as_str())).collect();
+    let total = used.len();
+    if keys.is_empty() {
+        println!("prepare note no pipeline records yet: runs write them with SCARLETT_PIPELINE_BOOK=1 (SCARLETT_PIPELINE_BOOK); run prepare again after one");
+    }
+    let count = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    println!("prepare progress library 0 {total}");
+    known::fill_library(&dir, &used, jobs, |_, _, made| {
+        failed.fetch_add(usize::from(!made), Ordering::Relaxed);
+        let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 50 == 0 || n == total {
+            println!("prepare progress library {n} {total}");
+        }
+    });
+    println!(
+        "library      {total} pipelines in the library ({} have no host pipeline), {:.0} s",
+        failed.load(Ordering::Relaxed),
+        began.elapsed().as_secs_f64()
+    );
+    if all {
+        println!("prepare step 3/{steps} driver");
+        run(Some(jobs), None, false, false, None)?;
+    }
+    println!("prepare done {:.0}", began.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }

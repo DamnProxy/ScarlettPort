@@ -86,6 +86,9 @@ jobs:
 
           Built from ``${{ github.sha }}`` by the [Release workflow](https://github.com/${{ github.repository }}/actions/workflows/release.yml).
 
+          ### New in this release
+          On by default: the save wait fix, the upscaler's network buffer in card memory, and two shader translation fixes (the first run rebuilds the shader cache). Measured on an RTX 3060 12 GB, Ryzen 5 5600X, 32 GB: world reached in 178 s (244 s before), 3.4 fps in the world (1.6 before), the upscaler's slowest pass 0.1-0.3 ms per frame (55-71 ms before). Load switches are opt-in in the Experimental preset. Details in the README.
+
           ### Shader build
           Play prepares the shader cache once by itself (``scarlett shaders``, a few minutes after a scan of the game files, then the engine's pipeline step), for each engine build, graphics driver and preset; it shows the phase, the time left and a "skip this time" link, and is not repeated while nothing changed. Prepare shaders (Settings) still runs it by hand. See the README FAQ if a build looks stuck.
 

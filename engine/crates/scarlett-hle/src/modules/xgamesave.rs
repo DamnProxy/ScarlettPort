@@ -179,6 +179,95 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// Windows errors that clear up by themselves while a virus scanner, the
+/// indexer or an Explorer window holds a handle for a moment: access denied
+/// (5), sharing violation (32), lock violation (33).
+fn transient(e: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// Runs `op` again after a short wait while it fails with a [`transient`]
+/// error (about two seconds in all).
+fn retry<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut wait = 10;
+    let mut tries = 1;
+    loop {
+        match op() {
+            Err(e) if transient(&e) && tries < 12 => {
+                std::thread::sleep(std::time::Duration::from_millis(wait));
+                wait = (wait * 2).min(250);
+                tries += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Removes a leftover (an unfinished or an older version). What a scanner
+/// still holds stays for the next time: it must never make the container
+/// unreadable or unsavable, which loses the save (and with it the profile's
+/// accepted terms, so the first-boot screens come back).
+///
+/// A leftover that will not go costs [`retry`]'s two seconds of sleep at
+/// every look at its container, under the lock all save calls take: with
+/// six of them the title's boot stood for minutes with nothing read
+/// (cli/idle-waits.md). `SCARLETT_SAVE_NO_WAIT=1` (or `SCARLETT_SAVE_NO_WAIT`)
+/// tries once, without sleeping, and leaves a leftover that stayed alone for
+/// the rest of the run.
+fn discard(path: &Path) {
+    static NO_WAIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static STAYED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    // On by default since 0.5.0 (REL050-ON); `=0` brings back the retries.
+    let no_wait = *NO_WAIT.get_or_init(|| std::env::var_os("SCARLETT_SAVE_NO_WAIT").is_none_or(|v| v != "0"));
+    let stayed = || STAYED.lock().unwrap_or_else(|e| e.into_inner());
+    if no_wait && stayed().iter().any(|p| p == path) {
+        return;
+    }
+    let began = std::time::Instant::now();
+    let removed = if no_wait { remove_plainly(path) } else { retry(|| std::fs::remove_dir_all(path)) };
+    match removed {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            #[cfg(windows)]
+            if super::waitlog::threshold_ms().is_some() {
+                tracing::warn!(
+                    "wait log: a save leftover was not removed after {} ms ({e}): {}",
+                    began.elapsed().as_millis(),
+                    path.display()
+                );
+            }
+            tracing::debug!(path = %path.display(), %e, "game save: leftover not removed yet");
+            if no_wait {
+                stayed().push(path.to_path_buf());
+            }
+        }
+    }
+}
+
+/// `remove_dir_all`, and where that fails, the folder's files one by one and
+/// then the folder by its path. Under the user's profile on the PC this was
+/// measured on, `remove_dir_all` removes the files and then fails on the
+/// folder itself with a sharing violation every time, also for an empty
+/// folder hours old, while `remove_dir` removes it at once: so every update
+/// left its old version's folder behind, empty, for good.
+fn remove_plainly(path: &Path) -> std::io::Result<()> {
+    let Err(first) = std::fs::remove_dir_all(path) else {
+        return Ok(());
+    };
+    if first.kind() == std::io::ErrorKind::NotFound {
+        return Err(first);
+    }
+    // Version folders hold files only; anything else stays, and the folder
+    // with it.
+    for entry in std::fs::read_dir(path)?.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    std::fs::remove_dir(path)
+}
+
 /// The number of a version folder exactly as [`commit`] names it (`v1`,
 /// `v2`, ...); `None` for anything else, such as `v01`, `v+1` or `v0`.
 fn version_number(file: &str) -> Option<u64> {
@@ -189,7 +278,7 @@ fn version_number(file: &str) -> Option<u64> {
 /// The names in version folder `dir`: container, display, blobs; `None` if
 /// its manifest is missing or does not parse.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
-    let bytes = match std::fs::read(dir.join(MANIFEST)) {
+    let bytes = match retry(|| std::fs::read(dir.join(MANIFEST))) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -213,7 +302,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            discard(&entry.path());
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -231,7 +320,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             continue;
         };
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            discard(&dir.join(format!("v{old}")));
         }
         return Ok(Some(Version {
             dir: version,
@@ -278,9 +367,18 @@ fn commit(
     display: &str,
     blobs: &[(&str, Source<'_>)],
 ) -> std::io::Result<()> {
-    let staged = dir.join(format!("v{number}.new"));
-    if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
+    // A leftover staging folder that cannot be removed (a scanner holds it)
+    // is not in the way: stage under another name.
+    let mut staged = dir.join(format!("v{number}.new"));
+    for n in 1..=8 {
+        if !staged.exists() {
+            break;
+        }
+        discard(&staged);
+        if !staged.exists() {
+            break;
+        }
+        staged = dir.join(format!("v{number}.{n}.new"));
     }
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
@@ -302,7 +400,11 @@ fn commit(
     let names: Vec<&str> = blobs.iter().map(|(n, _)| *n).collect();
     write(staged.join(MANIFEST), &manifest(name, display, &names))?;
     step();
-    std::fs::rename(&staged, dir.join(format!("v{number}")))?;
+    // The one step that commits (retried over a scanner's brief hold).
+    if let Err(e) = retry(|| std::fs::rename(&staged, dir.join(format!("v{number}")))) {
+        discard(&staged);
+        return Err(e);
+    }
     step();
     Ok(())
 }
@@ -514,7 +616,7 @@ impl Update {
         }
         // The old version is garbage now; a crash here leaves it for later.
         if let Some(old) = &current {
-            let _ = std::fs::remove_dir_all(&old.dir);
+            discard(&old.dir);
             step();
         }
         S_OK
@@ -1042,6 +1144,37 @@ mod tests {
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
         Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
+    }
+
+    /// An update leaves one version folder: the one before it is removed
+    /// whole, also when the new version shares a file with it.
+    #[test]
+    fn the_version_before_an_update_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(update(dir.path(), "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        assert_eq!(update(dir.path(), "two", &[("a", Some("new a"))]), S_OK);
+        let container = container_dir(dir.path(), "Slot");
+        let versions = || -> Vec<String> {
+            let all = std::fs::read_dir(&container).unwrap().flatten();
+            let mut all: Vec<String> = all.map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            all.sort();
+            all
+        };
+        if versions() != ["v2"] {
+            eprintln!("left: {:?}; removing v1 again: {:?}", versions(), std::fs::remove_dir_all(container.join("v1")));
+        }
+        assert_eq!(versions(), ["v2"]);
+    }
+
+    #[test]
+    fn a_folder_is_removed_plainly() {
+        let dir = tempfile::tempdir().unwrap();
+        let version = dir.path().join("v1");
+        std::fs::create_dir(&version).unwrap();
+        std::fs::write(version.join("0"), "a").unwrap();
+        assert!(remove_plainly(&version).is_ok());
+        assert!(!version.exists());
+        assert_eq!(remove_plainly(&version).unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
 
     /// Run by the crash test in a child process; does nothing otherwise.

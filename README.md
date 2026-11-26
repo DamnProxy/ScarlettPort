@@ -1,5 +1,7 @@
 <p align="center"><a href="https://github.com/ZigZagBoi1/ScarlettPort"><img src="https://img.shields.io/github/stars/ZigZagBoi1/ScarlettPort?style=for-the-badge&logo=github&label=Star%20ScarlettPort&color=ffd700" alt="Star ScarlettPort on GitHub"></a></p>
 <p align="center"><b>⭐ If ScarlettPort helps you, please star the repo, it helps more people find it.</b></p>
+> **New in 0.5.0:** the save emulation no longer sleeps retrying old save folders it cannot delete (about 243 s per boot), the upscaler's 24 MB network buffer is kept in card memory, and two shader translation fixes are on by default. Measured on an RTX 3060 12 GB, Ryzen 5 5600X, 32 GB: the world is reached in 178 s instead of 244 s, the upscaler's slowest pass takes 0.1-0.3 ms per frame instead of 55-71 ms, and the world runs at 3.4 fps instead of 1.6 fps. Changing the translation defaults rebuilds the shader cache once.
+>
 > **New in 0.4.8:** Prepare shaders works again with the 0.4.6+ engine (`scarlett shaders`, then `scarlett warm`), and the engine no longer refuses the launcher's `scarlett.toml`; `play-scarlett.ps1`/`setup-scarlett.ps1` use the same commands and the launcher's Stable settings; Settings, Features gains a performance overlay and a ray tracing switch; `SCARLETT_CAPTURE_LOG` writes `frames.csv` with the Stable preset too.
 >
 > **New in 0.4.7:** everything is named ScarlettPort now: the runtime is `scarlett.exe`, its switches are `SCARLETT_*`, and its data folder is `%LOCALAPPDATA%\ScarlettPort` (saves, caches and settings from the old folder are moved over on first start). The runtime also gains a GPU frame profiler.
@@ -19,15 +21,15 @@ ScarlettPort is the **ScarlettPort runtime** (`engine/`, built as `scarlett.exe`
 
 ### Where it stands
 
-Developed and tested so far against one open-world title. It boots, gets through the menus, saves and legal screens, reaches the world and gives you control in the opening area. Since 0.4.6 the engine renders the full picture (lit rooms, ambient and sky light, complete textures) at about 3 fps on an RTX 3060 (Series S profile); a hardware report measured 7-8 fps on an RTX 5070. The older, darker picture ran at about 5 fps. That is not 30 fps, and first runs still freeze on pipeline compiles while moving, so it is **not yet verified playable**; frame rate is the next focus.
+Developed and tested so far against one open-world title. Done: it boots, gets through the menus, saves and legal screens, reaches the world in 178 s, renders the full picture (lit rooms, ambient and sky light, complete textures) and gives you control in the opening area. Remaining: frame rate (3.4 fps in the world on an RTX 3060 12 GB with a Ryzen 5 5600X in 0.5.0, the goal is a playable 30 fps), stability over long sessions (no long run has been recorded yet), and known issues: haze indoors and a crash reported mid-prologue (issue #51). It is **not yet verified playable**.
 
-![progress](https://img.shields.io/badge/progress-70%25-ff2d95?style=for-the-badge)
+![progress](https://img.shields.io/badge/progress-90%25-ff2d95?style=for-the-badge)
 
 ```
-██████████████░░░░░░  70%
+██████████████████░░  90%
 ```
 
-`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `full picture` ✅ → `gameplay starts` ✅ (~3 fps, RTX 3060) → `playable speed` ⏳
+`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `full picture` ✅ → `gameplay starts` ✅ (3.4 fps, RTX 3060) → `playable speed` ⏳
 
 <a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" height="45"/></a>
 <a href="https://ko-fi.com/ziggymar"><img src="https://img.shields.io/badge/BUY%20A%20COFFEE-Ko--fi-ff5f5f?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" height="45"/></a>
@@ -142,7 +144,28 @@ Questions: [`docs/FAQ.md`](docs/FAQ.md). Problems: [`docs/TROUBLESHOOTING.md`](d
 
 ---
 
-## 🆕 New in v0.4.5
+## 🆕 New in v0.5.0
+
+Measured in two boots on an RTX 3060 12 GB, Ryzen 5 5600X, 32 GB RAM (Series S profile), the same scripted route, 180 s in the world, 0.4.x defaults against 0.5.0 defaults:
+
+| | before | after |
+|---|---|---|
+| world reached | 244 s | 178 s |
+| world fps (median / 95th percentile frame) | 1.6 (821 ms / 4,250 ms) | 3.4 (664 ms / 4,464 ms) |
+| upscaler pass 8cbd7f5b, card time | 55.7-70.8 ms/frame | 0.10-0.28 ms/frame |
+| upscaler passes f4611739 / f7fc6c98 | 43.7-50.0 / 34.7-40.1 ms/frame | below 0.1 ms/frame (left the profile's top list) |
+| crashes | 0 | 0 |
+
+One boot each; load times vary from boot to boot (199-404 s seen in earlier runs), so the load-time gain is a single measurement. The 95th-percentile frame did not improve.
+
+- **Save wait fix (on by default, `SCARLETT_SAVE_NO_WAIT`):** an old save version's folder that will not delete is removed file by file, tried once without sleeping. Before, the save emulation slept about 243 s per boot retrying it.
+- **Upscaler on the card (on by default, `SCARLETT_CARD_BIG_ROOM`, 256 MB):** buffers of 16 MB and more get card memory past the cap the world load's small copies used up, so the upscaler's 24 MB network tensor is no longer read over PCIe.
+- **Faster translation (on by default, `SCARLETT_GUARD_SINK`, `SCARLETT_LOADS_WIDE`):** one guard per run of guarded writes and console loads four dwords at a time. Both are in the shader cache key, so the first 0.5.0 run rebuilds shaders.
+- **Load work (opt-in, Experimental preset):** `SCARLETT_LOAD_UNPACED` (loading and menu frames skip the frame wait), `SCARLETT_PREFETCH` (reads ahead what the last boot read), `SCARLETT_PIPELINE_BOOK` (records the pipeline list `scarlett prepare` builds from), and the `scarlett prepare` command. They booted cleanly together but are not measured on their own yet.
+- **Launcher 0.5.0:** Stable sets the four new defaults; Experimental adds the load switches.
+- **Any switch can be turned back off** with `=0`.
+
+## New in v0.4.5
 
 A restructure, no runtime behaviour change: frame rate is the same as 0.4.4.
 
@@ -214,7 +237,7 @@ Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about
 | Hair too bright | ✅ done | hair and lighting render correctly in the opening cell (0.4.3) |
 | Texture upload queue | ✅ done | fair order (`SCARLETT_FAIR_DUE=2`, default): about 110 textures waiting at the end of a run, against 21,000 or more before |
 | Ray-tracing BVH builder | 🔨 in progress | `SCARLETT_BVH_BUILDER` still makes stray writes |
-| Load time | 🔨 in progress | the world is reached in about 212 s from an internal SSD (300 s or more before); a load cache (`SCARLETT_LOAD_CACHE`) and a faster decoder (`SCARLETT_FAST_INFLATE`) are in the runtime, off by default, not measured yet |
+| Load time | 🔨 in progress | 0.5.0 reaches the world in 178 s (244 s with the 0.4.x defaults, one boot each, RTX 3060); the read-ahead and unpaced loading frames are opt-in in Experimental, not measured alone; a load cache (`SCARLETT_LOAD_CACHE`) and a faster decoder (`SCARLETT_FAST_INFLATE`) are in the runtime, off by default, not measured yet |
 | World-entry copy stall | 📋 planned | cut the copies that stall entering the world |
 | PC responsiveness | 🧪 in testing | `SCARLETT_FRIENDLY=1` (set by the Stable preset): background work leaves processor time to the desktop |
 | Textures never uploaded | 📋 planned | 14,830 textures are never uploaded |
@@ -333,13 +356,17 @@ Every task is sized for **one contributor**. Pick one, comment on its issue to c
 
 ### Performance
 
-- [ ] **#4 Frame time.** The 0.4.6 full picture runs at about 3 fps on the RTX 3060 (7-8 fps on an RTX 5070); the numbers below are from the older, darker picture: 5.4 fps while walking and turning in the world (median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms; RTX 3060 12 GB, Ryzen 5 5600X; 3.9-4.5 fps before); 30 fps is not reached. The thread that gates each present spends about 187 ms per frame: about 55 ms preparing, 31 ms in refresh copies, 76 ms waiting on the card after title writes next to shader-written memory, 19 ms waiting for title reads. An infinitely fast card would still leave about 99 ms, so the waits and copies are the work to do. `SCARLETT_GPU_PROFILE` measures about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines. See `engine/crates/scarlett-gpu/src/host.rs`, `draw.rs`.
+- [ ] **#4 Frame time.** 0.5.0 runs the full picture at 3.4 fps in the world on the RTX 3060 (1.6 fps with the 0.4.x defaults in the same test; median frame 664 ms, 95th percentile 4,464 ms); the goal is 30 fps. Earlier: the 0.4.6 full picture ran at about 3 fps on the RTX 3060 (7-8 fps on an RTX 5070); the numbers below are from the older, darker picture: 5.4 fps while walking and turning in the world (median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms; RTX 3060 12 GB, Ryzen 5 5600X; 3.9-4.5 fps before); 30 fps is not reached. The thread that gates each present spends about 187 ms per frame: about 55 ms preparing, 31 ms in refresh copies, 76 ms waiting on the card after title writes next to shader-written memory, 19 ms waiting for title reads. An infinitely fast card would still leave about 99 ms, so the waits and copies are the work to do. `SCARLETT_GPU_PROFILE` measures about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines. See `engine/crates/scarlett-gpu/src/host.rs`, `draw.rs`.
 - [ ] **#5 Intro cutscene speed.** The intro is very slow unless skipped; find out why.
 - [ ] **#13 Zero-copy title memory.** `SCARLETT_ZERO_COPY` maps title memory for the GPU without copies; it needs placing to work at scale. `engine/crates/scarlett-gpu/src/zerocopy.rs`, `engine/crates/scarlett-hle/src/modules/xmem.rs`.
 - [ ] **#14 Load time.** The world is reached in about 212 s from an internal SSD. A load cache (`SCARLETT_LOAD_CACHE`) and a faster decoder (`SCARLETT_FAST_INFLATE`) are in the runtime, off by default: measure them. `engine/crates/scarlett-hle/src/modules/dstorage/loadcache.rs`.
 - [ ] **#15 World-entry copy stall.** Entering the world stalls on memory copies; find what is copied and cut it. `engine/crates/scarlett-gpu/src/memcopy.rs`, `host.rs`.
 - [x] **#16 PC responsiveness while running.** Done: `SCARLETT_FRIENDLY=1` keeps the rest of the PC usable (thread priorities, worker counts); the Stable preset sets it. `engine/crates/scarlett-core/src/friendly.rs`.
 - [x] **#6 Shader cache warm-up.** Done: `scarlett precompile-graphics` and the shader prewarm (`engine/apps/scarlett/src/translate.rs`, `engine/crates/scarlett-gpu/src/pipeline/precompiled.rs`).
+
+- [ ] **#51 Crash mid-prologue.** A crash was reported partway through the prologue; reproduce it and send the crash report.
+- [ ] **Long sessions.** No long run has been recorded yet: play for an hour and report crashes, memory use and fps.
+- [ ] **Indoor haze.** Rooms look hazy indoors; compare with a reference capture and find the pass.
 
 ### Tooling & docs
 

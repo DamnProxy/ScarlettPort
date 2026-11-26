@@ -149,8 +149,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    super::prefetch::start();
+    let opened = if super::prefetch::on() { file.try_clone().ok() } else { None };
     let files = Files::new(file, Io::chosen());
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    if let Some(opened) = opened {
+        super::prefetch::file_opened(file as usize, &opened);
+    }
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -323,7 +328,7 @@ struct Files {
 
 impl Files {
     fn new(first: std::fs::File, io: Io) -> Files {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = workers();
         let others = match io {
             Io::One => 0,
             Io::Overlapped => 1,
@@ -355,6 +360,20 @@ impl Files {
             (file, _) => file.unwrap_or(&self.first).seek_read(out, offset),
         }
     }
+}
+
+/// Request workers: one per logical core, or `SCARLETT_DSTORAGE_WORKERS`
+/// (`SCARLETT_DSTORAGE_WORKERS`, 1-64). A worker waits on its read before it
+/// inflates, so more workers than cores keep more reads in flight.
+fn workers() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        std::env::var("SCARLETT_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(cores, |n| n.clamp(1, 64))
+    })
 }
 
 /// A number for this thread: 0 for the first that asks, and so on.
@@ -629,7 +648,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = workers();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -1550,6 +1569,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     let files = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .files;
+    super::prefetch::read(request.source as usize, request.offset, out.len() as u64);
     let started = std::time::Instant::now();
     let (mut done, mut tries) = (0, 0);
     let result = loop {

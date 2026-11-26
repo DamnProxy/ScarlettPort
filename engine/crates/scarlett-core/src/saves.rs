@@ -34,6 +34,18 @@ pub fn validate(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether slot `default` still means the pre-slot location: saves made
+/// before slots existed live in `<title>/storage` and `<title>/saves`, and
+/// are slot `default` until a `slots/default` folder exists. Without this a
+/// run with `SCARLETT_SAVE_SLOT=default` starts a fresh profile (the first-boot
+/// and legal screens again) beside a profile that already accepted them.
+/// `title` is the title's data folder (absolute); nothing is created or moved.
+pub fn default_is_pre_slot(title: &Path, slot: Option<&str>) -> bool {
+    slot == Some("default")
+        && !title.join("slots").join("default").exists()
+        && (title.join("storage").exists() || title.join("saves").exists())
+}
+
 /// The storage folder of `slot` under a title folder (relative to the
 /// title's data folder), without creating anything.
 pub fn storage(title: &Path, slot: Option<&str>) -> Result<PathBuf> {
@@ -59,6 +71,21 @@ mod tests {
         for good in ["default", "run-2", "A_b.1"] {
             validate(good).unwrap();
         }
+    }
+
+    #[test]
+    fn default_slot_reads_the_pre_slot_place_until_it_has_a_folder() {
+        let t = std::env::temp_dir().join(format!("scarlett-slot-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        assert!(!default_is_pre_slot(&t, Some("default")), "nothing there yet");
+        std::fs::create_dir_all(t.join("saves")).unwrap();
+        assert!(default_is_pre_slot(&t, Some("default")));
+        assert!(!default_is_pre_slot(&t, Some("other")));
+        assert!(!default_is_pre_slot(&t, None));
+        std::fs::create_dir_all(t.join("slots/default")).unwrap();
+        assert!(!default_is_pre_slot(&t, Some("default")));
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[test]

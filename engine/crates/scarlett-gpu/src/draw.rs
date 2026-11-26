@@ -3134,6 +3134,38 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        // `SCARLETT_DISPATCH_LOG=<hash prefix>,..`: each new size a dispatch of
+        // those programs is run at, once, with the program's name.
+        {
+            static WANT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            static SEEN: std::sync::Mutex<Vec<(String, [u32; 3], u32)>> = std::sync::Mutex::new(Vec::new());
+            let want = WANT.get_or_init(|| {
+                std::env::var("SCARLETT_DISPATCH_LOG")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            });
+            if !want.is_empty()
+                && let Some(stage) = p.stages.first()
+            {
+                let hash = format!("{}", stage.shader.hash);
+                if want.iter().any(|w| hash.starts_with(w.as_str())) {
+                    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                    if !seen.iter().any(|s| s.0 == hash && s.1 == [x, y, z] && s.2 == flags) && seen.len() < 400 {
+                        seen.push((hash.clone(), [x, y, z], flags));
+                        let threads = stage.translated().threads;
+                        tracing::info!(
+                            "dispatch of {hash}: {x}x{y}x{z} (flags {flags:#x}, group {threads:?}), program {:?}, ambient role {:?}, builder {}",
+                            p.name,
+                            stage.shader.ambient,
+                            crate::pipeline::is_builder(self.pipeline as This)
+                        );
+                    }
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_builder(self.pipeline as This) {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));

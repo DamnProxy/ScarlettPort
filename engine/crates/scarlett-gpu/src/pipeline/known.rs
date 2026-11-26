@@ -247,6 +247,48 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     }
 }
 
+/// `scarlett prepare`: makes the host pipelines of those of `which` on
+/// `jobs` threads into the pipeline library in `dir` (the one runs load
+/// from), then saves it, so that a run loads them instead of compiling them
+/// while it loads. One already in the library is only loaded. `each` is told
+/// what came of each: milliseconds and whether there is one.
+pub fn fill_library(dir: &Path, which: &[usize], jobs: usize, each: impl Fn(usize, f64, bool) + Sync) {
+    super::library::use_pipeline_cache(dir.to_path_buf());
+    let mut places = HashMap::new();
+    walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
+    let wanted: HashSet<usize> = which.iter().copied().collect();
+    let mut entries = HashMap::new();
+    walk_pipelines(dir, |n, bytes| {
+        if wanted.contains(&n) {
+            entries.insert(n, bytes.to_vec());
+        }
+    });
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..jobs.max(1).min(which.len().max(1)) {
+            s.spawn(|| {
+                let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
+                let mut read = |hash: &[u8; 32]| {
+                    let &(_, at, len) = places.get(hash)?;
+                    let mut bytes = vec![0; len as usize];
+                    file.seek(SeekFrom::Start(at)).ok()?;
+                    file.read_exact(&mut bytes).ok()?;
+                    Some(bytes)
+                };
+                while let Some(&n) = which.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                    let Some(entry) = entries.get(&n) else { continue };
+                    let began = std::time::Instant::now();
+                    let made = parse(entry, &mut read)
+                        .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
+                        .is_some();
+                    each(n, began.elapsed().as_secs_f64() * 1e3, made);
+                }
+            });
+        }
+    });
+    super::library::save(true);
+}
+
 #[allow(clippy::type_complexity)]
 fn parse(
     entry: &[u8],
