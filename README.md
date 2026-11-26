@@ -250,13 +250,22 @@ Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about
 
 ---
 
+## Install
+
+1. Download `ScarlettPort-<version>-win64.zip` from [Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases).
+2. Right-click the ZIP.
+3. Choose **Extract All** (running it from inside the ZIP does not work).
+4. Run `ScarlettPort.exe` in the extracted folder. It asks for a player name, finds your game folder on its own (or Browse), sets up what it needs and prepares the shaders once; then **Play**.
+
+The ZIP holds only `ScarlettPort.exe`, a `runtime` folder, `README.txt` and `LICENSE.md`. Settings live in `%LOCALAPPDATA%\ScarlettPort`, the shader cache in `<drive>:\ScarlettCache`; your game folder is only read.
+
 ## 🚀 Run it
 
 > **You need your own dump of your own legally obtained Xbox Series copy.** This repo contains **no game files** of any kind, and never will.
 
 **Requirements:** Windows 10/11 x64 · a D3D12 GPU with Shader Model 6.6 and mesh shaders (RTX 20-series / RX 6000 or newer) · 32 GB RAM recommended · [Rust](https://rustup.rs) (MSVC) · Windows SDK
 
-**Easiest: the launcher.** Download `ScarlettPort-<version>-win64.zip` from [Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases), extract the whole ZIP (keep `ScarlettPort.exe` and the `runtime` folder side by side), run `ScarlettPort.exe`, pick your dump folder, press **Build shaders**, then **Play**. The release is built by CI from this repo, is not code-signed, and lists SHA-256 checksums in its notes.
+**Easiest: the launcher.** Download `ScarlettPort-<version>-win64.zip` from [Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases), extract the whole ZIP (keep `ScarlettPort.exe` and the `runtime` folder side by side), run `ScarlettPort.exe` and follow the first-run steps (see Install above). The release is built by CI from this repo, is not code-signed, and lists SHA-256 checksums in its notes.
 
 The shader build uses the World engine (the ScarlettPort runtime, `scarlett warm`) by default:
 

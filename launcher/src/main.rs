@@ -20,6 +20,7 @@ mod saves;
 mod update;
 mod controller;
 mod prep;
+mod firstrun;
 mod shaderbuild;
 mod theme;
 mod view;
@@ -146,6 +147,9 @@ pub struct Config {
     /// The first-run wizard was finished or skipped.
     #[serde(default)]
     pub wizard_done: bool,
+    /// The name shown as the console player (empty: the engine's default).
+    #[serde(default)]
+    pub player_name: String,
 }
 
 fn default_preset() -> String {
@@ -195,6 +199,7 @@ impl Default for Config {
             local_shaders_hash: String::new(),
             tuning: tuning::Tuning::default(),
             wizard_done: false,
+            player_name: String::new(),
         }
     }
 }
@@ -224,6 +229,11 @@ pub enum Message {
     Backups(String, Result<Vec<cli::Backup>, String>),
     SavesDone(Result<String, String>),
     Crashes(Result<Vec<String>, String>),
+    /// The automatic game folder search found one, and its end (true: it ran to the end).
+    GameFound(PathBuf),
+    SearchEnded(bool),
+    /// An engine's translator fingerprint (true: the local build's).
+    Translator(bool, Option<String>),
 }
 
 pub struct Launcher {
@@ -316,6 +326,19 @@ pub struct Launcher {
     pub play_after_build: bool,
     /// "Skip this time": the preparation was stopped to play now; the next Play prepares again.
     pub prep_skip: bool,
+    /// Translator fingerprints of the bundled and the local engine (None: not reported).
+    pub world_translator: Option<String>,
+    pub local_translator: Option<String>,
+    /// The automatic game folder search: its stop flag while it runs, what it found, how it ended.
+    pub search: Option<Arc<AtomicBool>>,
+    pub search_started: Option<Instant>,
+    pub found_games: Vec<PathBuf>,
+    pub search_end: Option<bool>,
+    /// What the Setup step placed or checked, one line each (ok, text).
+    pub setup_notes: Vec<(bool, String)>,
+    /// Pause in the preparation: the engine process is suspended while set.
+    pub pause: Arc<AtomicBool>,
+    pub name_edit: String,
 }
 
 pub fn config_path() -> PathBuf {
@@ -461,6 +484,15 @@ impl Launcher {
             tuning_at_start: None,
             report_copied: None,
             shot_wait: 0,
+            world_translator: None,
+            local_translator: None,
+            search: None,
+            search_started: None,
+            found_games: Vec::new(),
+            search_end: None,
+            setup_notes: Vec::new(),
+            pause: Arc::new(AtomicBool::new(false)),
+            name_edit: String::new(),
         };
         if fresh_cache {
             l.save();
@@ -470,8 +502,7 @@ impl Launcher {
         if l.config.auto_update && l.update_note.is_empty() {
             l.check_update();
         }
-        let l = l;
-        let mut l = l;
+        l.name_edit = l.config.player_name.clone();
         // `--page=settings` opens Settings on its Display tab (`--tab=game|display|options|about`)
         if std::env::args().any(|a| a == "--page=settings") {
             l.page = Page::Settings;
@@ -800,7 +831,8 @@ impl Launcher {
     /// Starts the shader build of the selected engine on its own thread (`shaderbuild`).
     fn start_build(&mut self, game: PathBuf) {
         let world = self.world_selected();
-        let hash = if world { self.effective_world_hash().map(str::to_string) } else { self.runtime_hash.clone() }.unwrap_or_default();
+        // World: keyed on the translator, so an engine update that keeps it resumes the build.
+        let hash = if world { Some(self.shader_key()) } else { self.runtime_hash.clone() }.unwrap_or_default();
         // Each preset has its own cache folder, so what was built is kept per folder too.
         let hash = if world { shaderbuild::state_key(&hash, &self.scarlett_cache()) } else { hash };
         let stop = Arc::new(AtomicBool::new(false));
@@ -815,9 +847,11 @@ impl Launcher {
             env,
             slow_secs: self.config.skip_slow.then_some(self.config.slow_secs.max(10)),
             stop: stop.clone(),
+            pause: self.pause.clone(),
             tx: self.tx.clone(),
         };
         self.stop = Some(stop);
+        self.pause.store(false, Ordering::Relaxed);
         self.running = Some(RunKind::Precompile);
         self.build = None;
         self.shader = None;
@@ -829,13 +863,82 @@ impl Launcher {
     /// What the selected preset's cache must have been prepared for.
     pub fn prep_stamp(&self) -> prep::Stamp {
         prep::Stamp {
-            engine: self.effective_world_hash().unwrap_or_default().to_string(),
+            shaders: self.shader_key(),
             driver: self.driver.clone(),
             cache_key: format!("{}|{}", self.config.preset, self.scarlett_cache().display()),
         }
     }
 
-    /// True when the preset's cache was prepared for this engine build, driver and preset.
+    /// The selected World engine's shader key: its translator fingerprint, else its build hash.
+    pub fn shader_key(&self) -> String {
+        let t = if self.local_selected() { &self.local_translator } else { &self.world_translator };
+        firstrun::shader_key(t.as_deref(), self.effective_world_hash())
+    }
+
+    /// Starts the automatic game folder search on a worker thread (`firstrun::search`).
+    pub fn start_search(&mut self) {
+        if self.search.is_some() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.search = Some(cancel.clone());
+        self.search_started = Some(Instant::now());
+        self.found_games.clear();
+        self.search_end = None;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let starts = firstrun::starts(&firstrun::fixed_drives(), firstrun::home().as_deref());
+            let ftx = tx.clone();
+            let done = firstrun::search(&starts, GAME_EXE, Instant::now() + firstrun::SEARCH_LIMIT, &cancel, |p| {
+                let _ = ftx.send(Message::GameFound(p));
+            });
+            let _ = tx.send(Message::SearchEnded(done));
+        });
+    }
+
+    pub fn cancel_search(&mut self) {
+        if let Some(c) = &self.search {
+            c.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Setup: places what the runtime needs beside it and lists what is written where. Never
+    /// writes into the game folder.
+    pub fn run_setup(&mut self) {
+        let mut notes = Vec::new();
+        match firstrun::ensure_d3d12(&self.scarlett_dir(), &runtime::runtime_dir()) {
+            Ok(Some(n)) => notes.push((true, n)),
+            Ok(None) => notes.push((true, format!("D3D12 runtime found in {}", self.scarlett_dir().join("D3D12").display()))),
+            Err(e) => notes.push((false, e)),
+        }
+        let cache = self.scarlett_cache();
+        let created = std::fs::create_dir_all(&cache).is_ok();
+        let free = game::free_space(&cache).map(|f| format!(", {} free", game::human(f))).unwrap_or_default();
+        notes.push((created, format!("Shader cache: {}{free}", cache.display())));
+        notes.push((true, format!("Settings: {}", config_path().display())));
+        notes.push((true, format!("Game data and saves: {}", game::title_data_dir(std::path::Path::new(&self.config.game_path)).display())));
+        notes.push((true, "Your game folder is only read; nothing is written there.".into()));
+        self.setup_notes = notes;
+        self.save();
+    }
+
+    /// Pause or resume the running preparation (the engine process is suspended, not stopped).
+    pub fn toggle_pause(&mut self) {
+        let p = !self.pause.load(Ordering::Relaxed);
+        self.pause.store(p, Ordering::Relaxed);
+    }
+
+    pub fn paused(&self) -> bool {
+        self.pause.load(Ordering::Relaxed)
+    }
+
+    pub fn set_player_name(&mut self) {
+        self.config.player_name = firstrun::clean_name(&self.name_edit);
+        self.name_edit = self.config.player_name.clone();
+        self.save();
+    }
+
+    /// True when the preset's cache was prepared for this translator, driver and preset.
     pub fn prepared(&self) -> bool {
         prep::matches(&self.scarlett_cache(), &self.prep_stamp())
     }
@@ -943,6 +1046,10 @@ impl Launcher {
             let level = env.iter().find(|(k, _)| *k == "SCARLETT_LOG").map(|(_, v)| v.clone()).unwrap_or_else(|| "info".into());
             presets::set(&mut env, "SCARLETT_LOG", format!("{level},scarlett_gpu::host=info"));
         }
+        let name = firstrun::clean_name(&self.config.player_name);
+        if !name.is_empty() {
+            presets::set(&mut env, firstrun::NAME_SWITCH, name);
+        }
         let toml = runtime::data_dir().join("scarlett.toml");
         if tuning::write_toml(&toml, &t.toml_keys(fsr)).is_ok() {
             presets::set(&mut env, "SCARLETT_CONFIG", toml.display().to_string());
@@ -953,6 +1060,7 @@ impl Launcher {
     /// Hashes and describes the local build on a worker thread.
     pub fn refresh_local(&mut self) {
         self.local_hash = None;
+        self.local_translator = None;
         self.local_desc.clear();
         if !self.local_ok() {
             return;
@@ -961,6 +1069,7 @@ impl Launcher {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(Message::Local(runtime::file_hash(&exe), cli::describe(&exe)));
+            let _ = tx.send(Message::Translator(true, firstrun::fingerprint(&exe)));
         });
     }
 
@@ -1146,12 +1255,14 @@ impl Launcher {
     }
 
     /// The hash the shaders were built for and the hash of the selected engine.
-    fn shader_hashes(&self) -> (&str, Option<&str>) {
+    /// What the shaders were built for and what the engine needs now. World: the shader key
+    /// (translator fingerprint), so an update that keeps the translator stays built.
+    fn shader_hashes(&self) -> (String, Option<String>) {
         if self.world_selected() {
             let built = if self.local_selected() { &self.config.local_shaders_hash } else { &self.config.world_shaders_hash };
-            (built, self.effective_world_hash())
+            (built.clone(), self.effective_world_hash().map(|_| self.shader_key()))
         } else {
-            (&self.config.shaders_hash, self.runtime_hash.as_deref())
+            (self.config.shaders_hash.clone(), self.runtime_hash.clone())
         }
     }
 
@@ -1160,8 +1271,8 @@ impl Launcher {
         flow::stage(&flow::Inputs {
             game_complete: self.game_complete(),
             precompiling: self.running == Some(RunKind::Precompile),
-            built_hash,
-            runtime_hash,
+            built_hash: &built_hash,
+            runtime_hash: runtime_hash.as_deref(),
             inline_shaders: false,
         })
     }
@@ -1310,9 +1421,9 @@ impl Launcher {
                                 let _ = prep::write(&self.scarlett_cache(), &self.prep_stamp());
                             }
                             if self.world_selected() && self.local_selected() {
-                                self.config.local_shaders_hash = self.local_hash.clone().unwrap_or_default();
+                                self.config.local_shaders_hash = self.shader_key();
                             } else if self.world_selected() {
-                                self.config.world_shaders_hash = self.world_hash.clone().unwrap_or_default();
+                                self.config.world_shaders_hash = self.shader_key();
                             } else {
                                 self.config.shaders_hash = self.runtime_hash.clone().unwrap_or_default();
                             }
@@ -1338,6 +1449,12 @@ impl Launcher {
                     Ok(found) => {
                         self.runtime_note = found.dir.display().to_string();
                         self.world_dir = found.world.is_some().then(|| found.dir.clone());
+                        if found.world.is_some() {
+                            let (tx, exe) = (self.tx.clone(), runtime::scarlett_exe());
+                            std::thread::spawn(move || {
+                                let _ = tx.send(Message::Translator(false, firstrun::fingerprint(&exe)));
+                            });
+                        }
                         self.world_hash = found.world;
                         self.runtime_hash = found.classic;
                         self.runtime_dir = Some(found.dir);
@@ -1371,7 +1488,7 @@ impl Launcher {
                     if let Some(p) = p {
                         self.use_folder(p);
                         if self.page == Page::Welcome && self.game_ok {
-                            self.wizard_step = 1;
+                            self.verify = None;
                             self.run_verify();
                         }
                     }
@@ -1393,6 +1510,24 @@ impl Launcher {
                 Message::Local(hash, desc) => {
                     self.local_hash = hash;
                     self.local_desc = desc;
+                }
+                Message::Translator(local, t) => {
+                    if local { self.local_translator = t } else { self.world_translator = t }
+                }
+                Message::GameFound(p) => {
+                    if !self.found_games.contains(&p) {
+                        self.found_games.push(p);
+                    }
+                    // the first one found is taken when no folder is set yet (Browse still changes it)
+                    if !self.game_ok && self.found_games.len() == 1 {
+                        self.use_folder(self.found_games[0].clone());
+                        self.verify = None;
+                        self.run_verify();
+                    }
+                }
+                Message::SearchEnded(done) => {
+                    self.search = None;
+                    self.search_end = Some(done);
                 }
                 Message::Verified(r) => {
                     self.verify_busy = false;
