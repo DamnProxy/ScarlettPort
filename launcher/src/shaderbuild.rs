@@ -392,11 +392,14 @@ fn world_split(job: &Job) -> Result<String, String> {
         base(&mut cmd);
         cmd.args(engine::shaders_args(&job.game, p.jobs));
         log(&job.tx, format!("> scarlett shaders \"{}\" --jobs {}  (phase 1 of 2: translate every shader, a few minutes; already translated ones are skipped)", job.game.display(), p.jobs));
-        p.current = "translating (the engine reports every 1,000 shaders)".into();
+        // The engine reads the game files first and prints its first count only after that.
+        p.name = "Scanning game files";
+        p.current = "reading the game files first; the shader count starts after that (a few minutes)".into();
         send(job, &p);
         let mut tick = Instant::now();
         let out = run(cmd, job, None, |l| {
             if let Some(n) = engine::parse_shaders(l) {
+                p.name = "Translating shaders";
                 p.done = n;
                 p.total = p.total.max(n);
                 p.current = format!("translating shaders {}–{}", n, (n + 1000).min(p.total));
