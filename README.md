@@ -1,228 +1,120 @@
-<p align="center"><a href="https://github.com/ZigZagBoi1/ScarlettPort"><img src="https://img.shields.io/github/stars/ZigZagBoi1/ScarlettPort?style=for-the-badge&logo=github&label=Star%20ScarlettPort&color=ffd700" alt="Star ScarlettPort on GitHub"></a></p>
-<p align="center"><b>⭐ If ScarlettPort helps you, please star the repo, it helps more people find it.</b></p>
-> **New in 0.5.0:** the save emulation no longer sleeps retrying old save folders it cannot delete (about 243 s per boot), the upscaler's 24 MB network buffer is kept in card memory, and two shader translation fixes are on by default. Measured on an RTX 3060 12 GB, Ryzen 5 5600X, 32 GB: the world is reached in 178 s instead of 244 s, the upscaler's slowest pass takes 0.1-0.3 ms per frame instead of 55-71 ms, and the world runs at 3.4 fps instead of 1.6 fps. Changing the translation defaults rebuilds the shader cache once.
->
-> **New in 0.4.8:** Prepare shaders works again with the 0.4.6+ engine (`scarlett shaders`, then `scarlett warm`), and the engine no longer refuses the launcher's `scarlett.toml`; `play-scarlett.ps1`/`setup-scarlett.ps1` use the same commands and the launcher's Stable settings; Settings, Features gains a performance overlay and a ray tracing switch; `SCARLETT_CAPTURE_LOG` writes `frames.csv` with the Stable preset too.
->
-> **New in 0.4.7:** everything is named ScarlettPort now: the runtime is `scarlett.exe`, its switches are `SCARLETT_*`, and its data folder is `%LOCALAPPDATA%\ScarlettPort` (saves, caches and settings from the old folder are moved over on first start). The runtime also gains a GPU frame profiler.
->
-
-> **New in 0.4.6:** the engine's renderer was rebuilt on a new base for a much more complete picture: lit rooms without ray tracing, ambient and sky light, textures shown complete, correct faces and clothing. On an RTX 3060 this picture currently runs at about 1 fps in the world, slower than 0.4.5's darker picture (about 5 fps); frame rate is the next focus. Run **Prepare shaders** in the launcher before the first play.
-
-
 <div align="center">
 
 # ScarlettPort
 
-**A bring-your-own-copy compatibility layer for Xbox Series X|S titles on Windows: its own runtime, its own launcher.**
-No emulator, no streaming. The title's own x64 code runs on your CPU, and its RDNA2 GPU code is recompiled for your graphics card on the fly. You supply a dump of your own legally purchased copy; nothing of any title is included here. Wine and Proton are the spirit of it.
+**Run your own Xbox Series X|S dump on a Windows PC. Its own runtime, its own launcher.**
 
-ScarlettPort is the **ScarlettPort runtime** (`engine/`, built as `scarlett.exe`) and the **ScarlettPort launcher** (`launcher/`). Since the runtime's fork point, 97,484 of its 204,657 lines (48%) are new or changed in this project: 145 new files and 94 changed ones, from 411 commits on top of the fork point (295 of them ScarlettPort's own) plus the pull requests merged here. That count also includes community work merged in and credited in [CREDITS.md](CREDITS.md).
+<a href="https://github.com/ZigZagBoi1/ScarlettPort"><img src="https://img.shields.io/github/stars/ZigZagBoi1/ScarlettPort?style=flat&logo=github&label=stars&color=ffd700" alt="GitHub stars"></a>
+<a href="https://github.com/ZigZagBoi1/ScarlettPort/releases/latest"><img src="https://img.shields.io/github/v/release/ZigZagBoi1/ScarlettPort?style=flat&label=release" alt="Latest release"></a>
+<a href="https://github.com/ZigZagBoi1/ScarlettPort/releases"><img src="https://img.shields.io/github/downloads/ZigZagBoi1/ScarlettPort/total?style=flat&label=downloads" alt="Downloads"></a>
+<a href="LICENSE.md"><img src="https://img.shields.io/badge/licence-GPL-blue?style=flat" alt="Licence"></a>
 
-### Where it stands
+<b>⭐ If ScarlettPort helps you, please star the repo, it helps more people find it.</b>
 
-Developed and tested so far against one open-world title. Done: it boots, gets through the menus, saves and legal screens, reaches the world in 178 s, renders the full picture (lit rooms, ambient and sky light, complete textures) and gives you control in the opening area. Remaining: frame rate (3.4 fps in the world on an RTX 3060 12 GB with a Ryzen 5 5600X in 0.5.0, the goal is a playable 30 fps), stability over long sessions (no long run has been recorded yet), and known issues: haze indoors and a crash reported mid-prologue (issue #51). It is **not yet verified playable**.
+</div>
 
-![progress](https://img.shields.io/badge/progress-90%25-ff2d95?style=for-the-badge)
+<img src="assets/world-lit.png" width="100%" alt="Lit gameplay view drawn by the ScarlettPort runtime">
+
+<sub>The title's own final image in gameplay on an RTX 3060: sunlight, textures, a fence and buildings. Shadowed areas are still too dark and some HUD text is cut off.</sub>
+
+## What it is
+
+A bring-your-own-copy compatibility layer, in the spirit of Wine and Proton. No emulator, no streaming: the title's own x64 code runs on your CPU, and its RDNA2 GPU code is recompiled for your graphics card on the fly.
+
+You supply a dump of your own legally purchased copy. Nothing of any title is included here.
+
+## Status
+
+![progress](https://img.shields.io/badge/progress-90%25-ff2d95?style=flat)
 
 ```
 ██████████████████░░  90%
 ```
 
-`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `full picture` ✅ → `gameplay starts` ✅ (3.4 fps, RTX 3060) → `playable speed` ⏳
+**Done:** boots, gets through menus, saves and legal screens, reaches the world (in 178 s in 0.5.0) and gives you control in the opening area, with the full picture: lit rooms, ambient and sky light, complete textures.
 
-<a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" height="45"/></a>
-<a href="https://ko-fi.com/ziggymar"><img src="https://img.shields.io/badge/BUY%20A%20COFFEE-Ko--fi-ff5f5f?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" height="45"/></a>
+**Remaining:**
 
-<sub>Donations are voluntary gifts that support development time. They are not a purchase: they buy no game content, access, builds or perks.<br>PayPal: please send as <b>Friends & Family</b> (a gift).</sub>
+- **Frame rate:** 3.4 fps in the world on an RTX 3060 12 GB + Ryzen 5 5600X (v0.5.0, Series S profile). The goal is a playable 30 fps.
+- **Stability over long sessions:** no long run has been recorded yet.
 
-</div>
+**New in 0.5.0** (RTX 3060 12 GB, Ryzen 5 5600X, 32 GB, one boot each, 0.4.x defaults against 0.5.0 defaults):
 
----
+- The save emulation no longer sleeps retrying old save folders it cannot delete (it slept about 243 s per boot).
+- The upscaler's 24 MB network buffer is kept in card memory: its slowest pass takes 0.10-0.28 ms per frame instead of 55.7-70.8 ms.
+- Two shader translation fixes are on by default (the first run rebuilds the shader cache once).
+- World reached in 178 s instead of 244 s (one boot each; load times vary from boot to boot), and 3.4 fps in the world instead of 1.6. The 95th-percentile frame did not improve (4,464 ms against 4,250 ms).
+- Load work (read-ahead, unpaced loading frames, `scarlett prepare`) is opt-in in the Experimental preset; not measured on its own yet.
+- Launcher 0.5.0: a first-run setup (game folder search, player name, one-time shader preparation).
 
-## 🛠️ What ScarlettPort has built
+**Known issues:** haze indoors; a crash reported mid-prologue ([#51](https://github.com/ZigZagBoi1/ScarlettPort/issues/51)).
 
-- **Runtime work on the frame:** a per-frame timeline of the thread that gates each present (preparing draws, refresh copies, card waits, title reads), which is how the numbers below were found; a fair texture upload queue (about 110 textures left waiting at the end of a run, against 21,000 or more before); copies cut from 286 to 84 MB per frame; the yard stutter fixed with lazy remapping of title memory; screen passes with workers of their own; a submission relay and precise read-back settles.
-- **Memory work:** sub-page refreshes, a capped card-copy reserve, and opt-in out-of-memory back-off, commit gate and prefetch cap.
-- **Picture and shader option sets:** `SCARLETT_LOOK=1` (picture fixes) and `SCARLETT_SHADER_FIXES=1` (shader translation fixes), offered together as the launcher's **Look** preset.
-- **Shader pipeline:** all 26,084 programs translate; a shader prewarm and `scarlett precompile-graphics` make 25,200 of 25,471 graphics pipelines ahead of play.
-- **The launcher:** one window to pick a dump, build shaders (resumable, phase by phase), choose a verified preset (Stable, Look) and play; checked updates, controller detection, saves and crash lists.
-- **Measured on an RTX 3060 12 GB with a Ryzen 5 5600X (Series S profile):** 5.4 fps while walking and turning in the world (median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms; 3.9-4.5 fps before). 30 fps is not reached.
+### Community results
 
-## 🧭 Architecture
+Hardware reports from testers. These are **their own measurements**, not ours.
 
-```
-launcher (ScarlettPort.exe, Rust + egui)
-   │  dump folder, presets, SCARLETT_* switches
-   ▼
-ScarlettPort runtime (scarlett.exe, engine/)
-   ├── loader + platform services   the title's x64 code runs natively; console OS calls answered on Windows
-   ├── shader translator            RDNA2 GPU code -> DXIL, cached on disk, pipelines built ahead of play
-   ├── Direct3D 12 back end         command lists, memory, textures, read-backs, presents
-   └── DirectStorage + audio        streaming reads, XMA decode
-```
+- **RX 9060 XT 16 GB + Ryzen 7 7700X**, v0.4.9 after warm: 18.7 fps median (53.4 ms; best 32.9 ms), up 3.3x from v0.4.4. [#53](https://github.com/ZigZagBoi1/ScarlettPort/issues/53)
+- **RTX 5070 12 GB + Ryzen 7 5800X3D**, v0.4.6: 7-8 fps. [#33](https://github.com/ZigZagBoi1/ScarlettPort/issues/33)
+- **RX 9060 XT**, v0.4.4: 5.3-6.0 fps. [#43](https://github.com/ZigZagBoi1/ScarlettPort/issues/43)
+- **RTX 3080 10 GB:** 3-4 fps in the world, through the prologue into the first mission. [#26](https://github.com/ZigZagBoi1/ScarlettPort/issues/26)
+- **RTX 3060 12 GB**, v0.4.5: about 3 fps. [#47](https://github.com/ZigZagBoi1/ScarlettPort/issues/47)
+- **Ours, RTX 3060 12 GB + Ryzen 5 5600X + 32 GB**, v0.5.0: 3.4 fps in the world (1.6 fps with the 0.4.x defaults in the same test).
 
-Every runtime switch is a `SCARLETT_*` environment variable; the executable is `scarlett.exe`, and the runtime keeps its data in `%LOCALAPPDATA%\ScarlettPort`.
+<details>
+<summary><b>Community results table</b></summary>
 
----
+| Report | GPU | CPU | Version | Their result |
+|---|---|---|---|---|
+| [#53](https://github.com/ZigZagBoi1/ScarlettPort/issues/53) | RX 9060 XT 16 GB | Ryzen 7 7700X | 0.4.9, after warm | 18.7 fps median (53.4 ms; best 32.9 ms), 3.3x over 0.4.4 |
+| [#33](https://github.com/ZigZagBoi1/ScarlettPort/issues/33) | RTX 5070 12 GB | Ryzen 7 5800X3D | 0.4.6 | 7-8 fps |
+| [#43](https://github.com/ZigZagBoi1/ScarlettPort/issues/43) | RX 9060 XT | Ryzen 7 7700X | 0.4.4 | 5.3-6.0 fps |
+| [#26](https://github.com/ZigZagBoi1/ScarlettPort/issues/26) | RTX 3080 10 GB | Ryzen 9 3900X | | 3-4 fps in the world, prologue into the first mission |
+| [#47](https://github.com/ZigZagBoi1/ScarlettPort/issues/47) | RTX 3060 12 GB | Ryzen 5 5600X | 0.4.5 | about 3 fps |
 
-## 📸 Screenshots
+</details>
 
-### Opening cell, ray tracing on (contributor's capture, PR #25)
+## Install
 
-| Before | After |
-| --- | --- |
-| ![Cell wall before the lighting fix](https://github.com/user-attachments/assets/5e917b82-c0bb-4cbd-bb3e-9dc3b840a42d) | ![Cell wall after the lighting fix](https://github.com/user-attachments/assets/99a24a6d-f9c3-432a-8d4e-443f88d9568f) |
-| ![Bunks before the lighting fix](https://github.com/user-attachments/assets/e1312aa7-9d51-4f8a-9144-28886e0acb9f) | ![Bunks after the lighting fix](https://github.com/user-attachments/assets/71b78492-79b6-4d29-84f1-b07b8e3ac721) |
-| ![Floor behind the table base with shadows disabled](https://github.com/user-attachments/assets/b13bbf0a-87c7-4928-8f1f-0ce09fda5a47) | ![Shadow behind the table base](https://github.com/user-attachments/assets/014da3d5-ad7f-4b08-af21-f2dbac7a05de) |
+1. Download `ScarlettPort-<version>-win64.zip` from [Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases).
+2. Right-click the ZIP, **Extract All** (keep `ScarlettPort.exe` and the `runtime` folder side by side).
+3. Run `ScarlettPort.exe`.
+4. Pick your game folder. It prepares shaders once, then press **Play**.
 
-<sub>Bounce light on the cell wall and bunk, and the table's shadow, restored by grooving6's PR #25. Captured by the contributor on an RX 7900 XTX with ray tracing switched on (`-RayTracing`, off by default). Not measured on other cards; ray tracing costs frame rate.</sub>
+**Requirements**
 
-### Opening cell on an RTX 3060, default settings
+- Windows 10/11 x64
+- DirectX 12 GPU with Shader Model 6.6 and mesh shaders (RTX 20-series / RX 6000 or newer)
+- 32 GB RAM recommended
+- Your own game files (your own dump of your own copy)
 
-![Opening cell on an RTX 3060](assets/cell-rtx3060.png)
+<sub>The release is built by CI from this repo, is not code-signed, and lists SHA-256 checksums in its notes.</sub>
 
-<sub>The v0.4.3 runtime on an RTX 3060 under Windows 10, ray tracing off, while walking and turning: warm rim light through the fence, hair and bunks drawn. Measured at about 5 fps in this scene.</sub>
+## More
 
-The screenshots below were captured on an RTX 3060 under Windows 10.
+<details>
+<summary><b>Progress and task board</b></summary>
 
-### Gameplay view, lit
+`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `full picture` ✅ → `gameplay starts` ✅ → `playable speed` ⏳
 
-![Lit gameplay view](assets/world-lit.png)
+| Stage | Status | Notes |
+|---|:---:|---|
+| Executable loads, imports bind | ✅ | the title's console DLLs load |
+| Intro, setup and menus | ✅ | 30 fps, audio plays |
+| Saves and legal screens | ✅ | the title saves a checkpoint and loads it again |
+| Open world loads | ✅ | world data streams in through DirectStorage |
+| Lit world renders | ✅ | since 0.4.6 the full picture (lit rooms, ambient and sky light, complete textures) at about 3 fps on an RTX 3060 (Series S profile); the older darker picture ran at about 5.4 fps |
+| Gameplay starts | ✅ | the prologue runs; not played end to end |
+| Pipelines prebuilt | ✅ | 25,200 of 25,471 graphics pipelines made ahead of time, and used in play |
+| Shaders translate | ✅ | all 26,084 translate; 26,013 pass DXIL validation on their own, the other 71 (oversized mesh shaders) validate only when linked with their pixel shader. XCL's counts differ ([`docs/STATUS.md`](docs/STATUS.md)) |
+| Keyboard and mouse | ✅ | click to capture, W walks the character |
+| Tile-grid overlay over gameplay | ✅ | fixed (rectangle-list pipelines decode right) |
+| Shadowed areas | ✅ | lit by the 0.4.6 renderer's ambient and sky light |
+| Intro cutscene | 🔨 | very slow unless skipped |
+| Speed work | 🔨 | stable frame pacing, yard stutter fixed, copies cut from 286 to 84 MB per frame; pipeline compile freezes on first runs |
+| Playable | ⏳ | not verified |
+| 30 fps on a mid-range PC | ⏳ | the goal |
 
-<sub>The title's own final image in gameplay: sunlight, textures, a fence and buildings, with the movement hint on screen. Shadowed areas are still too dark and some HUD text is cut off. Drawn by the ScarlettPort runtime.</sub>
-
-### Gameplay view with stand-in lighting (earlier build)
-
-![World with fallback lighting](assets/world-fallback-light.png)
-
-<sub>An earlier build, before the title's own lighting translated: a stand-in lighting pass (sky, a sun, fog) over the world's own geometry buffers. Fences, a bin and props are drawn; terrain and most surface colours are missing.</sub>
-
-### First gameplay frame (earlier build)
-
-![Movement hint prompt](assets/tutorial-prompt.png)
-
-<sub>The title's own movement hint, drawn over a still-black 3D picture because the lighting shaders did not all translate yet in that build.</sub>
-
-### Street, debug colours (earlier build)
-
-![Street in debug colours](assets/world-street-debug.png)
-
-<sub>One of the title's own geometry buffers shown in the window with a debug colour view, in real time. Lighting and textures are not there. That view is not part of the current runtime source.</sub>
-
-### Interior, debug colours (earlier build)
-
-![Interior geometry in debug colours](assets/world-sofa-debug.png)
-
-<sub>A sofa from an interior scene, drawn in real time with the same debug colour view of an internal buffer. The geometry is there; the lighting pass still output black in that build.</sub>
-
-### First world geometry (earlier build)
-
-![First world geometry](assets/first-world-geometry.png)
-
-<sub>One of the title's own render passes drawing the ground in 3D perspective. An internal pass, not a final image.</sub>
-
-### First-boot settings screen
-
-![Settings screen](assets/menu-subtitles.png)
-
-<sub>A first-boot settings screen drawn by the title on the runtime; the window caption shows 30 fps. Other screens (title artwork, loading screens, legal notices) are left out of this repo on purpose.</sub>
-
----
-
-## 🧱 What blocks a good picture
-
-Measured on an RTX 3060 (Series S profile, the title's own upscaler):
-
-- **Speed:** 5.4 fps while walking and turning in the world (median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms; RTX 3060 12 GB, Ryzen 5 5600X; 3.9-4.5 fps before). 30 fps is not reached. Where the frame goes, measured on the thread that gates each present: about 187 ms per frame, of which about 55 ms is preparing draws, about 31 ms is refresh copies, about 76 ms is waiting on the card after the title writes next to memory that shaders wrote, and about 19 ms is waiting for title reads. An infinitely fast card would still leave about 99 ms per frame; free copy-back would leave about 180 ms; a quarter of the resolution saves only about 13 ms of GPU time. So the card is not the limit: the waits and the processor work around it are. Tested with no gain: the shader optimizer mask, the pipelining switch, a lock split, thin LTO and removing the settle. The GPU profiler (`SCARLETT_GPU_PROFILE`) measures about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines, so no single pass is the one to fix. The intro cutscene is very slow unless it is skipped.
-- **Pipeline compile freezes:** on a first run, moving into new areas freezes while pipelines compile. The shader prewarm and the pipeline cache shorten this on later runs.
-- **Shadowed areas are too dark.** Hair and lighting render correctly in the opening cell. Ray tracing is off by default. With it enabled on an RX 7900 XTX (not on this RTX 3060), the title's probes and distant-shadow pass hit geometry in the opening cell. [Ray-tracing test notes](engine/docs/fork-ray-tracing.md)
-- **Not verified playable:** nobody has played a session end to end.
-
-Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROADMAP.md).
-Questions: [`docs/FAQ.md`](docs/FAQ.md). Problems: [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
-
----
-
-## 🆕 New in v0.5.0
-
-Measured in two boots on an RTX 3060 12 GB, Ryzen 5 5600X, 32 GB RAM (Series S profile), the same scripted route, 180 s in the world, 0.4.x defaults against 0.5.0 defaults:
-
-| | before | after |
-|---|---|---|
-| world reached | 244 s | 178 s |
-| world fps (median / 95th percentile frame) | 1.6 (821 ms / 4,250 ms) | 3.4 (664 ms / 4,464 ms) |
-| upscaler pass 8cbd7f5b, card time | 55.7-70.8 ms/frame | 0.10-0.28 ms/frame |
-| upscaler passes f4611739 / f7fc6c98 | 43.7-50.0 / 34.7-40.1 ms/frame | below 0.1 ms/frame (left the profile's top list) |
-| crashes | 0 | 0 |
-
-One boot each; load times vary from boot to boot (199-404 s seen in earlier runs), so the load-time gain is a single measurement. The 95th-percentile frame did not improve.
-
-- **Save wait fix (on by default, `SCARLETT_SAVE_NO_WAIT`):** an old save version's folder that will not delete is removed file by file, tried once without sleeping. Before, the save emulation slept about 243 s per boot retrying it.
-- **Upscaler on the card (on by default, `SCARLETT_CARD_BIG_ROOM`, 256 MB):** buffers of 16 MB and more get card memory past the cap the world load's small copies used up, so the upscaler's 24 MB network tensor is no longer read over PCIe.
-- **Faster translation (on by default, `SCARLETT_GUARD_SINK`, `SCARLETT_LOADS_WIDE`):** one guard per run of guarded writes and console loads four dwords at a time. Both are in the shader cache key, so the first 0.5.0 run rebuilds shaders.
-- **Load work (opt-in, Experimental preset):** `SCARLETT_LOAD_UNPACED` (loading and menu frames skip the frame wait), `SCARLETT_PREFETCH` (reads ahead what the last boot read), `SCARLETT_PIPELINE_BOOK` (records the pipeline list `scarlett prepare` builds from), and the `scarlett prepare` command. They booted cleanly together but are not measured on their own yet.
-- **Launcher 0.5.0:** Stable sets the four new defaults; Experimental adds the load switches.
-- **Any switch can be turned back off** with `=0`.
-
-## New in v0.4.5
-
-A restructure, no runtime behaviour change: frame rate is the same as 0.4.4.
-
-- **The runtime is first-class:** its source is `engine/` the source of truth rather than a patch stack; `engine/UPSTREAM.md` names the fork point and how upstream changes are merged, and the full credits list moved to `CREDITS.md`.
-- **`scarlett.exe`:** the runtime's executable and command name.
-- **`SCARLETT_*` switches:** every switch is a `SCARLETT_*` variable; the launcher and scripts set them.
-- **Launcher 0.4.5:** calls the World engine "ScarlettPort runtime"; presets unchanged.
-
-## New in v0.4.4
-
-New options, all **off by default** and **not yet measured on our RTX 3060**. Frame rate is unchanged at about 5 fps; these are about the picture, sound and memory, not speed.
-
-- **`SCARLETT_LOOK=1` (picture):** ambient light so dark rooms are not black, texture and colour fixes (no stray bytes or specks over faces, textures that changed being re-checked sooner, partly unmapped textures no longer uploaded as black, misaligned buffer views fixed), sampler and vertex-format fixes, and ocean textures copied back so boats float instead of sinking.
-- **`SCARLETT_SHADER_FIXES=1` (shader translation):** a more accurate translation of many shader instructions and forms. It changes the shader cache key, so the first run with it rebuilds shaders. Each part can be switched on its own (`SCARLETT_SHADER_*`, see the source).
-- **Audio fix (always on):** XMA audio is decoded until a whole block is ready, so sound no longer cuts out or stops when the title refills a voice.
-- **Memory options:** `SCARLETT_OOM_BACKOFF=1` (back off briefly when the card or PC is out of memory), `SCARLETT_COMMIT_GATE=1` (pause texture uploads when the PC is low on commit memory), `SCARLETT_PREFETCH_CAP=1` (cap texture bytes per frame). Also `SCARLETT_WAVE32_LOWER=1` (NVIDIA wave32 lowering fixes), `SCARLETT_MOVIE_PLANE=1` (movie frames uploaded from each list's own buffer) and `SCARLETT_THIN=1` (draw lists recorded on worker threads).
-- **Launcher 0.4.4:** a new opt-in **Look** preset (Stable plus `SCARLETT_LOOK=1` and `SCARLETT_SHADER_FIXES=1`); `scripts/play-scarlett.ps1 -Look` does the same. Stable is unchanged.
-
-Please send hardware reports if you try the Look preset: what looks better or worse, and your fps.
-
-## New in v0.4.3
-
-Measured in the world on an RTX 3060 12 GB with a Ryzen 5 5600X (Series S profile), walking and turning: 5.4 fps, median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms (3.9-4.5 fps before). 30 fps is not reached.
-
-- **Texture upload queue made fair** (`SCARLETT_FAIR_DUE=2`, the default): textures that show less than the title holds go first, then the ones that have waited longest. The queue now drains: about 110 textures are waiting at the end of a run, against 21,000 or more before.
-- **`SCARLETT_TEX_SPAN_PCT`** (25 by default, `0` turns it off): on a long frame the texture pass may take that share of the frame.
-- **A "texture queue" log line** every five seconds: textures due, uploaded in part, and the work done per frame.
-- **Hair and lighting** render correctly in the opening cell.
-- **Where the frame goes:** measured on the thread that gates each present: about 187 ms per frame, of which about 55 ms is preparing draws, about 31 ms is refresh copies, about 76 ms is waiting on the card after the title writes next to memory that shaders wrote, and about 19 ms is waiting for title reads. An infinitely fast card would still leave about 99 ms per frame; free copy-back would leave about 180 ms; a quarter of the resolution saves only about 13 ms of GPU time. So the card is not the limit: the waits and the processor work around it are. Tested with no gain: the shader optimizer mask, the pipelining switch, a lock split, thin LTO and removing the settle.
-- **Launcher 0.4.3:** version only, no feature changes.
-
-## New in v0.4.2
-
-Measured on an RTX 3060 (Series S profile): about 4 fps while walking and turning in the world, with steady pacing (95th-percentile frame about 270 ms).
-
-- **Lighting passes fixed:** the screen passes have workers of their own, on by default (`SCARLETT_SCREEN_WORKERS=0` turns them off).
-- **Texture reserve fix:** the room kept for card copies is capped (`SCARLETT_CARD_ROOM_KEPT_MB`, 512 by default), so the reserve no longer takes the memory textures need.
-- **Load time:** running from an internal SSD, the world is reached in about 212 s, against 300 s or more before.
-- **In-session A/B tooling:** switches are compared live within one game session.
-- **GPU profiler** (`SCARLETT_GPU_PROFILE`): GPU time is about 93-111 ms per frame, spread over about 1,100 pipelines.
-- **Shader optimizer:** the safe mask removes 51% of instructions offline; the in-game test is pending, so it stays off.
-- **Launcher 0.4.2:** the Stable preset adds `SCARLETT_FRIENDLY=1`, which leaves processor time to the desktop while the title runs.
-- **Known issues:** hair renders too bright, ray tracing is off, and the speed is far from 30 fps.
-
-## New in v0.4.0
-
-Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about 4 fps while moving, stable frame pacing.
-
-- **Yard stutter fixed:** lazy remapping of title memory plus the copy fix (`SCARLETT_REMAP_LAZY`, `SCARLETT_MEM_SUBPAGE`, `SCARLETT_COPY_NOQUERY`).
-- **Copies cut** from 286 to 84 MB per frame.
-- **Fast boot fixed** (`SCARLETT_FAST_BOOT`); it stays optional and off in the presets.
-- **In-session A/B tooling:** switch variants cycled live within one game session (`SCARLETT_AB`), with a per-variant summary.
-- **Shader prewarm:** shaders are translated ahead of play, so fewer compiles land mid-session.
-- **Launcher 0.4.0:** the Stable preset uses the fx-cand4 settings above.
-- **Known issues:** the lighting and hair look wrong (ray tracing is off); pipeline compiles freeze the picture when moving on a first run.
-
-## 🧪 Still in progress
+### Still in progress
 
 "In testing" means built and unit-tested, waiting for A/B game runs on our RTX 3060; "planned" means not built yet. Measured so far: the texture queue work in 0.4.3 (5.4 fps, 3.9-4.5 before); the other items have no measured fps gain yet.
 
@@ -237,7 +129,7 @@ Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about
 | Hair too bright | ✅ done | hair and lighting render correctly in the opening cell (0.4.3) |
 | Texture upload queue | ✅ done | fair order (`SCARLETT_FAIR_DUE=2`, default): about 110 textures waiting at the end of a run, against 21,000 or more before |
 | Ray-tracing BVH builder | 🔨 in progress | `SCARLETT_BVH_BUILDER` still makes stray writes |
-| Load time | 🔨 in progress | 0.5.0 reaches the world in 178 s (244 s with the 0.4.x defaults, one boot each, RTX 3060); the read-ahead and unpaced loading frames are opt-in in Experimental, not measured alone; a load cache (`SCARLETT_LOAD_CACHE`) and a faster decoder (`SCARLETT_FAST_INFLATE`) are in the runtime, off by default, not measured yet |
+| Load time | 🔨 in progress | 0.5.0 reaches the world in 178 s (244 s with the 0.4.x defaults, one boot each, RTX 3060); read-ahead and unpaced loading frames are opt-in (Experimental), not measured alone; a load cache (`SCARLETT_LOAD_CACHE`) and a faster decoder (`SCARLETT_FAST_INFLATE`) are in the runtime, off by default, not measured yet |
 | World-entry copy stall | 📋 planned | cut the copies that stall entering the world |
 | PC responsiveness | 🧪 in testing | `SCARLETT_FRIENDLY=1` (set by the Stable preset): background work leaves processor time to the desktop |
 | Textures never uploaded | 📋 planned | 14,830 textures are never uploaded |
@@ -249,102 +141,11 @@ Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about
 | Launcher: Prepare shaders | 🧪 in testing | `scarlett shaders` translates every shader, then `scarlett warm` makes the pipelines earlier runs recorded at low priority, with progress and Stop/resume, so moving in the world does not stutter on first use |
 | Launcher: drive note | 🧪 in testing | Settings says to keep the game folder on an internal NVMe/SSD for load times |
 
----
-
-## 🚦 Where we are
-
-| Stage | Status | Notes |
-|---|:---:|---|
-| Executable loads, imports bind | ✅ | the title's console DLLs load |
-| Intro, setup and menus | ✅ | 30 fps, audio plays |
-| Saves and legal screens | ✅ | the title saves a checkpoint and loads it again |
-| Open world loads | ✅ | world data streams in through DirectStorage |
-| Lit world renders | ✅ | since 0.4.6 the full picture (lit rooms, ambient and sky light, complete textures) at about 3 fps on an RTX 3060 (Series S profile), 7-8 fps on an RTX 5070; the older darker picture ran at about 5.4 fps |
-| Gameplay starts | ✅ | the prologue runs; not played end to end |
-| Pipelines prebuilt | ✅ | 25,200 of 25,471 graphics pipelines made ahead of time, and used in play |
-| Shaders translate (ScarlettPort runtime) | ✅ | all 26,084 translate; 26,013 pass DXIL validation on their own, the other 71 (oversized mesh shaders) validate only when linked with their pixel shader. XCL's counts differ ([`docs/STATUS.md`](docs/STATUS.md)) |
-| Keyboard and mouse | ✅ | click to capture, W walks the character |
-| Tile-grid overlay over gameplay | ✅ | fixed (rectangle-list pipelines decode right) |
-| Shadowed areas | ✅ | lit by the 0.4.6 renderer's ambient and sky light |
-| Intro cutscene | 🔨 | very slow unless skipped |
-| Speed work | 🔨 | stable frame pacing, yard stutter fixed, copies cut from 286 to 84 MB per frame; pipeline compile freezes on first runs |
-| Playable | ⏳ | not verified |
-| 30 fps on a mid-range PC | ⏳ | the goal |
-
----
-
-## 🚀 Run it
-
-> **You need your own dump of your own legally obtained Xbox Series copy.** This repo contains **no game files** of any kind, and never will.
-
-**Requirements:** Windows 10/11 x64 · a D3D12 GPU with Shader Model 6.6 and mesh shaders (RTX 20-series / RX 6000 or newer) · 32 GB RAM recommended · [Rust](https://rustup.rs) (MSVC) · Windows SDK
-
-**Easiest: the launcher.** Download `ScarlettPort-<version>-win64.zip` from [Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases), extract the whole ZIP (keep `ScarlettPort.exe` and the `runtime` folder side by side), run `ScarlettPort.exe`, pick your dump folder, press **Build shaders**, then **Play**. The release is built by CI from this repo, is not code-signed, and lists SHA-256 checksums in its notes.
-
-The shader build uses the World engine (the ScarlettPort runtime, `scarlett warm`) by default:
-
-| | Expected time (12-thread CPU) | What you see |
-|---|---|---|
-| World engine (default) | about 3 min for `scarlett warm` (measured 171 s for 25,889 shaders), then about 8 min for the graphics pipelines (491 s for 25,200) | phase, count, the current step and its elapsed time |
-| Classic engine (XCL, Settings → Game) | 20–30 min with "skip slow shaders" on; 45 min to several hours with it off | the same, plus "no output for N s" during the slow tail |
-
-- **It resumes.** Stop it or close the launcher at any time; pressing **Build shaders** again skips what is done (finished phases are recorded in `<cache>\build-world.json`, translated shaders are read back from the cache).
-- **What "83%" means (Classic engine).** XCL's precompile gets through about 22,400 of 26,503 programs quickly. The last ~4,000 are huge world compute shaders that the graphics driver takes 6–190 s each to compile, and the counter only moves when one finishes, so it can sit at 83–85% for a long time while still working. The launcher now shows the time since the last progress and runs as many of these at once as your CPU and free RAM allow. With **Skip slow shaders** (Settings → Options, on by default, 60 s) a step that shows no progress for that long is stopped and the rest compile on demand in game. Or switch to the World engine, which does not have this tail.
-
-To run the runtimes without the launcher, two are included ([`docs/RUNTIMES.md`](docs/RUNTIMES.md)):
-
-**A. ScarlettPort runtime: furthest today** (lit world)
-
-```powershell
-git clone https://github.com/ZigZagBoi1/ScarlettPort.git
-cd ScarlettPort
-.\scripts\setup-scarlett.ps1                                   # build + Agility SDK
-.\scripts\play-scarlett.ps1 -Game "D:\path\to\your\dump"       # Series S profile by default
-```
-
-**B. XCL: menus and loading screens**
-
-```powershell
-.\scripts\setup.ps1 -Game "D:\path\to\your\dump"     # build + Agility SDK + precompile shaders (45 min to hours, once; resumes)
-.\scripts\play.ps1  -Game "D:\path\to\your\dump" -AutoMenu
-```
-
-- `play-scarlett.ps1` sets the recommended environment (`--console series-s`, `SCARLETT_OWN_UPSCALER=1`, `SCARLETT_NO_WATCHDOG=1`). Its switches include `-AutoInput`, `-FastBoot` (testing only) and `-SaveSlot`.
-- While the game runs, write button names into `press.txt` (e.g. `DOWN DOWN A`) to press them.
-- Logs go to `logs\`. Attach one when you open an issue.
-- Controls: an Xbox controller works best. On the ScarlettPort runtime with no pad connected, the keyboard is a pad: Enter = A, Backspace = B, WASD = left stick, IJKL = right stick.
-
-Environment variables: [`docs/RUNTIMES.md`](docs/RUNTIMES.md). Build instructions: [`docs/BUILDING.md`](docs/BUILDING.md).
-
----
-
-## ❓ FAQ
-
-**The shader build looks stuck at ~85%.**
-That is the Classic (XCL) engine's slow tail: the last ~4,000 of 26,503 programs are huge world shaders that the graphics driver compiles in 6–190 s each, so the count stops moving for minutes at a time while it is still working (one report: 22,200/26,503). Update the launcher: it uses the World engine by default (about 3 minutes), shows the current step and how long it has taken, and with **Skip slow shaders** on leaves the slowest ones to compile in game. Whatever you already built is kept; pressing **Build shaders** again resumes.
-
-**Do I need to rebuild after updates?**
-After a launcher or runtime update the launcher marks the shaders as needing a rebuild. The shipped World engine keys its shader cache on the whole translator source, so a runtime update that changes the shader translator translates everything again (about 3 minutes); an update that does not touch the translator reuses the cache and the rebuild finishes quickly. A per-shader key that rebuilds only changed shaders exists in our fork (`fx-cachekey`) but is not in the runtime shipped here yet. The Classic engine's cache is keyed by the generated code, so it recompiles what changed.
-
-**Does the launcher go online?**
-Only for what you see: with "Updates" on (Settings → Options) it asks GitHub Releases at start whether a newer launcher exists. An update downloads only when you click it, into an `update` folder beside the launcher, is checked against the release's SHA-256 list, and is swapped in the next time you start the launcher; the replaced version is kept in `previous` for a rollback. "Send report" opens a prefilled GitHub hardware-report issue in your browser (your user name and folders are removed from the log). Discord status talks only to the Discord app on your PC.
-
-**Will auto-update trigger antivirus?**
-It can. Unsigned apps that download and replace executables can get reputation warnings (SmartScreen or antivirus) until a release has built up reputation. Our updater only acts when you click it, checks every file against the release's SHA-256 list, keeps the replaced version in `previous` for a rollback, and never uses `%TEMP%`. It updates only the launcher and its bundled `runtime` folder; a local build you picked in Settings → Runtime is never touched. If your antivirus flags a release, please report it as a false positive: [Microsoft's submission page](https://www.microsoft.com/en-us/wdsi/filesubmission).
-
-**Can I run my own runtime build?**
-Yes: Settings → Runtime → Local build, then browse to its `scarlett.exe` (keep its `D3D12` folder beside it) and pick a cache folder. The Stable preset sets the verified C1 environment, so no play script is needed.
-
-**How can I contribute?**
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md), then pick a task below or open an issue with one of the [issue templates](https://github.com/ZigZagBoi1/ScarlettPort/issues/new/choose) (bug report, hardware report, shader failure). Testers with different GPUs and hardware reports help most right now: GPU, driver, CPU, RAM, how long the shader build took and how far the game got.
-
----
-
-## 🤖 Task board: grab one, send a PR
+### Task board: grab one, send a PR
 
 Every task is sized for **one contributor**. Pick one, comment on its issue to claim it, and send a PR. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first (it takes two minutes).
 
-### Rendering
+**Rendering**
 
 - [ ] **#1 Light in shadow.** With ray tracing enabled (off by default), the opening cell has bounce light on an RX 7900 XTX. Other interiors and GPUs still need testing. See `engine/docs/fork-ray-tracing.md`.
 - [ ] **#2 Missing walls and roofs.** Some cards lose the first room's walls and roof with certain switches; find the cause (see `engine/VICKY.md`).
@@ -354,21 +155,21 @@ Every task is sized for **one contributor**. Pick one, comment on its issue to c
 - [ ] **#11 Ray-tracing BVH builder.** `SCARLETT_BVH_BUILDER` makes stray writes; find and fix them (upstream issues #2402 and #916 are related, see `CREDITS.md`). `engine/crates/scarlett-gpu/src/pipeline.rs`, `engine/crates/scarlett-shader/src/bvh.rs`.
 - [ ] **#12 Textures never uploaded.** 0.4.3 makes the upload queue fair (`SCARLETT_FAIR_DUE=2`, default): about 110 textures are waiting at the end of a run, against 21,000 or more before. Check what is still left waiting and why. `engine/crates/scarlett-gpu/src/texture.rs`, `descriptor/host.rs`.
 
-### Performance
+**Performance**
 
-- [ ] **#4 Frame time.** 0.5.0 runs the full picture at 3.4 fps in the world on the RTX 3060 (1.6 fps with the 0.4.x defaults in the same test; median frame 664 ms, 95th percentile 4,464 ms); the goal is 30 fps. Earlier: the 0.4.6 full picture ran at about 3 fps on the RTX 3060 (7-8 fps on an RTX 5070); the numbers below are from the older, darker picture: 5.4 fps while walking and turning in the world (median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms; RTX 3060 12 GB, Ryzen 5 5600X; 3.9-4.5 fps before); 30 fps is not reached. The thread that gates each present spends about 187 ms per frame: about 55 ms preparing, 31 ms in refresh copies, 76 ms waiting on the card after title writes next to shader-written memory, 19 ms waiting for title reads. An infinitely fast card would still leave about 99 ms, so the waits and copies are the work to do. `SCARLETT_GPU_PROFILE` measures about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines. See `engine/crates/scarlett-gpu/src/host.rs`, `draw.rs`.
+- [ ] **#4 Frame time.** 0.5.0 runs the full picture at 3.4 fps in the world on the RTX 3060 (median frame 664 ms, 95th percentile 4,464 ms); the goal is 30 fps. Earlier: the 0.4.6 full picture ran at about 3 fps on the RTX 3060 (7-8 fps on an RTX 5070). On the older, darker picture the thread that gates each present spends about 187 ms per frame: about 55 ms preparing, 31 ms in refresh copies, 76 ms waiting on the card after title writes next to shader-written memory, 19 ms waiting for title reads. An infinitely fast card would still leave about 99 ms, so the waits and copies are the work to do. See `engine/crates/scarlett-gpu/src/host.rs`, `draw.rs`.
 - [ ] **#5 Intro cutscene speed.** The intro is very slow unless skipped; find out why.
 - [ ] **#13 Zero-copy title memory.** `SCARLETT_ZERO_COPY` maps title memory for the GPU without copies; it needs placing to work at scale. `engine/crates/scarlett-gpu/src/zerocopy.rs`, `engine/crates/scarlett-hle/src/modules/xmem.rs`.
-- [ ] **#14 Load time.** The world is reached in about 212 s from an internal SSD. A load cache (`SCARLETT_LOAD_CACHE`) and a faster decoder (`SCARLETT_FAST_INFLATE`) are in the runtime, off by default: measure them. `engine/crates/scarlett-hle/src/modules/dstorage/loadcache.rs`.
+- [ ] **#14 Load time.** 0.5.0 reaches the world in 178 s (244 s before, one boot each). Measure `SCARLETT_PREFETCH` and `SCARLETT_LOAD_UNPACED` on their own. A load cache (`SCARLETT_LOAD_CACHE`) and a faster decoder (`SCARLETT_FAST_INFLATE`) are in the runtime, off by default: measure them. `engine/crates/scarlett-hle/src/modules/dstorage/loadcache.rs`.
 - [ ] **#15 World-entry copy stall.** Entering the world stalls on memory copies; find what is copied and cut it. `engine/crates/scarlett-gpu/src/memcopy.rs`, `host.rs`.
 - [x] **#16 PC responsiveness while running.** Done: `SCARLETT_FRIENDLY=1` keeps the rest of the PC usable (thread priorities, worker counts); the Stable preset sets it. `engine/crates/scarlett-core/src/friendly.rs`.
 - [x] **#6 Shader cache warm-up.** Done: `scarlett precompile-graphics` and the shader prewarm (`engine/apps/scarlett/src/translate.rs`, `engine/crates/scarlett-gpu/src/pipeline/precompiled.rs`).
 
-- [ ] **#51 Crash mid-prologue.** A crash was reported partway through the prologue; reproduce it and send the crash report.
+- [ ] **#51 Crash mid-prologue.** A crash was reported partway through the prologue; reproduce it and attach the crash report.
 - [ ] **Long sessions.** No long run has been recorded yet: play for an hour and report crashes, memory use and fps.
-- [ ] **Indoor haze.** Rooms look hazy indoors; compare with a reference capture and find the pass.
+- [ ] **Indoor haze.** Rooms look hazy indoors; find the pass that causes it.
 
-### Tooling & docs
+**Tooling and docs**
 
 - [ ] **#7 Hardware reports.** Run it on your GPU and post results (GPU, driver, fps, how far it got).
 - [ ] **Look preset A/B.** New in 0.4.4 and not yet measured: run Stable and Look (`SCARLETT_LOOK=1`, `SCARLETT_SHADER_FIXES=1`) in the same scene and report fps and what the picture gains or loses.
@@ -377,42 +178,272 @@ Every task is sized for **one contributor**. Pick one, comment on its issue to c
 - [ ] **Controller hot-plug report.** Try the Controller line with wireless (Bluetooth) PlayStation pads and other Xbox-compatible pads, and report what it shows. `launcher/src/controller.rs`.
 - [x] **Bring `SCARLETT_FRIENDLY` to the vendored runtime.** Done in 0.4.2: the runtime has it and the Stable preset sets it. `launcher/src/presets.rs`.
 
----
+Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
-## 🗂️ What's in here
+</details>
+
+<details>
+<summary><b>Measured results</b></summary>
+
+Measured on an RTX 3060 12 GB with a Ryzen 5 5600X (Series S profile, the title's own upscaler).
+
+- **0.5.0:** world reached in 178 s (244 s with the 0.4.x defaults); 3.4 fps in the world (1.6), median frame 664 ms (821), 95th percentile 4,464 ms (4,250); the upscaler's three network passes took 55.7-70.8 / 43.7-50.0 / 34.7-40.1 ms per frame before, 0.10-0.28 ms and below 0.1 ms after. One boot each, no crashes.
+- **Full picture (0.4.6):** about 3 fps in the world. A hardware report measured 7-8 fps on an RTX 5070.
+- **Older, darker picture (0.4.3):** 5.4 fps while walking and turning (median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms; 3.9-4.5 fps before). 30 fps is not reached.
+- **Where the frame goes** (thread that gates each present): about 187 ms per frame, of which about 55 ms is preparing draws, about 31 ms is refresh copies, about 76 ms is waiting on the card after the title writes next to memory that shaders wrote, and about 19 ms is waiting for title reads.
+- An infinitely fast card would still leave about 99 ms per frame; free copy-back would leave about 180 ms; a quarter of the resolution saves only about 13 ms of GPU time. So the card is not the limit: the waits and the processor work around it are.
+- **GPU profiler** (`SCARLETT_GPU_PROFILE`): about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines, so no single pass is the one to fix.
+- **Tested with no gain:** the shader optimizer mask, the pipelining switch, a lock split, thin LTO and removing the settle.
+- **Texture queue:** about 110 textures left waiting at the end of a run, against 21,000 or more before.
+- **Copies:** cut from 286 to 84 MB per frame.
+- **Load time:** the world is reached in about 212 s from an internal SSD, against 300 s or more before.
+- **Shaders:** all 26,084 programs translate; 25,200 of 25,471 graphics pipelines are made ahead of play.
+
+### What blocks a good picture
+
+- **Speed:** see above. The intro cutscene is very slow unless it is skipped.
+- **Pipeline compile freezes:** on a first run, moving into new areas freezes while pipelines compile. The shader prewarm and the pipeline cache shorten this on later runs.
+- **Shadowed areas are too dark.** Hair and lighting render correctly in the opening cell. Ray tracing is off by default. With it enabled on an RX 7900 XTX (not on this RTX 3060), the title's probes and distant-shadow pass hit geometry in the opening cell. [Ray-tracing test notes](engine/docs/fork-ray-tracing.md)
+- **Not verified playable:** nobody has played a session end to end.
+
+</details>
+
+<details>
+<summary><b>How it works</b></summary>
+
+ScarlettPort is the **ScarlettPort runtime** (`engine/`, built as `scarlett.exe`) and the **ScarlettPort launcher** (`launcher/`).
+
+```
+launcher (ScarlettPort.exe, Rust + egui)
+   │  dump folder, presets, SCARLETT_* switches
+   ▼
+ScarlettPort runtime (scarlett.exe, engine/)
+   ├── loader + platform services
+   │     the title's x64 code runs natively;
+   │     console OS calls answered on Windows
+   ├── shader translator
+   │     RDNA2 GPU code -> DXIL, cached on disk,
+   │     pipelines built ahead of play
+   ├── Direct3D 12 back end
+   │     command lists, memory, textures, read-backs, presents
+   └── DirectStorage + audio
+         streaming reads, XMA decode
+```
+
+Every runtime switch is a `SCARLETT_*` environment variable, and the runtime keeps its data in `%LOCALAPPDATA%\ScarlettPort`.
+
+Since the runtime's fork point, 97,484 of its 204,657 lines (48%) are new or changed in this project: 145 new files and 94 changed ones, from 411 commits on top of the fork point (295 of them ScarlettPort's own) plus the pull requests merged here. That count also includes community work merged in and credited in [CREDITS.md](CREDITS.md).
+
+### What ScarlettPort has built
+
+- **Runtime work on the frame:** a per-frame timeline of the thread that gates each present, a fair texture upload queue, copies cut from 286 to 84 MB per frame, the yard stutter fixed with lazy remapping of title memory, screen passes with workers of their own, a submission relay and precise read-back settles.
+- **Memory work:** sub-page refreshes, a capped card-copy reserve, and opt-in out-of-memory back-off, commit gate and prefetch cap.
+- **Picture and shader option sets:** `SCARLETT_LOOK=1` and `SCARLETT_SHADER_FIXES=1`, offered together as the launcher's **Look** preset.
+- **Shader pipeline:** a shader prewarm and `scarlett precompile-graphics`.
+- **The launcher:** one window to pick a dump, build shaders (resumable, phase by phase), choose a verified preset (Stable, Look) and play; checked updates, controller detection, saves and crash lists.
+
+### What's in here
 
 ```
 ScarlettPort/
-├── engine/           the ScarlettPort runtime (Cargo workspace, builds scarlett.exe); fork point in engine/UPSTREAM.md
-├── launcher/         native launcher (Rust, egui); runs the engines from a runtime\ folder beside it
-├── runtime/
-│   └── xcl/          Classic engine: XCL (ivall/xcl) with our changes
-├── scripts/          setup.ps1 / play.ps1 (XCL), setup-scarlett.ps1 / play-scarlett.ps1 (ScarlettPort runtime)
-├── patches/          our changes to XCL as a plain diff (xcl-stack.patch)
-├── docs/             STATUS, RUNTIMES, BUILDING, ROADMAP, FAQ, TROUBLESHOOTING
-├── assets/           screenshots
-├── CREDITS.md        full credits for the runtime's lineage
-└── LICENSE.md        licensing overview
+├── engine/     ScarlettPort runtime (builds scarlett.exe)
+├── launcher/   native launcher (Rust, egui)
+├── runtime/xcl Classic engine: XCL with our changes
+├── scripts/    setup/play scripts for both engines
+├── patches/    our changes to XCL (xcl-stack.patch)
+├── docs/       STATUS, RUNTIMES, BUILDING, ROADMAP,
+│               FAQ, TROUBLESHOOTING
+├── assets/     screenshots
+├── CREDITS.md  credits for the runtime's lineage
+└── LICENSE.md  licensing overview
 ```
 
----
+</details>
 
-## ⚖️ Legal
+<details>
+<summary><b>Screenshots</b></summary>
+
+**Opening cell on an RTX 3060, default settings**
+
+<img src="assets/cell-rtx3060.png" width="100%" alt="Opening cell on an RTX 3060">
+
+<sub>The v0.4.3 runtime on an RTX 3060 under Windows 10, ray tracing off, while walking and turning: warm rim light through the fence, hair and bunks drawn. Measured at about 5 fps in this scene.</sub>
+
+**Opening cell, ray tracing on (contributor's capture, PR #25)**
+
+Before, then after:
+
+<img src="https://github.com/user-attachments/assets/5e917b82-c0bb-4cbd-bb3e-9dc3b840a42d" width="49%" alt="Cell wall before the lighting fix"> <img src="https://github.com/user-attachments/assets/99a24a6d-f9c3-432a-8d4e-443f88d9568f" width="49%" alt="Cell wall after the lighting fix">
+<img src="https://github.com/user-attachments/assets/e1312aa7-9d51-4f8a-9144-28886e0acb9f" width="49%" alt="Bunks before the lighting fix"> <img src="https://github.com/user-attachments/assets/71b78492-79b6-4d29-84f1-b07b8e3ac721" width="49%" alt="Bunks after the lighting fix">
+<img src="https://github.com/user-attachments/assets/b13bbf0a-87c7-4928-8f1f-0ce09fda5a47" width="49%" alt="Floor behind the table base with shadows disabled"> <img src="https://github.com/user-attachments/assets/014da3d5-ad7f-4b08-af21-f2dbac7a05de" width="49%" alt="Shadow behind the table base">
+
+<sub>Bounce light on the cell wall and bunk, and the table's shadow, restored by grooving6's PR #25. Captured by the contributor on an RX 7900 XTX with ray tracing switched on (`-RayTracing`, off by default). Not measured on other cards; ray tracing costs frame rate.</sub>
+
+The screenshots below were captured on an RTX 3060 under Windows 10.
+
+**Gameplay view with stand-in lighting (earlier build)**
+
+<img src="assets/world-fallback-light.png" width="100%" alt="World with fallback lighting">
+
+<sub>Before the title's own lighting translated: a stand-in lighting pass (sky, a sun, fog) over the world's own geometry buffers. Fences, a bin and props are drawn; terrain and most surface colours are missing.</sub>
+
+**First gameplay frame (earlier build)**
+
+<img src="assets/tutorial-prompt.png" width="100%" alt="Movement hint prompt">
+
+<sub>The title's own movement hint, drawn over a still-black 3D picture because the lighting shaders did not all translate yet in that build.</sub>
+
+**Street, debug colours (earlier build)**
+
+<img src="assets/world-street-debug.png" width="100%" alt="Street in debug colours">
+
+<sub>One of the title's own geometry buffers shown with a debug colour view, in real time. Lighting and textures are not there. That view is not part of the current runtime source.</sub>
+
+**Interior, debug colours (earlier build)**
+
+<img src="assets/world-sofa-debug.png" width="100%" alt="Interior geometry in debug colours">
+
+<sub>A sofa from an interior scene, drawn in real time with the same debug colour view of an internal buffer. The geometry is there; the lighting pass still output black in that build.</sub>
+
+**First world geometry (earlier build)**
+
+<img src="assets/first-world-geometry.png" width="100%" alt="First world geometry">
+
+<sub>One of the title's own render passes drawing the ground in 3D perspective. An internal pass, not a final image.</sub>
+
+**First-boot settings screen**
+
+<img src="assets/menu-subtitles.png" width="100%" alt="Settings screen">
+
+<sub>A first-boot settings screen drawn by the title on the runtime; the window caption shows 30 fps. Other screens (title artwork, loading screens, legal notices) are left out of this repo on purpose.</sub>
+
+</details>
+
+<details>
+<summary><b>Switches and presets</b></summary>
+
+0.5.0 turns on by default: `SCARLETT_SAVE_NO_WAIT`, `SCARLETT_CARD_BIG_ROOM` (256 MB), `SCARLETT_GUARD_SINK` and `SCARLETT_LOADS_WIDE`; `=0` turns each off. The **Experimental** preset adds `SCARLETT_LOAD_UNPACED`, `SCARLETT_PREFETCH` and `SCARLETT_PIPELINE_BOOK` (booted cleanly, not measured on their own).
+
+The launcher offers two verified presets: **Stable** (the default) and **Look** (Stable plus `SCARLETT_LOOK=1` and `SCARLETT_SHADER_FIXES=1`; `scripts/play-scarlett.ps1 -Look` does the same). Settings, Features has a performance overlay and a ray tracing switch. All switches: [`docs/RUNTIMES.md`](docs/RUNTIMES.md).
+
+- **`SCARLETT_LOOK=1` (picture):** ambient light so dark rooms are not black, texture and colour fixes, sampler and vertex-format fixes, and ocean textures copied back so boats float instead of sinking.
+- **`SCARLETT_SHADER_FIXES=1` (shader translation):** a more accurate translation of many shader instructions and forms. It changes the shader cache key, so the first run with it rebuilds shaders. Each part can be switched on its own (`SCARLETT_SHADER_*`).
+- **`SCARLETT_FRIENDLY=1`** (set by Stable): leaves processor time to the desktop while the title runs.
+- **`SCARLETT_FAIR_DUE=2`** (default): fair texture upload order. **`SCARLETT_TEX_SPAN_PCT`** (25 by default, `0` turns it off): on a long frame the texture pass may take that share of the frame.
+- **`SCARLETT_SCREEN_WORKERS=0`** turns off the screen-pass workers. **`SCARLETT_CARD_ROOM_KEPT_MB`** (512 by default) caps the card-copy reserve.
+- **Memory options:** `SCARLETT_OOM_BACKOFF=1`, `SCARLETT_COMMIT_GATE=1`, `SCARLETT_PREFETCH_CAP=1`. Also `SCARLETT_WAVE32_LOWER=1`, `SCARLETT_MOVIE_PLANE=1` and `SCARLETT_THIN=1`.
+- **Yard stutter fix:** `SCARLETT_REMAP_LAZY`, `SCARLETT_MEM_SUBPAGE`, `SCARLETT_COPY_NOQUERY`.
+- **Testing:** `SCARLETT_AB` (in-session A/B), `SCARLETT_GPU_PROFILE` (GPU frame profiler), `SCARLETT_CAPTURE_LOG` (writes `frames.csv`), `SCARLETT_FAST_BOOT` (optional, off in the presets).
+
+Please send hardware reports if you try the Look preset: what looks better or worse, and your fps.
+
+</details>
+
+<details>
+<summary><b>Building from source</b></summary>
+
+Needs [Rust](https://rustup.rs) (MSVC) and the Windows SDK. Full instructions: [`docs/BUILDING.md`](docs/BUILDING.md). Two runtimes are included ([`docs/RUNTIMES.md`](docs/RUNTIMES.md)).
+
+**A. ScarlettPort runtime: furthest today** (lit world)
+
+```powershell
+git clone https://github.com/ZigZagBoi1/ScarlettPort.git
+cd ScarlettPort
+.\scripts\setup-scarlett.ps1
+.\scripts\play-scarlett.ps1 -Game "D:\path\to\your\dump"
+```
+
+`setup-scarlett.ps1` builds and fetches the Agility SDK; `play-scarlett.ps1` uses the Series S profile by default and the launcher's Stable settings. Its switches include `-AutoInput`, `-FastBoot` (testing only) and `-SaveSlot`.
+
+**B. XCL: menus and loading screens**
+
+```powershell
+.\scripts\setup.ps1 -Game "D:\path\to\your\dump"
+.\scripts\play.ps1  -Game "D:\path\to\your\dump" -AutoMenu
+```
+
+`setup.ps1` builds, fetches the Agility SDK and precompiles shaders (45 min to hours, once; resumes).
+
+- While the game runs, write button names into `press.txt` (e.g. `DOWN DOWN A`) to press them.
+- Logs go to `logs\`. Attach one when you open an issue.
+- Controls: an Xbox controller works best. With no pad connected, the keyboard is a pad: Enter = A, Backspace = B, WASD = left stick, IJKL = right stick.
+
+**Shader build times** (12-thread CPU)
+
+- **World engine (default):** about 3 min for `scarlett warm` (measured 171 s for 25,889 shaders), then about 8 min for the graphics pipelines (491 s for 25,200).
+- **Classic engine (XCL, Settings, Game):** 20-30 min with "skip slow shaders" on; 45 min to several hours with it off.
+
+It resumes: stop it or close the launcher at any time, and building again skips what is done (finished phases are recorded in `<cache>\build-world.json`).
+
+</details>
+
+<details>
+<summary><b>Troubleshooting and FAQ</b></summary>
+
+More: [`docs/FAQ.md`](docs/FAQ.md) and [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+
+**The shader build looks stuck at ~85%.**
+That is the Classic (XCL) engine's slow tail: the last ~4,000 of 26,503 programs are huge world shaders that the graphics driver compiles in 6-190 s each, so the count stops moving for minutes at a time while it is still working. Update the launcher: it uses the World engine by default (about 3 minutes), shows the current step and how long it has taken, and with **Skip slow shaders** on (Settings, Options, 60 s) leaves the slowest ones to compile in game. Whatever you already built is kept.
+
+**Do I need to rebuild after updates?**
+After a launcher or runtime update the launcher marks the shaders as needing a rebuild. The World engine keys its shader cache on the whole translator source, so an update that changes the shader translator translates everything again (about 3 minutes); one that does not reuses the cache. A per-shader key exists in our fork (`fx-cachekey`) but is not in the shipped runtime yet. The Classic engine's cache is keyed by the generated code, so it recompiles what changed.
+
+**Does the launcher go online?**
+Only for what you see: with "Updates" on it asks GitHub Releases at start whether a newer launcher exists. An update downloads only when you click it, into an `update` folder beside the launcher, is checked against the release's SHA-256 list, and is swapped in on the next start; the replaced version is kept in `previous` for a rollback. "Send report" opens a prefilled GitHub hardware-report issue in your browser (your user name and folders are removed from the log). Discord status talks only to the Discord app on your PC.
+
+**Will auto-update trigger antivirus?**
+It can. Unsigned apps that download and replace executables can get SmartScreen or antivirus warnings until a release has built up reputation. Our updater only acts when you click it, checks every file against the SHA-256 list, keeps the replaced version in `previous`, and never uses `%TEMP%`. It updates only the launcher and its bundled `runtime` folder; a local build you picked is never touched. If your antivirus flags a release, please report it as a false positive: [Microsoft's submission page](https://www.microsoft.com/en-us/wdsi/filesubmission).
+
+**Can I run my own runtime build?**
+Yes: Settings, Runtime, Local build, then browse to its `scarlett.exe` (keep its `D3D12` folder beside it) and pick a cache folder. The Stable preset sets the verified environment, so no play script is needed.
+
+</details>
+
+<details>
+<summary><b>Contributing</b></summary>
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md), then pick a task from the task board above or open an issue with one of the [issue templates](https://github.com/ZigZagBoi1/ScarlettPort/issues/new/choose) (bug report, hardware report, shader failure).
+
+Testers with different GPUs help most right now: GPU, driver, CPU, RAM, how long the shader build took and how far the game got.
+
+</details>
+
+<details>
+<summary><b>Credits and licence</b></summary>
+
+- `engine/` (GPL-3.0-or-later) is a fork, with its lineage and the community work merged in credited in [`CREDITS.md`](CREDITS.md). Fork point: [`engine/UPSTREAM.md`](engine/UPSTREAM.md).
+- `runtime/xcl` is XCL by ivall and contributors (GPL-2.0-only).
+- Each keeps its own `LICENSE`. See [`LICENSE.md`](LICENSE.md).
+
+</details>
+
+<details>
+<summary><b>Disclaimer</b></summary>
 
 - This project is **not affiliated with, endorsed by or sponsored by** the developer or publisher of any title it is used with, or by Microsoft. It is free and is not sold.
 - It contains **no game files, code, assets or keys**, and no console SDK code.
 - It does **not download game files**. The scripts download only Microsoft's public D3D12 Agility SDK from NuGet.
 - You need your **own legally obtained copy** of a title and your own dump of it. This project does not provide, link to or help obtain game files.
-- Licences and credits are kept: `engine/` (GPL-3.0-or-later) is a fork, with its lineage and the community work merged in credited in [`CREDITS.md`](CREDITS.md); `runtime/xcl` is XCL by ivall and contributors (GPL-2.0-only). Each keeps its own `LICENSE`. See [`LICENSE.md`](LICENSE.md).
 - Game and company names are trademarks of their owners.
+
+</details>
+
+<details>
+<summary><b>Donations</b></summary>
+
+<a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal"></a>
+<a href="https://ko-fi.com/ziggymar"><img src="https://img.shields.io/badge/BUY%20A%20COFFEE-Ko--fi-ff5f5f?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi"></a>
+
+<sub>Donations are voluntary gifts that support development time. They are not a purchase: they buy no game content, access, builds or perks. PayPal: please send as <b>Friends & Family</b> (a gift).</sub>
+
+</details>
+
+---
 
 <div align="center">
 
-**If this is useful, star it ⭐ and share it.**
+**If this is useful, star it ⭐ and share it.** Thank you for more than 500 stars!
 
-<sub>Lineage and fork point: [`engine/UPSTREAM.md`](engine/UPSTREAM.md). Credits: [`CREDITS.md`](CREDITS.md).</sub>
+<a href="https://star-history.com/#ZigZagBoi1/ScarlettPort&Date"><img src="https://api.star-history.com/svg?repos=ZigZagBoi1/ScarlettPort&type=Date" alt="Star History Chart" width="100%"></a>
 
 </div>
-
-<p align="center">Thank you for more than 500 stars!</p>
-<p align="center"><a href="https://star-history.com/#ZigZagBoi1/ScarlettPort&Date"><img src="https://api.star-history.com/svg?repos=ZigZagBoi1/ScarlettPort&type=Date" alt="Star History Chart" width="600"></a></p>
