@@ -12,7 +12,7 @@
 #   SCARLETT_PIPELINE_WAIT_MS=0  do not hold a draw back waiting for a pipeline build
 #   The engine's CAND4 group (THIN, CARD_BUFFERS_MIN_KB, CARD_STEPS, ...), as the launcher sets it.
 #   SCARLETT_FAST_BOOT=1    with -FastBoot: press through logos and menus (testing only)
-#   SCARLETT_RAYTRACING=1   with -RayTracing: the title's ray-traced lighting, for that launch only
+#   SCARLETT_BVH_BUILDER=1  with -RayTracing: the title's ray-traced indirect light, for that launch only
 #   SCARLETT_SAVE_SLOT      with -SaveSlot: pick a save slot by name
 #   SCARLETT_AUTO_INPUT=1   with -AutoInput: press A on a timer so menus advance without a pad
 #   SCARLETT_PRESS_FILE     press.txt in the repo root: write button names ("A", "DOWN DOWN A") to press them
@@ -34,9 +34,9 @@ param(
     [switch]$RayTracing,
     # Save slot name (SCARLETT_SAVE_SLOT).
     [string]$SaveSlot = '',
-    # Run `scarlett precompile-graphics` even if it already ran once.
+    # Run `scarlett shaders` and `scarlett warm` even if they already ran once.
     [switch]$Precompile,
-    # Do not run `scarlett precompile-graphics` (pipelines are then built while you play).
+    # Do not run `scarlett shaders` / `scarlett warm` (shaders are then translated while you play).
     [switch]$SkipPrecompile
 )
 $ErrorActionPreference = 'Stop'
@@ -90,16 +90,23 @@ $env:SCARLETT_PRESS_FILE = Join-Path $root 'press.txt'
 Set-Content -Path $env:SCARLETT_PRESS_FILE -Value '' -NoNewline
 if ($AutoInput) { $env:SCARLETT_AUTO_INPUT = '1' }
 
-# Prebuild the title's precompiled graphics pipelines into the pipeline library (needs a GPU; the
-# first run takes a while and is done once, marked by a stamp file).
-$stamp = Join-Path $root 'logs\precompile-graphics.done'
+# Translate every shader into the cache (`scarlett shaders`, a few minutes), then make the host
+# pipelines earlier runs recorded (`scarlett warm`; none on a first run). Done once, marked by a
+# stamp file; -Precompile runs both again (after an engine or driver update).
+$stamp = Join-Path $root 'logs\shaders.done'
 if (-not $SkipPrecompile -and ($Precompile -or -not (Test-Path $stamp))) {
-    Write-Host 'Building the title''s precompiled graphics pipelines (once)...' -ForegroundColor Cyan
+    Write-Host 'Translating the title''s shaders (once, a few minutes)...' -ForegroundColor Cyan
     $ErrorActionPreference = 'Continue'
-    & $vic precompile-graphics
+    & $vic shaders $Game
     $code = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
-    if ($code -ne 0) { throw "scarlett precompile-graphics failed (exit $code)." }
+    if ($code -ne 0) { throw "scarlett shaders failed (exit $code)." }
+    Write-Host 'Making the pipelines earlier runs recorded...' -ForegroundColor Cyan
+    $ErrorActionPreference = 'Continue'
+    & $vic warm
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($code -ne 0) { throw "scarlett warm failed (exit $code)." }
     New-Item -ItemType Directory -Force (Split-Path $stamp) | Out-Null
     Set-Content -Path $stamp -Value (Get-Date -Format s)
 }
@@ -114,11 +121,11 @@ $ErrorActionPreference = 'Continue'
 # For this launch only: PowerShell's environment belongs to the whole session, so a plain launch
 # after one with -RayTracing in the same window would still run with ray tracing. A value set by
 # hand before running the script is kept when the switch is left out.
-$rayTracingBefore = $env:SCARLETT_RAYTRACING
-if ($RayTracing) { $env:SCARLETT_RAYTRACING = '1' }
+$rayTracingBefore = $env:SCARLETT_BVH_BUILDER
+if ($RayTracing) { $env:SCARLETT_BVH_BUILDER = '1' }
 try {
     & $vic run $exe --execute --console $Console *> $log
 } finally {
-    $env:SCARLETT_RAYTRACING = $rayTracingBefore
+    $env:SCARLETT_BVH_BUILDER = $rayTracingBefore
 }
 exit $LASTEXITCODE

@@ -1,5 +1,7 @@
 <p align="center"><a href="https://github.com/ZigZagBoi1/ScarlettPort"><img src="https://img.shields.io/github/stars/ZigZagBoi1/ScarlettPort?style=for-the-badge&logo=github&label=Star%20ScarlettPort&color=ffd700" alt="Star ScarlettPort on GitHub"></a></p>
 <p align="center"><b>⭐ If ScarlettPort helps you, please star the repo, it helps more people find it.</b></p>
+> **New in 0.4.8:** Prepare shaders works again with the 0.4.6+ engine (`scarlett shaders`, then `scarlett warm`), and the engine no longer refuses the launcher's `scarlett.toml`; `play-scarlett.ps1`/`setup-scarlett.ps1` use the same commands and the launcher's Stable settings; Settings, Features gains a performance overlay and a ray tracing switch; `SCARLETT_CAPTURE_LOG` writes `frames.csv` with the Stable preset too.
+>
 > **New in 0.4.7:** everything is named ScarlettPort now: the runtime is `scarlett.exe`, its switches are `SCARLETT_*`, and its data folder is `%LOCALAPPDATA%\ScarlettPort` (saves, caches and settings from the old folder are moved over on first start). The runtime also gains a GPU frame profiler.
 >
 
@@ -221,7 +223,7 @@ Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about
 | Save safety | 🧪 in testing | protects your save folder from being overwritten by test runs |
 | One-command benchmark queue | 🧪 in testing | queues A/B runs of switch sets and collects the frame-time logs in one command |
 | Launcher: Controller line | 🧪 in testing | the Play page shows a connected Xbox pad or PlayStation pad (DualShock 4, DualSense, Edge); PlayStation pads are read natively over USB (`SCARLETT_PAD_PS`) |
-| Launcher: Prepare shaders | 🧪 in testing | after the shader translation, `scarlett precompile-graphics` makes the graphics pipelines at low priority, with progress and Stop/resume, so moving in the world does not stutter on first use |
+| Launcher: Prepare shaders | 🧪 in testing | `scarlett shaders` translates every shader, then `scarlett warm` makes the pipelines earlier runs recorded at low priority, with progress and Stop/resume, so moving in the world does not stutter on first use |
 | Launcher: drive note | 🧪 in testing | Settings says to keep the game folder on an internal NVMe/SSD for load times |
 
 ---

@@ -10,7 +10,7 @@ Both runtimes run a title from your own dump. Each currently gets further at som
 | Speed in the world | about 4 fps in the prologue (RTX 3060, Series S profile), GPU-bound | not rendering the final image |
 | Final image | lit; shadowed areas too dark; the tile-grid overlay is fixed | black |
 | Extras | frame capture, save slots, press file, fast boot (testing), launcher (default engine) | launcher (Classic engine), pipeline journal and offline build, profiles, achievements, crash reports |
-| Shader build | `scarlett warm` (about 3 min) then `scarlett precompile-graphics` (about 8 min) | `xcl shaders --precompile`: 45 min to hours (slow tail from 83%) |
+| Shader build | `scarlett shaders <dump>` (a few minutes) then `scarlett warm` (the pipelines earlier runs recorded) | `xcl shaders --precompile`: 45 min to hours (slow tail from 83%) |
 | Scripts | `setup-scarlett.ps1`, `play-scarlett.ps1`, launcher | `setup.ps1`, `play.ps1`, launcher |
 
 Neither is verified playable.
@@ -44,7 +44,7 @@ Every switch is a `SCARLETT_*` environment variable. The full list is in the sou
 | `SCARLETT_RELAY=1\|2` | submission relay (off in the runtime by default; `play-scarlett.ps1` sets `2`) |
 | `SCARLETT_SYNC_PRECISE=1` | a submission waits only for the submissions it depends on. Set by `play-scarlett.ps1` |
 | `SCARLETT_READ_SETTLE_PRECISE=1` | read-backs settle on the exact submissions they need (needs the relay). Set by `play-scarlett.ps1` |
-| `SCARLETT_PRECOMPILED_GRAPHICS=1` | make graphics pipelines from the title's precompiled cache, prebuilt with `scarlett precompile-graphics` (25,200 of 25,471 made). Set by `play-scarlett.ps1`, which runs the precompile once; `setup-scarlett.ps1 -Game <dump>` can do it too |
+| `SCARLETT_PRECOMPILED_GRAPHICS=1` | make graphics pipelines from the title's precompiled cache, engines before 0.4.6 only (their `precompile-graphics` command is gone); `play-scarlett.ps1` and `setup-scarlett.ps1 -Game <dump>` run `scarlett shaders` instead |
 | `SCARLETT_PIPELINE_WAIT_MS=0` | do not hold a draw back for a pipeline build. Set by `play-scarlett.ps1` |
 | `SCARLETT_SHADER_OPT=on` | opt-in shader clean-up passes (off by default; they can drop walls and roofs on some cards) |
 | `SCARLETT_FAIR_DUE=0\|1\|2` | order of the texture upload queue. `2` (default): textures showing less than the title holds first, then the longest due; `1`: plain turns; `0`: the older order |
