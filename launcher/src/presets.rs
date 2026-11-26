@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn stable_matches_play_ps1() {
         let e = stable_env(Path::new("D:/dump"), Path::new("F:/c"));
-        assert_eq!(e.len(), 10 + 9 + 4);
+        assert_eq!(e.len(), 10 + 9 + 3);
         for (k, v) in [
             ("VICTORY_SAVE_SLOT", "default"),
             ("VICTORY_OWN_UPSCALER", "1"),
