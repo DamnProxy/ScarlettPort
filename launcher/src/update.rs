@@ -71,7 +71,19 @@ pub fn pick(json: &serde_json::Value) -> Option<Release> {
 }
 
 fn get(url: &str) -> Result<ureq::Response, String> {
-    ureq::get(url).set("User-Agent", AGENT).set("Accept", "application/vnd.github+json").timeout(std::time::Duration::from_secs(30)).call().map_err(|e| e.to_string())
+    ureq::get(url).set("User-Agent", AGENT).set("Accept", "application/vnd.github+json").timeout(std::time::Duration::from_secs(30)).call().map_err(|e| explain(&e.to_string()))
+}
+
+/// A short reason for a failed request: GitHub's hourly limit for unsigned requests (403/429)
+/// and no connection get their own words; anything else is passed on.
+pub fn explain(e: &str) -> String {
+    if e.contains("status code 403") || e.contains("status code 429") {
+        "GitHub's limit for update checks was reached; try again in an hour".into()
+    } else if e.to_ascii_lowercase().contains("dns") || e.contains("Connection Failed") || e.to_ascii_lowercase().contains("timed out") {
+        format!("no connection to GitHub ({e})")
+    } else {
+        e.to_string()
+    }
 }
 
 /// Some(release) when one newer than this launcher is published.
@@ -288,6 +300,15 @@ mod tests {
                 { "name": "SHA256SUMS.txt", "browser_download_url": "s" } ] }
         ]);
         assert!(pick(&j).is_none());
+    }
+
+    #[test]
+    fn explains_rate_limit_and_offline() {
+        assert!(explain("https://api.github.com/repos/x: status code 403").contains("limit"));
+        assert!(explain("https://api.github.com/repos/x: status code 429").contains("limit"));
+        assert!(explain("https://api.github.com/: Dns Failed: resolve dns name").starts_with("no connection"));
+        assert_eq!(explain("other"), "other");
+        assert!(!newer("garbage", "0.4.8") && !newer("v0.4.8", "0.4.8") && newer("v0.4.9", "0.4.8") && newer("v0.4.10", "0.4.9"));
     }
 
     #[test]
