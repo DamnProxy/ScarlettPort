@@ -532,6 +532,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         (_, HwStage::Es) => io.es_dwords = es_dwords(p)?,
         _ => {}
     }
+    if first_half_on() {
+        first_halves_read(p, &mut io);
+    }
     Ok(io)
 }
 
@@ -740,6 +743,70 @@ fn es_dwords(p: &Program) -> Result<Vec<u32>, ShaderError> {
         return Err(unsupported(0, "an export program that writes no vertex"));
     }
     Ok(out)
+}
+
+/// Whether [`first_halves_read`] runs (`VICTORY_INTERP_FIRST_HALF=1`; off
+/// by default: it changes the translation of pixel programs, so the shader
+/// cache keys it and takes entries of its own while it is on). Belobug
+/// 2823ba1.
+fn first_half_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INTERP_FIRST_HALF").is_some_and(|v| v == "1"))
+}
+
+/// A first half some other instruction reads too (the compiler keeps
+/// P0 + i P10 for more than its second half) evaluates on its own as well.
+fn first_halves_read(p: &Program, io: &mut Io) {
+    if !io
+        .interps
+        .iter()
+        .any(|(_, i)| matches!(i, Interp::Interpolated { .. }))
+    {
+        return;
+    }
+    // What instructions other than second halves read, and through phis.
+    let mut read: std::collections::HashSet<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| !i.name().starts_with("v_interp_p2"))
+        .flat_map(|i| i.reads.iter().map(|r| r.1))
+        .collect();
+    loop {
+        let before = read.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if read.contains(&phi.value) {
+                read.extend(phi.args.iter().copied());
+            }
+        }
+        if read.len() == before {
+            break;
+        }
+    }
+    let mut more = Vec::new();
+    for (_, interp) in &io.interps {
+        let Interp::Interpolated {
+            attribute, first, ..
+        } = interp
+        else {
+            continue;
+        };
+        for &(b, i) in first {
+            let known = |all: &[(Site, Interp)]| all.iter().any(|(s, _)| *s == (b, i));
+            if p.blocks[b].insts[i].writes.iter().any(|w| read.contains(&w.1))
+                && !known(&io.interps)
+                && !known(&more)
+            {
+                more.push((
+                    (b, i),
+                    Interp::Weighted {
+                        attribute: *attribute,
+                    },
+                ));
+            }
+        }
+    }
+    io.interps.extend(more);
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.

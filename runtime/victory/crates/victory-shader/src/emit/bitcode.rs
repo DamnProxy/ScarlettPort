@@ -230,6 +230,11 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    // rule-region: begin feature:wave64-lds
+    /// Blocks split by [`Module::split_head`]: the block that now holds the start of each,
+    /// which later branches to it and phis at its top go to.
+    heads: HashMap<usize, usize>,
+    // rule-region: end
 }
 
 impl Module {
@@ -330,11 +335,277 @@ impl Module {
         }
     }
 
+    /// An upper bound on the unsigned value of 32-bit (or narrower) integer
+    /// `v`, from how it is made: a constant; an `and`, `lshr` or `urem` with a
+    /// constant; a zero extension; a sum, product or join of bounded values
+    /// that cannot wrap; a thread's group or in-group number (`dx.op` 94-96,
+    /// below 65 536 on any D3D12 host). `u32::MAX` when nothing is known.
+    pub fn bound(&self, v: V) -> u64 {
+        self.bound_depth(v, 8)
+    }
+
+    /// The value of `v` where it is integer arithmetic on constants (an `and`, `or`, `add`,
+    /// `sub` or shift of constants, as the lowering makes a shift's amount), as an unsigned
+    /// number of its width.
+    fn const_eval(&self, v: V, depth: u32) -> Option<i64> {
+        let w = match self.types[self.type_of(v).0 as usize] {
+            TypeDef::Int(n) if n <= 32 => n,
+            _ => return None,
+        };
+        let mask = (1i64 << w) - 1;
+        if let Some(k) = self.int_value(v) {
+            return Some(k & mask);
+        }
+        let V::Inst(i) = v else { return None };
+        if depth == 0 {
+            return None;
+        }
+        let Op::Bin(op, x, y) = &self.insts[i as usize].op else { return None };
+        let (a, b) = (self.const_eval(*x, depth - 1)?, self.const_eval(*y, depth - 1)?);
+        let r = match op {
+            Bin::And => a & b,
+            Bin::Or => a | b,
+            Bin::Xor => a ^ b,
+            Bin::Add => a.wrapping_add(b),
+            Bin::Sub => a.wrapping_sub(b),
+            Bin::Shl if b < w as i64 => a << b,
+            Bin::LShr if b < w as i64 => a >> b,
+            _ => return None,
+        };
+        Some(r & mask)
+    }
+
+    fn bound_depth(&self, v: V, depth: u32) -> u64 {
+        const ANY: u64 = u32::MAX as u64;
+        let width = |ty: Ty| match self.types[ty.0 as usize] {
+            TypeDef::Int(n) if n <= 32 => Some(n),
+            _ => None,
+        };
+        let Some(w) = width(self.type_of(v)) else { return ANY };
+        let full = (1u64 << w) - 1;
+        if let Some(k) = self.int_value(v) {
+            return (k as u64) & full;
+        }
+        if depth == 0 {
+            return full;
+        }
+        let V::Inst(i) = v else { return full };
+        let b = |x: V| self.bound_depth(x, depth - 1);
+        let r = match &self.insts[i as usize].op {
+            Op::Bin(Bin::And, x, y) => b(*x).min(b(*y)),
+            Op::Bin(Bin::LShr, x, y) => match self.const_eval(*y, 4) {
+                Some(k) if (0..w as i64).contains(&k) => b(*x) >> k,
+                _ => full,
+            },
+            Op::Bin(Bin::URem, _, y) => match self.const_eval(*y, 4) {
+                Some(k) if k > 0 && (k as u64) <= full => k as u64 - 1,
+                _ => full,
+            },
+            Op::Bin(Bin::Or, x, y) => {
+                let m = b(*x).max(b(*y));
+                (m + 1).next_power_of_two() - 1
+            }
+            Op::Bin(Bin::Add, x, y) => b(*x) + b(*y),
+            Op::Bin(Bin::Mul, x, y) => b(*x).saturating_mul(b(*y)),
+            Op::Cast(Cast::ZExt, x) => match width(self.type_of(*x)) {
+                Some(n) => b(*x).min((1u64 << n) - 1),
+                None => full,
+            },
+            Op::Select(_, x, y) => b(*x).max(b(*y)),
+            Op::Call(f, args) if self.funcs[*f as usize].name.starts_with("dx.op.") => {
+                match args.first().and_then(|&a| self.int_value(a)) {
+                    // GroupId, ThreadIdInGroup, FlattenedThreadIdInGroup
+                    Some(94..=96) => 0xFFFF,
+                    _ => full,
+                }
+            }
+            _ => full,
+        };
+        r.min(full)
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
             self.consts[o as usize] = self.consts[n as usize].clone();
         }
+    }
+
+    /// Runs `main` for one thread on the CPU (for tests): integer arithmetic, compares,
+    /// selects, phis and branches, `dx.op` integer min/max, user data read with
+    /// `cbufferLoadLegacy` from `cbuf` (by dword), and raw/typed buffer stores, which it
+    /// gives as (index, value) in order. Anything else gives an unknown value; a store of
+    /// one, or a branch on one, ends the run with `None`. Values are integers of their
+    /// type's width, kept zero-extended.
+    #[cfg(test)]
+    pub(crate) fn eval(&self, cbuf: &[u32]) -> Option<Vec<(u32, u32)>> {
+        #[derive(Clone, Debug)]
+        enum X {
+            I(u64),
+            Agg(Vec<X>),
+            Unknown,
+        }
+        let width = |ty: Ty| match self.types[ty.0 as usize] {
+            TypeDef::Int(n) => Some(n),
+            _ => None,
+        };
+        let ones = |w: u32| if w == 0 || w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let sx = |x: u64, w: u32| if w == 0 || w >= 64 { x } else { ((x << (64 - w)) as i64 >> (64 - w)) as u64 };
+        let get = |vals: &HashMap<u32, X>, v: V| -> X {
+            match v {
+                V::Const(i) => match (&self.consts[i as usize].1, width(self.consts[i as usize].0)) {
+                    (Const::Int(k), Some(w)) => X::I((*k as u64) & ones(w)),
+                    _ => X::Unknown,
+                },
+                V::Inst(i) => vals.get(&i).cloned().unwrap_or(X::Unknown),
+                _ => X::Unknown,
+            }
+        };
+        let mut vals: HashMap<u32, X> = HashMap::new();
+        let mut stores = Vec::new();
+        let (mut block, mut prev) = (0usize, usize::MAX);
+        for _ in 0..100_000 {
+            let b = &self.blocks[block];
+            let phis: Vec<(u32, X)> = b
+                .phis
+                .iter()
+                .map(|&i| {
+                    let Op::Phi(ins) = &self.insts[i as usize].op else { unreachable!() };
+                    let x = ins.iter().find(|(_, p)| *p == prev).map_or(X::Unknown, |(v, _)| get(&vals, *v));
+                    (i, x)
+                })
+                .collect();
+            vals.extend(phis);
+            for &i in &b.body {
+                let inst = &self.insts[i as usize];
+                let m = ones(width(inst.ty).unwrap_or(0));
+                let r = match &inst.op {
+                    Op::Bin(op, a, c) => match (get(&vals, *a), get(&vals, *c), width(self.type_of(*a))) {
+                        (X::I(a), X::I(c), Some(w)) => {
+                            let s = |x: u64| sx(x, w) as i64;
+                            match op {
+                                Bin::Add => X::I(a.wrapping_add(c) & m),
+                                Bin::Sub => X::I(a.wrapping_sub(c) & m),
+                                Bin::Mul => X::I(a.wrapping_mul(c) & m),
+                                Bin::UDiv if c != 0 => X::I(a / c),
+                                Bin::URem if c != 0 => X::I(a % c),
+                                Bin::SDiv if c != 0 => X::I((s(a).wrapping_div(s(c)) as u64) & m),
+                                Bin::Shl if c < u64::from(w) => X::I((a << c) & m),
+                                Bin::LShr if c < u64::from(w) => X::I(a >> c),
+                                Bin::AShr if c < u64::from(w) => X::I(((s(a) >> c) as u64) & m),
+                                Bin::And => X::I(a & c),
+                                Bin::Or => X::I(a | c),
+                                Bin::Xor => X::I(a ^ c),
+                                _ => X::Unknown,
+                            }
+                        }
+                        _ => X::Unknown,
+                    },
+                    Op::Cast(op, a) => match (get(&vals, *a), width(self.type_of(*a))) {
+                        (X::I(a), Some(from)) => match op {
+                            Cast::ZExt | Cast::Trunc => X::I(a & m),
+                            Cast::SExt => X::I(sx(a, from) & m),
+                            Cast::Bitcast if width(inst.ty).is_some() => X::I(a & m),
+                            _ => X::Unknown,
+                        },
+                        _ => X::Unknown,
+                    },
+                    Op::Cmp(p, a, c) => match (get(&vals, *a), get(&vals, *c), width(self.type_of(*a))) {
+                        (X::I(a), X::I(c), Some(w)) => {
+                            let (sa, sc) = (sx(a, w) as i64, sx(c, w) as i64);
+                            let t = match *p {
+                                pred::EQ => a == c,
+                                pred::NE => a != c,
+                                pred::IUGT => a > c,
+                                pred::IUGE => a >= c,
+                                pred::IULT => a < c,
+                                pred::IULE => a <= c,
+                                pred::SGT => sa > sc,
+                                pred::SGE => sa >= sc,
+                                pred::SLT => sa < sc,
+                                pred::SLE => sa <= sc,
+                                _ => return None,
+                            };
+                            X::I(u64::from(t))
+                        }
+                        _ => X::Unknown,
+                    },
+                    Op::Select(c, t, f) => match get(&vals, *c) {
+                        X::I(1) => get(&vals, *t),
+                        X::I(0) => get(&vals, *f),
+                        _ => X::Unknown,
+                    },
+                    Op::Extract(a, k) => match get(&vals, *a) {
+                        X::Agg(xs) => xs.get(*k as usize).cloned().unwrap_or(X::Unknown),
+                        _ => X::Unknown,
+                    },
+                    Op::Call(f, args) if self.funcs[*f as usize].name.starts_with("dx.op.") => {
+                        let code = args.first().and_then(|&a| self.int_value(a));
+                        let arg = |k: usize| args.get(k).map_or(X::Unknown, |&a| get(&vals, a));
+                        match code {
+                            Some(59) => match arg(2) {
+                                X::I(row) => X::Agg(
+                                    (0..4)
+                                        .map(|k| X::I(u64::from(cbuf.get(row as usize * 4 + k).copied().unwrap_or(0))))
+                                        .collect(),
+                                ),
+                                _ => X::Unknown,
+                            },
+                            Some(c @ 37..=40) => match (arg(1), arg(2)) {
+                                (X::I(a), X::I(b)) => {
+                                    let (sa, sb) = (sx(a, 32) as i64, sx(b, 32) as i64);
+                                    X::I(match c {
+                                        37 => {
+                                            if sa >= sb { a } else { b }
+                                        }
+                                        38 => {
+                                            if sa <= sb { a } else { b }
+                                        }
+                                        39 => a.max(b),
+                                        _ => a.min(b),
+                                    })
+                                }
+                                _ => X::Unknown,
+                            },
+                            Some(69 | 140) => {
+                                match (arg(2), arg(4)) {
+                                    (X::I(at), X::I(v)) => stores.push((at as u32, v as u32)),
+                                    _ => return None,
+                                }
+                                X::Unknown
+                            }
+                            _ => X::Unknown,
+                        }
+                    }
+                    _ => X::Unknown,
+                };
+                vals.insert(i, r);
+            }
+            prev = block;
+            match b.term {
+                Some(Term::Br(t)) => block = t,
+                Some(Term::CondBr(c, t, f)) => match get(&vals, c) {
+                    X::I(1) => block = t,
+                    X::I(0) => block = f,
+                    _ => return None,
+                },
+                Some(Term::Ret) | None => return Some(stores),
+            }
+        }
+        None
+    }
+
+    /// Number of calls to function `name` across all blocks (for tests).
+    #[cfg(test)]
+    pub(crate) fn call_count(&self, name: &str) -> usize {
+        self.blocks
+            .iter()
+            .flat_map(|b| b.body.iter())
+            .filter(|&&i| match self.insts[i as usize].op {
+                Op::Call(f, _) => self.funcs[f as usize].name == name,
+                _ => false,
+            })
+            .count()
     }
 
     /// A function declaration (or `main` with `body`), found by name.
@@ -467,6 +738,9 @@ impl Module {
     }
     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
     pub fn phi(&mut self, block: usize, ty: Ty) -> V {
+        // rule-region: begin feature:wave64-lds
+        let block = self.heads.get(&block).copied().unwrap_or(block);
+        // rule-region: end
         let i = self.insts.len() as u32;
         self.insts.push(Inst {
             ty,
@@ -514,9 +788,54 @@ impl Module {
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        // rule-region: begin feature:wave64-lds
+        let head = |b: usize| self.heads.get(&b).copied().unwrap_or(b);
+        let t = match t {
+            Term::Br(b) => Term::Br(head(b)),
+            Term::CondBr(c, x, y) => Term::CondBr(c, head(x), head(y)),
+            Term::Ret => Term::Ret,
+        };
+        // rule-region: end
         self.blocks[block].term = Some(t);
     }
 
+    // rule-region: begin feature:wave64-lds
+    /// Splits `block` where it now ends: what it holds so far (phis and body) moves to a new
+    /// block, returned, which every branch to `block` – those made already and those made
+    /// later – reaches instead, as do phis made later for its top. `block` keeps its
+    /// terminator and whatever is added to it from now on, and so stays the block its
+    /// successors' phis name; code put between the two parts must end the new block with
+    /// [`Self::terminate_exact`] into `block`. (The entry block is not split.)
+    pub fn split_head(&mut self, block: usize) -> usize {
+        let head = self.new_block();
+        let (phis, body) = {
+            let b = &mut self.blocks[block];
+            (std::mem::take(&mut b.phis), std::mem::take(&mut b.body))
+        };
+        self.blocks[head].phis = phis;
+        self.blocks[head].body = body;
+        let to = |b: usize| if b == block { head } else { b };
+        for (n, b) in self.blocks.iter_mut().enumerate() {
+            if n == head {
+                continue;
+            }
+            b.term = match b.term {
+                Some(Term::Br(x)) => Some(Term::Br(to(x))),
+                Some(Term::CondBr(c, x, y)) => Some(Term::CondBr(c, to(x), to(y))),
+                t => t,
+            };
+        }
+        // (a block split again: its start is still where the first split put it)
+        self.heads.entry(block).or_insert(head);
+        head
+    }
+
+    /// [`Self::terminate`] without following splits: a branch to the later part itself.
+    pub fn terminate_exact(&mut self, block: usize, t: Term) {
+        self.blocks[block].term = Some(t);
+    }
+
+    // rule-region: end
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

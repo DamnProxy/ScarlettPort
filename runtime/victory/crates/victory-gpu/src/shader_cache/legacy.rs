@@ -52,6 +52,29 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
+        // The view heap is in the key, so it is probed before the key is made, whatever looks
+        // the cache up first (fx-prewarm). A run's first lookup used to be `is_cached`, from the
+        // early pipelines' scheduling (`make::translations_ready`), before any translation had
+        // probed: such a run keyed with no view limit and no heap map although it translated
+        // with them, and a run without early pipelines (a first boot) keyed with them.
+        #[cfg(windows)]
+        crate::descriptor::host::probe_view_limit();
+        with_host_settings(*base(), &HostFacts::now())
+    })
+}
+
+/// [`build`] as runs before fx-prewarm made it when their first lookup came before the view
+/// heap probe (see [`build`]): no view limit and no heap map. Where the compute shaders of a
+/// cache those runs filled are: `victory prewarm manifest` looks there too.
+fn build_unprobed() -> &'static [u8; 32] {
+    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+    BUILD.get_or_init(|| with_host_settings(*base(), &HostFacts::now().unprobed()))
+}
+
+/// [`key`] of this build and settings, before the host facts are mixed in.
+fn base() -> &'static [u8; 32] {
+    static BASE: OnceLock<[u8; 32]> = OnceLock::new();
+    BASE.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -67,14 +90,18 @@ fn build() -> &'static [u8; 32] {
         };
         match translator {
             Ok(translator) => {
-                let switches = SWITCHES.map(|name| (name, std::env::var_os(name)));
-                with_host_settings(key(
+                let switches = if FIRST_SWITCHES_ONLY.load(Ordering::Relaxed) {
+                    SWITCHES.into_iter().map(|name| (name, std::env::var_os(name))).collect()
+                } else {
+                    all_switches()
+                };
+                key(
                     &translator,
                     limit,
                     victory_shader::emit::group_sync(),
                     &switches,
                     victory_shader::emit::shader_opt(),
-                ))
+                )
             }
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
@@ -95,22 +122,49 @@ fn build() -> &'static [u8; 32] {
 /// runs before the first translation): the clamp of view indices and the
 /// heap map bindless views are looked up in (`VICTORY_HEAP_MAP`,
 /// `VICTORY_HEAP_WINDOW`).
-fn with_host_settings(base: [u8; 32]) -> [u8; 32] {
+fn with_host_settings(base: [u8; 32], facts: &HostFacts) -> [u8; 32] {
     let mut bytes = base.to_vec();
-    bytes.push(u8::from(victory_shader::resource::rt_miss()));
-    bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+    bytes.push(u8::from(facts.rt_miss));
+    bytes.extend_from_slice(&facts.view_limit.to_le_bytes());
     // (victory-amd) the host's widest wave, which picks how wave64 programs are made.
-    bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
-    let map = victory_shader::emit::view_heap_map().map_or([u32::MAX; 2], |(w, s)| [w, s]);
+    bytes.extend_from_slice(&facts.max_wave.to_le_bytes());
+    let map = facts.view_map.map_or([u32::MAX; 2], |(w, s)| [w, s]);
     for word in map {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
     // (`VICTORY_F3_VIEW_FIX=1` changes the translation of typed buffer accesses; named only
     // when on, so the key of a run without it is the one of fx-final)
-    if victory_shader::emit::words::f3_view_fix() {
+    if facts.f3_view_fix {
         bytes.extend_from_slice(b"VICTORY_F3_VIEW_FIX=1");
     }
     *blake3::hash(&bytes).as_bytes()
+}
+
+/// The host facts and settings [`with_host_settings`] mixes into the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostFacts {
+    rt_miss: bool,
+    view_limit: u32,
+    max_wave: u32,
+    view_map: Option<(u32, u32)>,
+    f3_view_fix: bool,
+}
+
+impl HostFacts {
+    fn now() -> HostFacts {
+        HostFacts {
+            rt_miss: victory_shader::resource::rt_miss(),
+            view_limit: victory_shader::emit::view_heap_limit(),
+            max_wave: victory_shader::emit::host_max_wave(),
+            view_map: victory_shader::emit::view_heap_map(),
+            f3_view_fix: victory_shader::emit::words::f3_view_fix(),
+        }
+    }
+
+    /// As a key made before the view heap probe saw them (see [`build`]).
+    fn unprobed(self) -> HostFacts {
+        HostFacts { view_limit: 0, view_map: None, ..self }
+    }
 }
 
 /// The environment switches that change what the translator makes, part of the key.
@@ -130,6 +184,22 @@ const SWITCHES: [&str; 8] = [
 /// Serialization schema version of [`encode`] / [`decode`]: bump it whenever [`HostShader`]'s
 /// on-disk format changes (the sources hash covers the translator, not this file).
 const CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// Key by [`SWITCHES`] alone, as fx-cand (before 53f1675b named every switch of the
+/// translator): `victory prewarm manifest --cand-key` reads a cache warmed by that build.
+/// Set before the first lookup (the key is made once).
+static FIRST_SWITCHES_ONLY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn key_by_first_switches() {
+    FIRST_SWITCHES_ONLY.store(true, Ordering::Relaxed);
+}
+
+/// [`SWITCHES`] and every other `VICTORY_*` switch the translator's source
+/// names (`victory_shader::SWITCHES`, fxceless 8dd30ab), with their values.
+fn all_switches() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+    let extra = victory_shader::SWITCHES.split(',').filter(|n| !n.is_empty() && !SWITCHES.contains(n));
+    SWITCHES.into_iter().chain(extra).map(|name| (name, std::env::var_os(name))).filter(super::keyed).collect()
+}
 
 /// The key of a translation's context: the translator's identity and the settings that
 /// change what it makes (the loop limit, which group barriers wait, the switches that pick
@@ -154,6 +224,18 @@ fn key(
     }
     bytes.extend_from_slice(&shader_opt.to_le_bytes());
     *blake3::hash(&bytes).as_bytes()
+}
+
+/// The offline warm-up (`victory translate --warm`, fxceless 8dd30ab):
+/// `container` is translated into the cache unless it is there already.
+/// `Ok(true)`: it was translated now. Needs [`use_shader_cache`] and the
+/// same host facts the run will have. Keys as [`host_shader`] does.
+pub(super) fn warm(container: &[u8]) -> Result<bool, String> {
+    if CACHE.get().is_none() {
+        return Err("no shader cache".into());
+    }
+    let misses = MISSES.load(Ordering::Relaxed);
+    host_shader(container).map(|_| MISSES.load(Ordering::Relaxed) != misses)
 }
 
 /// The translation of a console shader container, from the cache when
@@ -298,9 +380,26 @@ fn program_key(build: &[u8; 32], deep_skips_off: bool) -> [u8; 32] {
 /// Whether the translation of `container` is in the cache already (nothing is read or
 /// translated: the entry's file is looked for).
 pub(crate) fn is_cached(container: &[u8]) -> bool {
-    CACHE
-        .get()
-        .is_some_and(|cache| has_entry(cache, build(), container))
+    // At the key `host_shader` stores under: a wave64 program kept out of the deep-skips
+    // form has its own.
+    CACHE.get().is_some_and(|cache| has_entry_in(cache, &[*build()], container))
+}
+
+/// Whether the cache holds a translation of `container` that a run made: at this build's key
+/// ([`is_cached`]) or at the key of a run that looked the cache up before the view heap probe
+/// ([`build_unprobed`]). For choosing what to prewarm (`victory prewarm manifest`); what the
+/// next run finds is [`is_cached`].
+pub(crate) fn is_cached_by_runs(container: &[u8]) -> bool {
+    is_cached(container) || CACHE.get().is_some_and(|cache| has_entry_in(cache, &[*build_unprobed()], container))
+}
+
+/// Whether `cache` holds the translation of `container` made in one of `contexts`, each at the
+/// key [`host_shader`] stores under (the program's own when it is kept out of deep skips).
+fn has_entry_in(cache: &Cache, contexts: &[[u8; 32]], container: &[u8]) -> bool {
+    use victory_shader::emit;
+    let hash = blake3::hash(container).to_hex()[..16].to_owned();
+    let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
+    contexts.iter().any(|c| has_entry(cache, &program_key(c, off), container))
 }
 
 /// Whether `cache` holds the translation of `container` made in context `build`.
@@ -544,12 +643,50 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        // Not stored (the entry format is fx-final's): a translation made with
+        // `VICTORY_D16_UINT=1` comes back without the table places of its
+        // 16-bit views, which this title's own unsigned views do not need.
+        half_views: Vec::new(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fx-prewarm: a cache filled by runs whose first lookup came before the view heap probe
+    /// holds their translations (their compute shaders among them) at the unprobed key. The
+    /// probed key misses them; the lookup the prewarm manifest makes finds them.
+    #[test]
+    fn translations_keyed_before_the_view_heap_probe_are_found_for_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path().to_owned()).unwrap();
+        let base = [7u8; 32];
+        // A capped host (NVIDIA): the probe sets the view limit and the heap map.
+        let probed = HostFacts {
+            rt_miss: false,
+            view_limit: 999_999,
+            max_wave: 32,
+            view_map: Some((1 << 17, 1_000_000 - (1 << 18) - 2)),
+            f3_view_fix: false,
+        };
+        let unprobed = probed.unprobed();
+        assert_eq!((unprobed.view_limit, unprobed.view_map, unprobed.max_wave), (0, None, 32));
+        let (now, before) = (with_host_settings(base, &probed), with_host_settings(base, &unprobed));
+        assert_ne!(now, before, "the probe's facts are in the key");
+
+        // A run stored a translation at the unprobed key.
+        let container = b"not a container: no wave64 program, so the context's own key".to_vec();
+        let converter = Translate {
+            translate: |_: &[u8]| Ok(shader()),
+            ran: AtomicBool::new(false),
+        };
+        cache.get_or_convert(&converter, &cache_input(&before, &container)).unwrap();
+
+        assert!(!has_entry_in(&cache, &[now], &container), "the next run's key misses it");
+        assert!(has_entry_in(&cache, &[now, before], &container), "the manifest's lookup finds it");
+        assert!(!has_entry_in(&cache, &[now, before], b"another container"));
+    }
 
     fn shader() -> HostShader {
         HostShader {
@@ -578,6 +715,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: Vec::new(),
         }
     }
 
@@ -704,9 +842,9 @@ mod tests {
                 &[&CACHE_SCHEMA_VERSION.to_le_bytes()[..], FINAL_SOURCE_HASH.as_bytes()].concat(),
                 victory_shader::emit::loop_limit(),
                 victory_shader::emit::group_sync(),
-                &SWITCHES.map(|name| (name, std::env::var_os(name))),
+                &all_switches(),
                 victory_shader::emit::shader_opt(),
-            ));
+            ), &HostFacts::now());
             assert_eq!(build(), &expected);
         }
     }

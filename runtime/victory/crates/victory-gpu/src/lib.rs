@@ -15,22 +15,38 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(all(test, windows))]
+mod agility;
+#[cfg(windows)]
+mod ab;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod cardmeter;
+#[cfg(windows)]
+mod gpuprof;
 pub mod console;
+pub mod cores;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;
+#[cfg(windows)]
+mod drvwatch;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
+pub mod framelog;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
+pub mod fsr;
+#[cfg(windows)]
 mod over;
+mod overlay;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -39,7 +55,11 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod plaincopy;
+#[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod fxprof;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
@@ -47,6 +67,7 @@ pub mod query;
 mod mem2;
 #[cfg(windows)]
 mod memcopy;
+mod memopt;
 mod narrow;
 #[cfg(windows)]
 mod translate;
@@ -58,8 +79,12 @@ mod rebar;
 #[cfg(windows)]
 mod regions;
 pub mod queue;
+#[cfg(windows)]
+mod queue2;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+mod census;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -68,6 +93,10 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod safe_copy;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
 pub mod splash;
@@ -75,11 +104,18 @@ pub mod splash;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod zerocopy;
+mod vram;
 
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use census::title_memory_reserved;
+#[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use zerocopy::sections as zero_copy_sections;
 #[cfg(windows)]
 pub use regions::{title_memory_not_placeholder, title_memory_placeholder};
 #[cfg(windows)]
@@ -87,11 +123,15 @@ pub use mem2::use_cpu_free;
 #[cfg(windows)]
 pub use shadow::gpu_only_exposed;
 #[cfg(windows)]
-pub use translate::{enabled as mem2_gpu_only_noview, title_memory_translated, title_memory_untranslated};
+pub use translate::{
+    enabled as mem2_gpu_only_noview, flush_unmaps as translate_flush_unmaps, lazy as remap_lazy, lazy_call, title_memory_translated,
+    title_memory_untranslated, shown as title_memory_in_table, write_through as title_memory_write_through, parking as remap_park,
+};
 #[cfg(windows)]
 pub use watch::{
     count_remap, physical_written, title_memory_gpu_only, title_memory_reading, use_title_memory, title_memory_remapped,
-    title_memory_remapping, title_memory_remapping_is_global, writing as kernel_will_write, Remapping,
+    title_memory_remapping, title_memory_remapping_is_global, title_memory_remapping_many, title_memory_remapped_many,
+    writing as kernel_will_write, title_memory_written, Remapping,
 };
 
 /// Whether `VICTORY_MEM2_GPU_ONLY_NOSNAP` is on (xmem then keeps the record

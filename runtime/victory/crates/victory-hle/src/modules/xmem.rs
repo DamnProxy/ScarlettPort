@@ -92,6 +92,7 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    let (asked_kind, asked_protect) = (kind, protect);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -181,6 +182,9 @@ pub extern "system" fn XMemVirtualAlloc(
         VIRTUAL_BYTES.fetch_add(size, Ordering::Relaxed);
     }
     if base.is_null() {
+        // The census keeps what the title asked for (`VICTORY_CENSUS`).
+        #[cfg(windows)]
+        victory_gpu::title_memory_reserved(at as usize, size, asked_kind, flags, asked_protect);
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),
@@ -373,7 +377,7 @@ const PAGE: usize = 64 << 10;
 /// made the first time a page of it is shown through the GPU side's
 /// translation table (`VICTORY_MEM2_GPU_ONLY_NOVIEW`; 0: none yet, or it
 /// failed).
-struct Section(HANDLE, usize, std::sync::OnceLock<usize>);
+struct Section(HANDLE, usize, std::sync::OnceLock<usize>, bool);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -480,7 +484,9 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
             // `VICTORY_PHYS_COMMIT=1`: here too, so a map is no commit.
-            PAGE_READWRITE | if on_wine() || phys_commit() { SEC_COMMIT } else { SEC_RESERVE },
+            // `VICTORY_REMAP_LAZY=1`: too, so a view made on a touch is no
+            // commit, and the section's own view reads committed bytes.
+            PAGE_READWRITE | if committed_whole() { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -500,9 +506,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine() || phys_commit());
+    let committed = committed_whole();
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
     PHYSICAL_BYTES.fetch_add(size, Ordering::Relaxed);
-    let section = Arc::new(Section(handle, size, std::sync::OnceLock::new()));
+    let section = Arc::new(Section(handle, size, std::sync::OnceLock::new(), committed));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -565,7 +572,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len, slice.section.3).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -692,6 +699,58 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     })
 }
 
+/// The title addresses that show bytes `[offset, offset + len)` of `pages`
+/// now, byte for byte, as runs (address, bytes) in address order: a write
+/// to the pages through a view of our own ([`page_window`],
+/// [`write_physical`]) lands there too, and nothing that watches those
+/// addresses sees it (the GPU side's guards fault only on a write at the
+/// guarded address itself). Empty if no view shows them. Byte for byte,
+/// not by whole pages: the title packs several small textures into one
+/// page and fills each with a request of its own.
+pub(crate) fn shown_runs(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    let Some(end) = offset.checked_add(len) else {
+        return Vec::new();
+    };
+    let first = offset / PAGE;
+    let Some(touched) = pages.get(first..end.div_ceil(PAGE)) else {
+        return Vec::new();
+    };
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    {
+        let physical = physical();
+        for (i, page) in touched.iter().enumerate() {
+            let Some(addresses) = physical.pages.get(page).and_then(|slice| physical.shown.get(&slice.key(0))) else {
+                continue;
+            };
+            // The bytes of this page that the write covers.
+            let lo = if i == 0 { offset % PAGE } else { 0 };
+            let hi = (end - (first + i) * PAGE).min(PAGE);
+            pieces.extend(addresses.iter().map(|&at| (at + lo, hi - lo)));
+        }
+    }
+    pieces.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (at, bytes) in pieces {
+        match runs.last_mut() {
+            Some((start, n)) if *start + *n == at => *n += bytes,
+            _ => runs.push((at, bytes)),
+        }
+    }
+    runs
+}
+
+/// Bytes `[offset, offset + len)` of `pages` have been written through a
+/// view of our own: the GPU side is told at every title address that
+/// shows them (`victory_gpu::title_memory_written`; what it does with it
+/// is `VICTORY_PAGE_WRITES`' to say, and it counts either way). Call when
+/// the bytes are there, and without the page table's lock ([`shown_runs`]
+/// takes and leaves it).
+pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
+    for (at, bytes) in shown_runs(pages, offset, len) {
+        victory_gpu::title_memory_written(at, bytes, true);
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -706,19 +765,23 @@ pub extern "system" fn XMemMapPhysicalPages(
 
 /// [`XMemMapPhysicalPages`], not counted as a call of its own.
 fn map_physical(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void {
+    // A CPU fault meanwhile on a page between entries waits for the call.
+    let _call = remap_lazy().then(victory_gpu::lazy_call);
     let started = std::time::Instant::now();
     let base = address as usize;
     // SAFETY: the title passes `n` page numbers unless null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
     let mut physical = physical();
     let mut held = None;
-    let batched = pagemap_runs();
+    let batched = pagemap_runs() || remap_lazy();
     if batched {
         begin_notes();
     }
-    let ok = map_pages(&mut physical, base, n, pages, &mut held, false);
+    // `VICTORY_REMAP_LAZY`: a single page (the shared render-target pool
+    // maps one per call) is a table update; runs stay views.
+    let ok = map_pages(&mut physical, base, n, pages, &mut held, n == 1 && remap_lazy());
     if batched {
-        end_notes(&physical);
+        end_call(&physical, &mut held);
     }
     victory_gpu::count_remap(13, started.elapsed().as_micros() as u64);
     drop(held);
@@ -751,12 +814,18 @@ fn map_pages(
     let Some(pages) = pages else {
         return true;
     };
+    let lazy = page_views && remap_lazy();
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return false;
         };
+        // `VICTORY_REMAP_LAZY`: a table update; a view when the CPU touches it.
+        if lazy && translate(physical, base + i * PAGE, &first) {
+            i += 1;
+            continue;
+        }
         // One view per run of consecutive slices of one section; one per
         // page for a Scatter batch: the title remaps a page of it alone
         // later, and unmapping a page of a view takes the whole view away
@@ -787,6 +856,8 @@ fn map_pages(
 /// the bytes to the one held.
 fn hold(held: &mut Option<victory_gpu::Remapping>, from: usize, to: usize) {
     match held {
+        // Held from the start of the call (`VICTORY_REMAP_LAZY`).
+        Some(h) if remap_lazy() && h.covers(from, to - from) => {}
         Some(h) => h.extend(from, to - from),
         None => *held = Some(victory_gpu::title_memory_remapping(from, to - from)),
     }
@@ -802,7 +873,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    if pagemap_runs() {
+    if pagemap_runs() || remap_lazy() {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (addresses, pages) = unsafe {
             (
@@ -873,13 +944,71 @@ fn phys_commit() -> bool {
     *ON
 }
 
+/// `VICTORY_REMAP_LAZY=1` (off by default): the title's page mappings
+/// (Scatter, `CopyPageMappingsBatchX`, single-page maps) are updates of the
+/// GPU side's translation table, a host view made only when the CPU touches
+/// a page (`victory_gpu` translate). Per call: one page lock, one hold on
+/// all the bytes it changes, the views it takes away unmapped at its end,
+/// the GPU side told once. Implies the batch paths of [`pagemap_runs`].
+pub(crate) fn remap_lazy() -> bool {
+    victory_gpu::remap_lazy()
+}
+
+/// Whether new sections are committed whole. Not for `VICTORY_REMAP_LAZY`
+/// any more (it was, +7 GB of working set from boot in runs RL-B/RL-C
+/// against RL-A): a page is committed when the table first shows it
+/// (`translate`) or a view of it is made, as without the switch.
+/// `VICTORY_REMAP_LAZY_COMMIT=1` commits them whole again.
+fn committed_whole() -> bool {
+    // `VICTORY_ZERO_COPY=2`: a section must be committed for the GPU side to
+    // open it as a heap.
+    on_wine() || phys_commit() || (remap_lazy() && lazy_commit()) || victory_gpu::zero_copy_sections()
+}
+
+/// `VICTORY_REMAP_LAZY_COMMIT=1` (off): sections committed whole with
+/// `VICTORY_REMAP_LAZY`, as on fx-remap/fx-remap2.
+fn lazy_commit() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_REMAP_LAZY_COMMIT").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+/// Holds, from the start of a call (`VICTORY_REMAP_LAZY`), every range it
+/// changes: one entry among the GPU side's changes, one wait.
+fn hold_call(physical: &Physical, held: &mut Option<victory_gpu::Remapping>, ranges: impl Iterator<Item = (usize, usize)>) {
+    if !remap_lazy() || held.is_some() {
+        return;
+    }
+    let reach: Vec<(usize, usize)> = ranges.filter(|r| r.1 > 0).map(|(at, len)| reach(physical, at, len)).collect();
+    if !reach.is_empty() {
+        *held = Some(victory_gpu::title_memory_remapping_many(&reach));
+    }
+}
+
+/// The end of a call of page mappings: the GPU side told, the hold on the
+/// bytes let go, then the views it took away unmapped (`VICTORY_REMAP_LAZY`).
+/// The views retired are out of the table and, once told, of the mapping
+/// record, so no read or write in place waits on their unmapping (it ran
+/// under the hold, and copies reading those ranges in place waited the
+/// whole mapper time: run RL-B's world-entry burst).
+fn end_call(physical: &Physical, held: &mut Option<victory_gpu::Remapping>) {
+    end_notes(physical);
+    if remap_lazy() {
+        drop(held.take());
+        let n = victory_gpu::translate_flush_unmaps();
+        victory_gpu::count_remap(10, n as u64);
+    }
+}
+
 /// [`XMemMapPhysicalPagesScatter`] with [`pagemap_runs`].
 fn scatter_batched(addresses: &[usize], pages: Option<&[usize]>) -> bool {
+    // A CPU fault meanwhile on a page between entries waits for the call.
+    let _call = remap_lazy().then(victory_gpu::lazy_call);
     let started = std::time::Instant::now();
     let unmaps = |i: usize| pages.is_none_or(|p| p[i] == 0);
     let groups = victory_core::pagemap::scatter_groups(addresses, unmaps);
     let mut physical = physical();
     let mut held = None;
+    hold_call(&physical, &mut held, groups.iter().map(|&(first, len)| (addresses[first], len * PAGE)));
     begin_notes();
     let mut ok = true;
     for &(first, len) in &groups {
@@ -892,7 +1021,7 @@ fn scatter_batched(addresses: &[usize], pages: Option<&[usize]>) -> bool {
             break;
         }
     }
-    end_notes(&physical);
+    end_call(&physical, &mut held);
     drop(held);
     drop(physical);
     victory_gpu::count_remap(0, 1);
@@ -922,8 +1051,12 @@ fn end_notes(physical: &Physical) {
         return;
     };
     let joined = notes.changed_joined();
-    for &(from, to) in &joined {
-        victory_gpu::title_memory_remapped(from, to - from);
+    if remap_lazy() {
+        victory_gpu::title_memory_remapped_many(&joined);
+    } else {
+        for &(from, to) in &joined {
+            victory_gpu::title_memory_remapped(from, to - from);
+        }
     }
     let views = notes.views_alive(|at, len| physical.views.get(&at).is_some_and(|v| v.0 == len));
     for &(at, len, section, offset) in &views {
@@ -1032,6 +1165,8 @@ static VIRTUAL_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// and one hold on the bytes, the GPU side told once at the end. The
 /// queue's page-mapping copies (`victory_gpu::resource::use_page_batch_mapper`).
 pub fn map_alias_batch(ops: &[victory_core::pagemap::AliasOp]) -> bool {
+    // A CPU fault meanwhile on a page between entries waits for the call.
+    let _call = remap_lazy().then(victory_gpu::lazy_call);
     let started = std::time::Instant::now();
     let merged = victory_core::pagemap::merge_alias(ops);
     let pages: u64 = ops.iter().map(|o| o.pages()).sum();
@@ -1039,12 +1174,13 @@ pub fn map_alias_batch(ops: &[victory_core::pagemap::AliasOp]) -> bool {
     let gpu_only: u64 = ops.iter().map(|o| gpu_only_pages(o.to as usize, o.len as usize)).sum();
     let mut physical = physical();
     let mut held = None;
+    hold_call(&physical, &mut held, merged.iter().map(|o| (o.to as usize, o.len as usize)));
     begin_notes();
     let mut ok = true;
     for op in &merged {
         ok &= alias_locked(&mut physical, op, &mut held);
     }
-    end_notes(&physical);
+    end_call(&physical, &mut held);
     drop(held);
     drop(physical);
     victory_gpu::count_remap(5, 1);
@@ -1095,7 +1231,9 @@ fn alias_locked(
 /// switch off, elsewhere, or if the section's own view cannot be made.
 /// Under the page lock, after `unmap` took away what `at` showed.
 fn translate(physical: &mut Physical, at: usize, slice: &Slice) -> bool {
-    if !at.is_multiple_of(PAGE) || gpu_only_pages(at, PAGE) == 0 || !victory_gpu::mem2_gpu_only_noview() {
+    if !at.is_multiple_of(PAGE)
+        || !(remap_lazy() || (gpu_only_pages(at, PAGE) != 0 && victory_gpu::mem2_gpu_only_noview()))
+    {
         return false;
     }
     let whole = slice.section.whole();
@@ -1103,7 +1241,12 @@ fn translate(physical: &mut Physical, at: usize, slice: &Slice) -> bool {
         return false;
     }
     let offset = slice.index * PAGE;
-    victory_gpu::title_memory_translated(at, whole + offset, slice.section.0 as usize, offset as u64);
+    // A section reserved, not committed (made before the switch was read):
+    // its page is committed here, once for every view of it.
+    if !slice.section.3 && !commit(whole + offset, PAGE, false) {
+        return false;
+    }
+    victory_gpu::title_memory_translated(at, whole + offset, slice.section.0 as usize, offset as u64, slice.section.3);
     // Its bytes are new to the GPU side (what it showed went in `unmap`).
     note_remapped(at, PAGE);
     physical.shown.entry(slice.key(0)).or_default().push(at);
@@ -1133,6 +1276,8 @@ fn shown_at(physical: &Physical, at: usize) -> Option<Slice> {
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    // A CPU fault meanwhile on a page between entries waits for the call.
+    let _call = remap_lazy().then(victory_gpu::lazy_call);
     let (to, from, len) = (to as usize, from as usize, len as usize);
     victory_gpu::count_remap(6, (len / PAGE) as u64);
     victory_gpu::count_remap(7, 1);
@@ -1157,12 +1302,20 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
             return false;
         }
     }
+    if remap_lazy() {
+        victory_gpu::translate_flush_unmaps();
+    }
     true
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    // A view retired from the table may still stand there
+    // (`VICTORY_REMAP_LAZY`): it goes before a view is mapped in its place.
+    if remap_lazy() {
+        victory_gpu::translate_flush_unmaps();
+    }
     // A lone 64 KiB placeholder is the whole range already: no split
     // (`VICTORY_PAGEMAP_RUNS`; if that was wrong the map fails and is
     // made again after the split).
@@ -1240,7 +1393,7 @@ fn mapped(
     slice: Slice,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
 ) -> bool {
-    if !commit(base, len) {
+    if !commit(base, len, slice.section.3) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         if len == PAGE && pagemap_runs() {
@@ -1268,9 +1421,9 @@ fn mapped(
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
-    if on_wine() || phys_commit() {
-        return true; // sections are committed whole there
+fn commit(base: usize, len: usize, committed: bool) -> bool {
+    if committed {
+        return true; // the section is committed whole
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
@@ -1552,6 +1705,66 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XMemGetWorkingSetStatistics),
             hle_export!(XMemTransferMemory),
         ],
+    }
+}
+
+/// The title's own `VirtualFree` (kernel32 and the memory API set).
+/// `VICTORY_REMAP_LAZY`: the release of a placeholder that pages are mapped
+/// into lazily (table entries, no view) is refused, as the host refuses it
+/// when they are views (error 87, which the non-lazy path relied on). The
+/// host would release it: the reservation goes, the address is reserved
+/// again by someone else, and the title's next read of its page meets a
+/// stale entry (cand4 crash, 2026-11-25: 487 then a read of "reserved,
+/// never committed" memory at the 2 MiB reservation made there).
+pub(crate) mod host_free {
+    use super::*;
+
+    pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+        if kind & MEM_RELEASE != 0 && kind & MEM_PRESERVE_PLACEHOLDER == 0 && remap_lazy() && holds_lazy_pages(address as usize)
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    at = format_args!("{address:p}"),
+                    "VICTORY_REMAP_LAZY: the title released a reservation with pages mapped in it; refused, as with views there (more not logged)"
+                )
+            });
+            REFUSED.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: plain error code.
+            unsafe { windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER) };
+            return 0;
+        }
+        // SAFETY: the title's own arguments.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, kind) }
+    }
+
+    /// Releases refused, since the start.
+    pub(crate) static REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Whether the allocation a release at `at` would free (the region of
+    /// one kind from `at`) has pages shown through the table.
+    fn holds_lazy_pages(at: usize) -> bool {
+        if at == 0 {
+            return false;
+        }
+        // SAFETY: plain data; zero is valid.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { windows_sys::Win32::System::Memory::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) } == 0
+            || info.State != MEM_RESERVE
+        {
+            return false;
+        }
+        let end = at.saturating_add(info.RegionSize);
+        physical().translated.range(at..end).next().is_some()
+    }
+
+    pub(crate) fn module() -> HleModule {
+        HleModule {
+            name: "xmem-host",
+            dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
+            exports: vec![hle_export!(VirtualFree)],
+        }
     }
 }
 
@@ -2044,6 +2257,267 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
+    /// `VICTORY_REMAP_LAZY` for the `remap_lazy_` tests: set before the
+    /// switch is first read. Run them alone (`remap_lazy_`, see
+    /// `remap-tests.sh`): the switch is read once per process.
+    fn lazy_on() -> bool {
+        // SAFETY: set before any thread of this process reads it.
+        unsafe { std::env::set_var("VICTORY_REMAP_LAZY", "1") };
+        if !remap_lazy() {
+            eprintln!("VICTORY_REMAP_LAZY read off earlier in this process: run the remap_lazy_ tests alone");
+            return false;
+        }
+        true
+    }
+
+    const MAGIC: u64 = 0x5ca7_7e40_0000_0000;
+
+    /// Tags each page: its index (xor a constant) in its first 16 bytes and
+    /// its last 8.
+    fn tag_pages(pages: &[usize]) {
+        for (k, &p) in pages.iter().enumerate() {
+            let t = (k as u64 ^ MAGIC).to_le_bytes();
+            let head: Vec<u8> = t.iter().chain(t.iter()).copied().collect();
+            assert!(write_physical(&[p], 0, &head));
+            assert!(write_physical(&[p], PAGE - 8, &t));
+        }
+    }
+
+    /// The tag at `at` (a page), read by the CPU in place: the first touch
+    /// of a page shown through the table makes it a view.
+    fn tag_at(at: usize, offset: usize) -> u64 {
+        // SAFETY: a mapped page (a view, or a table entry the fault makes one).
+        unsafe { ((at + offset) as *const u64).read_volatile() }
+    }
+
+    /// A 10,000-page Scatter (scattered order, scattered pages) is one call
+    /// of table updates: no view, no split, no commit until the CPU touches
+    /// a page; every page then reads exactly the page mapped there. Mapped
+    /// again with another order, the views made go and every page reads its
+    /// new page; unmapped, nothing is left.
+    #[test]
+    fn remap_lazy_scatter_of_10000_pages() {
+        if !lazy_on() {
+            return;
+        }
+        const N: usize = 10_000;
+        let pages = allocate(N);
+        tag_pages(&pages);
+        let base = placeholder(N) as usize;
+        let slot = |s: usize| base + s * PAGE;
+        // Entry i maps slot (i * 3001) % N to page (slot * k) % N: both
+        // permutations (3001, 7919 and 7907 are prime to 10,000).
+        let batch = |k: usize| -> (Vec<usize>, Vec<usize>) {
+            (0..N).map(|i| (i * 3001) % N).map(|s| (slot(s), pages[(s * k) % N])).unzip()
+        };
+        let (addresses, numbers) = batch(7919);
+        let t = std::time::Instant::now();
+        assert!(scatter_batched(&addresses, Some(&numbers)));
+        let first = t.elapsed();
+        {
+            let physical = physical();
+            assert!(physical.views.range(base..slot(N)).next().is_none(), "no views made");
+            assert_eq!(physical.translated.range(base..slot(N)).count(), N);
+        }
+        for s in [0, 1, N / 2, N - 1] {
+            assert_ne!(query(slot(s) as *const c_void).host.State, MEM_COMMIT, "slot {s} untouched");
+        }
+        for s in 0..N {
+            let want = ((s * 7919) % N) as u64 ^ MAGIC;
+            assert_eq!(tag_at(slot(s), 0), want, "slot {s}");
+            assert_eq!(tag_at(slot(s), PAGE - 8), want, "slot {s}, last bytes");
+        }
+        // Every slot is a view now; remapped, each must show its new page.
+        let (addresses, numbers) = batch(7907);
+        let t = std::time::Instant::now();
+        assert!(scatter_batched(&addresses, Some(&numbers)));
+        let second = t.elapsed();
+        for s in 0..N {
+            assert_eq!(tag_at(slot(s), 8), ((s * 7907) % N) as u64 ^ MAGIC, "slot {s} after the remap");
+        }
+        // A physical write reaches a lazily made view.
+        assert!(write_physical(&pages[(5 * 7907) % N..][..1], 0, &[0xee]));
+        assert_eq!(tag_at(slot(5), 0) & 0xff, 0xee);
+        let all: Vec<usize> = (0..N).map(slot).collect();
+        let t = std::time::Instant::now();
+        assert!(scatter_batched(&all, None));
+        let third = t.elapsed();
+        assert!(physical().translated.range(base..slot(N)).next().is_none());
+        for s in (0..N).step_by(97) {
+            assert_ne!(query(slot(s) as *const c_void).host.State, MEM_COMMIT, "slot {s} unmapped");
+        }
+        eprintln!("10,000-page Scatter: {first:?} as table updates, {second:?} over 10,000 views, {third:?} to unmap all");
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    /// A CPU read of a page mapped lazily into a section that is not
+    /// committed (`VICTORY_REMAP_LAZY` without `_COMMIT`): the fault makes
+    /// it a committed view and the read sees the page. The title's release
+    /// of the reservation meanwhile is refused (it would be with a view
+    /// there), so the read is not of a stale entry at an address reserved
+    /// again (the cand4 crash); unmapped, the release goes through.
+    #[test]
+    fn remap_lazy_read_of_an_uncommitted_page_after_a_refused_release() {
+        if !lazy_on() {
+            return;
+        }
+        let pages = allocate(2);
+        tag_pages(&pages);
+        let base = placeholder(4);
+        let at = base as usize;
+        assert_eq!(XMemMapPhysicalPages(base, 1, &pages[1]), base);
+        assert!(physical().translated.contains_key(&at), "a single map is a table entry");
+        assert!(!physical().translated.values().next().unwrap().section.3, "the section is not committed whole");
+        assert_eq!(host_free::VirtualFree(base, 0, MEM_RELEASE), 0, "released with a page mapped in it");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32));
+        // The read faults, the handler makes the page a committed view.
+        assert_eq!(tag_at(at, 0), 1 ^ MAGIC);
+        assert_eq!(tag_at(at, PAGE - 8), 1 ^ MAGIC);
+        assert!(XMemMapPhysicalPages(base, 1, std::ptr::null()) == base);
+        victory_gpu::translate_flush_unmaps();
+        assert!(!physical().translated.contains_key(&at));
+    }
+
+    /// Readers on four threads read pages in place (faulting views in)
+    /// while the main thread remaps them again and again, by Scatter, by
+    /// single maps and by page mappings into a second reservation. A read
+    /// is always some page's whole tag, never a crash or a torn mix, and a
+    /// read that no remap overlapped (a sequence lock) is exactly the page
+    /// mapped there last.
+    #[test]
+    fn remap_lazy_racing_remaps_and_reads() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
+        use victory_core::pagemap::AliasOp;
+        if !lazy_on() {
+            return;
+        }
+        const P: usize = 24;
+        const S: usize = 8;
+        let pages = allocate(P);
+        tag_pages(&pages);
+        let pool = placeholder(S) as usize;
+        let dst = placeholder(S) as usize;
+        let seq = Arc::new(AtomicU64::new(0));
+        let expected: Arc<Vec<AtomicUsize>> = Arc::new((0..S).map(AtomicUsize::new).collect());
+        let at = |s: usize| pool + s * PAGE;
+        let numbers: Vec<usize> = (0..S).map(|s| pages[s]).collect();
+        assert!(scatter_batched(&(0..S).map(at).collect::<Vec<_>>(), Some(&numbers)));
+        let p = PAGE as u64;
+        assert!(map_alias_batch(&[AliasOp { to: dst as u64, from: Some(pool as u64), len: S as u64 * p, repeat: false }]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|r| {
+                let (seq, expected, stop) = (seq.clone(), expected.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let (mut exact, mut all) = (0u64, 0u64);
+                    let mut x = 0x9e37_79b9_u64 + r;
+                    while !stop.load(Ordering::Relaxed) {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let s = (x % S as u64) as usize;
+                        let base = if x & 1 << 40 != 0 { dst } else { pool };
+                        let before = seq.load(Ordering::Acquire);
+                        let a = tag_at(base + s * PAGE, 0);
+                        let b = tag_at(base + s * PAGE, PAGE - 8);
+                        fence(Ordering::Acquire);
+                        let after = seq.load(Ordering::Relaxed);
+                        assert!((a ^ MAGIC) < P as u64, "slot {s}: {a:#x} is no page's tag");
+                        assert!((b ^ MAGIC) < P as u64, "slot {s}: {b:#x} is no page's tag");
+                        if before == after && before % 2 == 0 {
+                            let want = expected[s].load(Ordering::Relaxed) as u64 ^ MAGIC;
+                            assert_eq!((a, b), (want, want), "slot {s} at sequence {before}");
+                            exact += 1;
+                        }
+                        all += 1;
+                    }
+                    (exact, all)
+                })
+            })
+            .collect();
+        for round in 1..=3000usize {
+            let new: Vec<usize> = (0..S).map(|s| (s * 5 + round * 7) % P).collect();
+            seq.fetch_add(1, Ordering::AcqRel); // odd: remapping
+            match round % 3 {
+                0 => {
+                    let n: Vec<usize> = new.iter().map(|&k| pages[k]).collect();
+                    assert!(scatter_batched(&(0..S).rev().map(at).collect::<Vec<_>>(), Some(&n.iter().rev().copied().collect::<Vec<_>>())));
+                }
+                1 => {
+                    for s in 0..S {
+                        assert_eq!(XMemMapPhysicalPages(at(s) as *mut c_void, 1, &pages[new[s]]), at(s) as *mut c_void);
+                    }
+                }
+                _ => {
+                    let n: Vec<usize> = new.iter().map(|&k| pages[k]).collect();
+                    assert!(scatter_batched(&(0..S).map(at).collect::<Vec<_>>(), Some(&n)));
+                }
+            }
+            // The second reservation shows the pool's pages, in two runs.
+            let half = (S / 2) as u64;
+            assert!(map_alias_batch(&[
+                AliasOp { to: dst as u64 + half * p, from: Some(pool as u64 + half * p), len: half * p, repeat: false },
+                AliasOp { to: dst as u64, from: Some(pool as u64), len: half * p, repeat: false },
+            ]));
+            for s in 0..S {
+                expected[s].store(new[s], Ordering::Relaxed);
+            }
+            seq.fetch_add(1, Ordering::Release); // even: settled
+            if round % 200 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (mut exact, mut all) = (0, 0);
+        for r in readers {
+            let (e, a) = r.join().expect("a reader saw the wrong bytes or crashed");
+            exact += e;
+            all += a;
+        }
+        eprintln!("racing remaps: {all} reads, {exact} of them checked exactly");
+        assert!(exact > 0 && all > 0);
+        assert!(scatter_batched(&(0..S).map(at).collect::<Vec<_>>(), None));
+        assert!(map_alias_batch(&[AliasOp { to: dst as u64, from: None, len: S as u64 * p, repeat: false }]));
+        assert_eq!(XMemFreePhysicalPages(P, pages.as_ptr()), 1);
+    }
+
+    /// A page made a view and then remapped or unmapped within one call:
+    /// the old view is gone by the call's end (it never shows the old page
+    /// afterwards), an address remapped back and forth in one batch ends as
+    /// its last entry says, and an eager run mapped over a retired view
+    /// still maps.
+    #[test]
+    fn remap_lazy_views_taken_away_go_by_the_end_of_the_call() {
+        if !lazy_on() {
+            return;
+        }
+        let pages = allocate(4);
+        tag_pages(&pages);
+        let b = placeholder(4) as usize;
+        let slot = |k: usize| b + k * PAGE;
+        assert!(scatter_batched(&[slot(0), slot(1)], Some(&pages[..2])));
+        assert_eq!(tag_at(slot(0), 0), MAGIC); // a view now
+        assert_eq!(tag_at(slot(1), 0), 1 ^ MAGIC);
+        // Slot 0 to page 2, then 3, then 2 again, in one batch.
+        assert!(scatter_batched(&[slot(0), slot(0), slot(0)], Some(&[pages[2], pages[3], pages[2]])));
+        assert_eq!(tag_at(slot(0), 0), 2 ^ MAGIC);
+        // Unmapped: no view stays.
+        assert!(scatter_batched(&[slot(1)], None));
+        assert_ne!(query(slot(1) as *const c_void).host.State, MEM_COMMIT);
+        // An eager run over a retired view and a lone placeholder.
+        assert_eq!(XMemMapPhysicalPages(slot(0) as *mut c_void, 2, pages[2..].as_ptr()), slot(0) as *mut c_void);
+        assert_eq!(tag_at(slot(0), 0), 2 ^ MAGIC);
+        assert_eq!(tag_at(slot(1), 0), 3 ^ MAGIC);
+        // Back to table updates over the eager view.
+        assert!(scatter_batched(&[slot(1), slot(0)], Some(&[pages[0], pages[1]])));
+        assert_eq!(tag_at(slot(0), 0), 1 ^ MAGIC);
+        assert_eq!(tag_at(slot(1), 0), MAGIC);
+        assert!(scatter_batched(&(0..4).map(slot).collect::<Vec<_>>(), None));
+        assert!((0..4).all(|k| query(slot(k) as *const c_void).host.State != MEM_COMMIT));
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
     /// Turns [`pagemap_runs`] on for the tests that want it (it only ever
     /// maps the same as off, so other tests running meanwhile are fine).
     pub(super) static PAGEMAP_RUNS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2216,6 +2690,54 @@ mod tests {
         assert_eq!(shown(pages[3]), [at + 3 * PAGE]);
         XMemMapPhysicalPages(base, 8, std::ptr::null());
         assert!(pages.iter().all(|&p| shown(p).is_empty()));
+    }
+
+    /// Pages say where the title has them mapped, byte for byte (after
+    /// fork PR #571's test; its runs are whole pages).
+    #[test]
+    fn pages_say_where_they_are_mapped() {
+        let pages = allocate(3);
+        let reserve = |n: usize| {
+            let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+            assert!(!at.is_null());
+            at
+        };
+        // `b` keeps a page unmapped at either end, so that no run at `b`
+        // ever touches one at `a`, wherever the host puts the two.
+        let (a, b) = (reserve(3), reserve(4));
+        assert!(shown_runs(&pages, 0, 3 * PAGE).is_empty(), "mapped nowhere");
+        // All three at `a`; the last two at `b`, from its second page on.
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        let second = b.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(second, 2, pages[1..].as_ptr()), second);
+        let (a, second) = (a as usize, second as usize);
+        let sorted = |mut runs: Vec<(usize, usize)>| {
+            runs.sort_unstable();
+            runs
+        };
+        assert_eq!(shown_runs(&pages, 0, PAGE), vec![(a, PAGE)]);
+        // A request for part of a page names those bytes alone.
+        assert_eq!(shown_runs(&pages, 0x4000, 0x3000), vec![(a + 0x4000, 0x3000)]);
+        // Across two pages, shown at two addresses each: one run at each.
+        assert_eq!(
+            shown_runs(&pages, PAGE + 1, PAGE),
+            sorted(vec![(a + PAGE + 1, PAGE), (second + 1, PAGE)])
+        );
+        // A page unmapped in the middle of a view: the rest still shows.
+        let middle = (a + PAGE) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+        assert_eq!(
+            shown_runs(&pages, 0, 3 * PAGE),
+            sorted(vec![(a, PAGE), (a + 2 * PAGE, PAGE), (second, 2 * PAGE)])
+        );
+        // Too few pages for the bytes: nothing (the write fails too).
+        assert!(shown_runs(&pages, 0, 3 * PAGE + 1).is_empty());
+        for (at, n) in [(a, 3), (second, 2)] {
+            let at = at as *mut c_void;
+            assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
+        }
+        assert!(shown_runs(&pages, 0, 3 * PAGE).is_empty());
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     #[test]

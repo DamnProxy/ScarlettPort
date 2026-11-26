@@ -11,8 +11,9 @@
 //! title's reads drain it. `[controls]` in victory.toml sets and rebinds it.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 
@@ -51,6 +52,28 @@ impl PadState {
     /// Nothing pressed or deflected.
     pub fn is_idle(&self) -> bool {
         *self == PadState::default()
+    }
+
+    /// The sticks with a radial dead zone of `dz` (0 to 0.9): a stick
+    /// inside it rests, one outside it is rescaled so the response starts
+    /// at 0 at the edge of the zone and still reaches 1.
+    pub fn with_deadzone(mut self, dz: f32) -> PadState {
+        if dz <= 0.0 {
+            return self;
+        }
+        let dz = dz.min(0.9);
+        let shape = |x: f32, y: f32| {
+            let m = x.hypot(y);
+            if m <= dz {
+                (0.0, 0.0)
+            } else {
+                let k = ((m - dz) / (1.0 - dz)).min(1.0) / m;
+                (x * k, y * k)
+            }
+        };
+        (self.left_x, self.left_y) = shape(self.left_x, self.left_y);
+        (self.right_x, self.right_y) = shape(self.right_x, self.right_y);
+        self
     }
 
     /// `self` and `other` as one pad: buttons OR, triggers max, and each
@@ -212,6 +235,10 @@ const KEYS: [(&str, u8); 48] = [
 /// The virtual key a key name stands for (case does not matter).
 pub fn key_code(name: &str) -> Option<u8> {
     let name = name.trim();
+    // A key with no name of its own is written as its code (`0xE2`).
+    if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+        return u8::from_str_radix(hex, 16).ok().filter(|&vk| vk != 0);
+    }
     if let [c] = name.as_bytes()
         && c.is_ascii_alphanumeric()
     {
@@ -251,6 +278,52 @@ pub fn key_name(vk: u8) -> String {
     }
 }
 
+impl Output {
+    /// The name `[controls]` and key map files give it (`A`, `LeftUp`, `Walk`).
+    pub fn name(self) -> &'static str {
+        OUTPUTS.iter().find(|(_, o)| *o == self).map_or("?", |(n, _)| n)
+    }
+
+    /// Every output, in the order the overlay lists them.
+    pub fn all() -> impl Iterator<Item = Output> {
+        OUTPUTS.iter().map(|(_, o)| *o)
+    }
+
+    /// A short description for the overlay.
+    pub fn label(self) -> &'static str {
+        match self {
+            Output::Button(A) => "A (sprint, accept)",
+            Output::Button(B) => "B (back)",
+            Output::Button(X) => "X (jump)",
+            Output::Button(Y) => "Y (use, enter)",
+            Output::Button(LEFT_SHOULDER) => "LB",
+            Output::Button(RIGHT_SHOULDER) => "RB",
+            Output::LeftTrigger => "LT (aim, brake)",
+            Output::RightTrigger => "RT (shoot, gas)",
+            Output::Button(LEFT_STICK) => "Left stick click",
+            Output::Button(RIGHT_STICK) => "Right stick click",
+            Output::Button(VIEW) => "View",
+            Output::Button(MENU) => "Menu",
+            Output::Button(UP) => "D-pad up",
+            Output::Button(DOWN) => "D-pad down",
+            Output::Button(LEFT) => "D-pad left",
+            Output::Button(RIGHT) => "D-pad right",
+            Output::Stick { right: false, x: false, positive: true } => "Move forward",
+            Output::Stick { right: false, x: false, positive: false } => "Move back",
+            Output::Stick { right: false, x: true, positive: false } => "Move left",
+            Output::Stick { right: false, x: true, positive: true } => "Move right",
+            Output::Stick { right: true, x: false, positive: true } => "Look up",
+            Output::Stick { right: true, x: false, positive: false } => "Look down",
+            Output::Stick { right: true, x: true, positive: false } => "Look left",
+            Output::Stick { right: true, x: true, positive: true } => "Look right",
+            Output::Walk => "Walk (hold)",
+            Output::ToggleVehicle => "Foot / vehicle layout",
+            Output::ReleaseCursor => "Free the mouse",
+            Output::Button(_) => "Button",
+        }
+    }
+}
+
 fn output(name: &str) -> Option<Output> {
     OUTPUTS
         .iter()
@@ -281,6 +354,58 @@ impl Layout {
             self.0.insert(vk, outs);
         }
         Ok(())
+    }
+
+    /// The keys that do `out`, by key code.
+    pub fn keys_of(&self, out: Output) -> Vec<u8> {
+        self.0
+            .iter()
+            .filter(|(_, outs)| outs.contains(&out))
+            .map(|(vk, _)| *vk)
+            .collect()
+    }
+
+    /// What `vk` does.
+    pub fn outputs_of(&self, vk: u8) -> &[Output] {
+        self.outputs(vk)
+    }
+
+    /// Makes `new` do `out` (and nothing else: what it did is taken from
+    /// it) and, when `old` is given, takes `out` from that key. `new` of
+    /// `None` only unbinds `old`. Returns what `new` did before.
+    pub fn rebind(&mut self, out: Output, old: Option<u8>, new: Option<u8>) -> Vec<Output> {
+        if let Some(old) = old
+            && Some(old) != new
+        {
+            let rest: Vec<Output> = self.outputs(old).iter().copied().filter(|o| *o != out).collect();
+            if rest.is_empty() {
+                self.0.remove(&old);
+            } else {
+                self.0.insert(old, rest);
+            }
+        }
+        let Some(new) = new else { return Vec::new() };
+        let before: Vec<Output> = self.outputs(new).iter().copied().filter(|o| *o != out).collect();
+        self.0.insert(new, vec![out]);
+        before
+    }
+
+    /// Key map lines (`Key=Out,Out`) for the keys that differ from `base`;
+    /// a key `base` binds and this does not is written with nothing after
+    /// the `=`.
+    fn keymap_lines(&self, base: &Layout) -> Vec<String> {
+        let mut lines = Vec::new();
+        let keys: std::collections::BTreeSet<u8> =
+            self.0.keys().chain(base.0.keys()).copied().collect();
+        for vk in keys {
+            let (mine, theirs) = (self.outputs(vk), base.outputs(vk));
+            if mine == theirs {
+                continue;
+            }
+            let outs: Vec<&str> = mine.iter().map(|o| o.name()).collect();
+            lines.push(format!("{}={}", key_name(vk), outs.join(",")));
+        }
+        lines
     }
 
     fn of(table: &[(&str, &[&str])]) -> Layout {
@@ -358,6 +483,9 @@ pub struct Settings {
     /// smallest movement turns and the response is linear.
     pub deadzone: f32,
     pub curve: f32,
+    /// A radial dead zone put on every host pad's sticks (0: none), for
+    /// drift the title's own zone does not hide. Not the mouse's `deadzone`.
+    pub pad_deadzone: f32,
     pub walk_speed: f32,
     pub on_foot: Layout,
     pub vehicle: Layout,
@@ -374,6 +502,7 @@ impl Default for Settings {
             carry: true,
             deadzone: 0.0,
             curve: 1.0,
+            pad_deadzone: 0.0,
             walk_speed: 0.5,
             on_foot: default_layout(ON_FOOT),
             vehicle: default_layout(VEHICLE),
@@ -399,6 +528,7 @@ struct File {
     mouse_carry: Option<bool>,
     stick_deadzone: Option<f32>,
     stick_curve: Option<f32>,
+    pad_deadzone: Option<f32>,
     walk_speed: Option<f32>,
     #[serde(default)]
     on_foot: BTreeMap<String, Binding>,
@@ -428,6 +558,7 @@ impl Settings {
         range("mouse_y_scale", file.mouse_y_scale, 0.01, 100.0, &mut s.y_scale)?;
         range("stick_deadzone", file.stick_deadzone, 0.0, 0.9, &mut s.deadzone)?;
         range("stick_curve", file.stick_curve, 0.2, 5.0, &mut s.curve)?;
+        range("pad_deadzone", file.pad_deadzone, 0.0, 0.5, &mut s.pad_deadzone)?;
         range("walk_speed", file.walk_speed, 0.05, 1.0, &mut s.walk_speed)?;
         s.enabled = file.enabled.unwrap_or(s.enabled);
         s.invert_y = file.mouse_invert_y.unwrap_or(s.invert_y);
@@ -519,6 +650,30 @@ impl Settings {
         problems
     }
 
+    /// The key map file text of what differs from the built-in layouts:
+    /// the lines `apply_keymap` reads back to the same bindings.
+    pub fn keymap_text(&self) -> String {
+        let base = Settings::default();
+        let mut text = String::from(
+            "# Key bindings changed from the defaults (written by the F1 overlay).\n\
+             # key=button[,button...]; nothing after the = unbinds the key.\n",
+        );
+        for (name, mine, theirs) in [
+            ("on_foot", &self.on_foot, &base.on_foot),
+            ("vehicle", &self.vehicle, &base.vehicle),
+        ] {
+            let lines = mine.keymap_lines(theirs);
+            if !lines.is_empty() {
+                text.push_str(&format!("[{name}]\n"));
+                for l in lines {
+                    text.push_str(&l);
+                    text.push('\n');
+                }
+            }
+        }
+        text
+    }
+
     /// The environment's say, over `[controls]`: `VICTORY_KBM=0` turns
     /// keyboard and mouse play off, `VICTORY_MOUSE_SENS=<factor>`,
     /// `VICTORY_MOUSE_INVERT_Y=1`, `VICTORY_KEYMAP=<file>`. Returns what
@@ -562,6 +717,45 @@ impl Settings {
 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
+static KEYMAP_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// The key map file the overlay saves to and that is read at start (before
+/// `VICTORY_KEYMAP`, which wins where both bind a key). Call before
+/// [`configure`].
+pub fn set_keymap_file(path: PathBuf) {
+    let _ = KEYMAP_FILE.set(path);
+}
+
+/// Where the key map file is: `VICTORY_KEYMAP`, else the one set by
+/// [`set_keymap_file`].
+pub fn keymap_file() -> Option<PathBuf> {
+    std::env::var("VICTORY_KEYMAP")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| PathBuf::from(p.trim()))
+        .or_else(|| KEYMAP_FILE.get().cloned())
+}
+
+/// Settings changed while the title runs (by the overlay); the input host
+/// takes a newer one on its next poll.
+static LIVE: Mutex<Option<Settings>> = Mutex::new(None);
+static LIVE_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// Makes `s` the settings in force, now.
+pub fn publish(s: Settings) {
+    *LIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    LIVE_VERSION.fetch_add(1, Ordering::Release);
+}
+
+/// Changes so far; the settings in force have changed when it has.
+pub fn live_version() -> u64 {
+    LIVE_VERSION.load(Ordering::Acquire)
+}
+
+/// The settings in force: the last published, else the start-up ones.
+pub fn current() -> Settings {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(settings)
+}
 
 /// Takes `[controls]` from the config file (none: the defaults). Call it
 /// before the title starts; later calls change nothing.
@@ -573,6 +767,14 @@ pub fn configure(table: Option<&toml::Table>) -> Result<(), String> {
     // A bad environment value is logged, never fatal: the game still starts.
     let env = |k: &str| std::env::var(k).ok();
     let read = |p: &str| std::fs::read_to_string(p);
+    // The overlay's own file, then the environment over it.
+    if let Some(path) = KEYMAP_FILE.get()
+        && let Ok(text) = std::fs::read_to_string(path)
+    {
+        for problem in s.apply_keymap(&text) {
+            tracing::warn!("{}: {problem}", path.display());
+        }
+    }
     for problem in s.apply_env(&env, &read) {
         tracing::warn!("{problem}");
     }
@@ -1596,4 +1798,115 @@ mod tests {
         assert_eq!(inverted.right_y, -base.right_y);
         assert_eq!(inverted.right_x, base.right_x);
         assert!(base.right_y < 0.0, "mouse down looks down");
-    }}
+    }
+
+    #[test]
+    fn keys_without_a_name_are_written_as_their_code_and_read_back() {
+        assert_eq!(key_code("0xE2"), Some(0xE2));
+        assert_eq!(key_code("0xe2"), Some(0xE2));
+        assert_eq!(key_code("0x0"), None);
+        assert_eq!(key_code("0x100"), None);
+        assert_eq!(key_code(&key_name(0xE2)), Some(0xE2));
+        assert_eq!(key_code(&key_name(0x90)), Some(0x90));
+    }
+
+    #[test]
+    fn rebinding_moves_a_key_and_takes_it_from_what_it_did() {
+        let mut l = Settings::default().on_foot;
+        let (z, x, space) = (vk("Z"), vk("X"), vk("Space"));
+        // Z walks; X does nothing yet.
+        assert_eq!(l.keys_of(Output::Walk), vec![z]);
+        assert!(l.rebind(Output::Walk, Some(z), Some(x)).is_empty());
+        assert_eq!(l.keys_of(Output::Walk), vec![x]);
+        assert!(l.outputs_of(z).is_empty(), "the old key is free again");
+        // Space is X (jump): it becomes Walk and loses that.
+        let lost = l.rebind(Output::Walk, None, Some(space));
+        assert_eq!(lost, vec![Output::Button(X)]);
+        assert_eq!(l.keys_of(Output::Walk), vec![space, x]);
+        assert!(l.keys_of(Output::Button(X)).is_empty());
+        // Only unbinding.
+        l.rebind(Output::Walk, Some(x), None);
+        assert_eq!(l.keys_of(Output::Walk), vec![space]);
+        // The same key again changes nothing.
+        let before = l.clone();
+        l.rebind(Output::Walk, Some(space), Some(space));
+        assert_eq!(l, before);
+        // A key that did two things loses only the one it is taken from.
+        let mut l = Layout::default();
+        l.bind("Q", &["A", "B"]).unwrap();
+        l.rebind(Output::Button(A), Some(vk("Q")), None);
+        assert_eq!(l.outputs_of(vk("Q")), &[Output::Button(B)]);
+    }
+
+    #[test]
+    fn every_output_has_a_name_and_a_label() {
+        let all: Vec<Output> = Output::all().collect();
+        assert_eq!(all.len(), OUTPUTS.len());
+        for o in all {
+            assert_ne!(o.name(), "?");
+            assert_ne!(o.label(), "Button", "{}", o.name());
+            assert_eq!(output(o.name()), Some(o));
+        }
+    }
+
+    #[test]
+    fn the_keymap_text_reads_back_to_the_same_settings() {
+        let defaults = Settings::default();
+        assert_eq!(
+            defaults.keymap_text().lines().filter(|l| !l.starts_with('#')).count(),
+            0,
+            "nothing differs from the defaults: no bindings written"
+        );
+        let mut s = Settings::default();
+        s.on_foot.rebind(Output::Walk, Some(vk("Z")), Some(vk("X")));
+        s.on_foot.rebind(Output::Button(A), Some(vk("LShift")), None);
+        s.on_foot.rebind(Output::Button(Y), None, Some(0xE2));
+        s.vehicle.rebind(Output::RightTrigger, Some(vk("W")), Some(WHEEL_UP));
+        s.vehicle.rebind(Output::Button(B), None, Some(vk("Mouse4")));
+        let text = s.keymap_text();
+        assert!(text.contains("[on_foot]") && text.contains("[vehicle]"));
+        assert!(text.contains("LShift=
+"), "an unbound default key is written empty: {text}");
+        assert!(text.contains("0xe2=Y"), "{text}");
+        let mut back = Settings::default();
+        assert_eq!(back.apply_keymap(&text), Vec::<String>::new());
+        assert_eq!(back, s);
+        // A second round trip is stable.
+        assert_eq!(back.keymap_text(), text);
+    }
+
+    #[test]
+    fn a_pad_dead_zone_rests_small_sticks_and_rescales_the_rest() {
+        let pad = PadState { left_x: 0.1, left_y: 0.0, right_x: 0.0, right_y: -1.0, buttons: A, left_trigger: 0.3, ..PadState::default() };
+        assert_eq!(pad.with_deadzone(0.0), pad);
+        let p = pad.with_deadzone(0.2);
+        assert_eq!((p.left_x, p.left_y), (0.0, 0.0), "inside the zone");
+        assert_eq!((p.right_x, p.right_y), (0.0, -1.0), "full stays full");
+        assert_eq!((p.buttons, p.left_trigger), (A, 0.3), "only sticks");
+        let mid = PadState { left_x: 0.6, ..PadState::default() }.with_deadzone(0.2);
+        assert!((mid.left_x - 0.5).abs() < 1e-6, "{}", mid.left_x);
+        // Diagonals keep their direction.
+        let d = PadState { right_x: 0.5, right_y: 0.5, ..PadState::default() }.with_deadzone(0.2);
+        assert!((d.right_x - d.right_y).abs() < 1e-6 && d.right_x > 0.0);
+    }
+
+    #[test]
+    fn the_pad_dead_zone_is_read_from_the_config_and_range_checked() {
+        let ok: toml::Table = toml::from_str("pad_deadzone = 0.15").unwrap();
+        assert_eq!(Settings::parse(&ok).unwrap().pad_deadzone, 0.15);
+        let bad: toml::Table = toml::from_str("pad_deadzone = 0.9").unwrap();
+        assert!(Settings::parse(&bad).unwrap_err().contains("pad_deadzone"));
+        assert_eq!(Settings::default().pad_deadzone, 0.0);
+    }
+
+    #[test]
+    fn published_settings_replace_the_start_up_ones_and_count() {
+        let before = live_version();
+        let s = Settings { sensitivity: 3.5, ..Settings::default() };
+        publish(s);
+        assert!(live_version() > before);
+        assert_eq!(current().sensitivity, 3.5);
+        // The start-up settings are untouched.
+        assert_eq!(settings().sensitivity, 1.0);
+    }
+}

@@ -66,6 +66,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Whether its code walks the ray-tracing structures, once looked at
+    /// ([`Shader::walks`]).
+    #[cfg(windows)]
+    walks: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -116,6 +120,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                walks: OnceLock::new(),
             })
         })
         .clone()
@@ -137,6 +143,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
         translated: OnceLock::new(),
+        walks: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
@@ -223,7 +230,8 @@ impl Shader {
 pub(crate) fn linked(ms: &Shader, ps: Option<&Shader>) -> Option<(Arc<Vec<u8>>, Option<Arc<Vec<u8>>>)> {
     use victory_shader::emit::{self, link};
     type Made = Option<Arc<emit::HostShader>>;
-    static MESH: Mutex<Option<HashMap<(String, Vec<link::Semantic>), Made>>> = Mutex::new(None);
+    type MeshKey = (String, Vec<link::Semantic>, Vec<(link::Semantic, u8)>);
+    static MESH: Mutex<Option<HashMap<MeshKey, Made>>> = Mutex::new(None);
     static PIXEL: Mutex<Option<HashMap<String, Made>>> = Mutex::new(None);
     let mt = &ms.translated()?.host;
     if !link::mesh_outputs_over(mt) {
@@ -237,8 +245,20 @@ pub(crate) fn linked(ms: &Shader, ps: Option<&Shader>) -> Option<(Arc<Vec<u8>>, 
         Some(pt) => link::pixel_reads(pt).ok()?,
         None => Vec::new(),
     };
+    // `VICTORY_MESH_LINK=1` (#2398): also the channels read of each input.
+    let masks = match pt {
+        Some(pt) if link::channels_on() => link::pixel_read_masks(pt).ok()?,
+        _ => Vec::new(),
+    };
     let made = |own: &emit::HostShader, s: &Shader| -> Made {
-        let r = emit::for_program(&s.hash, || link::translate_keeping(&s.container, &reads));
+        let keep = || link::translate_keeping(&s.container, &reads);
+        let r = emit::for_program(&s.hash, || {
+            if masks.is_empty() {
+                keep()
+            } else {
+                link::with_masks(&masks, keep)
+            }
+        });
         match r {
             Ok(t) if link::same_bindings(own, &t) => Some(Arc::new(t)),
             Ok(_) => {
@@ -255,7 +275,7 @@ pub(crate) fn linked(ms: &Shader, ps: Option<&Shader>) -> Option<(Arc<Vec<u8>>, 
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
-        .entry((ms.hash.clone(), reads.clone()))
+        .entry((ms.hash.clone(), reads.clone(), masks.clone()))
         .or_insert_with(|| made(mt, ms))
         .clone()?;
     let p = match (ps, pt) {
@@ -275,7 +295,14 @@ pub(crate) fn linked(ms: &Shader, ps: Option<&Shader>) -> Option<(Arc<Vec<u8>>, 
         tracing::warn!(mesh = %ms.hash, pixel, "mesh outputs the pixel shader reads pass 32 KiB");
         return None;
     }
-    tracing::info!(mesh = %ms.hash, pixel, reads = reads.len(), "mesh shader linked to its pixel shader");
+    tracing::info!(
+        mesh = %ms.hash,
+        pixel,
+        reads = reads.len(),
+        channels = !masks.is_empty(),
+        bytes = link::mesh_output_bytes(&m).unwrap_or(0),
+        "mesh shader linked to its pixel shader"
+    );
     Some((Arc::new(m.dxil.clone()), p.map(|p| Arc::new(p.dxil.clone()))))
 }
 
@@ -385,6 +412,87 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// Whether the program walks the ray-tracing structures: its code has
+    /// an `image_bvh_intersect_ray` or `image_bvh64_intersect_ray`. Looked
+    /// at once, when a dispatch first asks.
+    fn walks(&self) -> bool {
+        *self.walks.get_or_init(|| container_walks(&self.container))
+    }
+}
+
+/// Whether a console container's code tests rays against the nodes of a
+/// ray-tracing structure.
+#[cfg(windows)]
+fn container_walks(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
+}
+
+/// Whether native code has a ray-tracing node test.
+#[cfg(windows)]
+fn code_walks(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code).is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+}
+
+/// Dispatches held back by [`walk_held`] since the last frame line.
+#[cfg(windows)]
+pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a dispatch with the title's pipeline `this` is held back
+/// because its program walks ray-tracing structures nothing has built
+/// (`VICTORY_BVH_HOLD=1`; off by default).
+///
+/// The structure builder does not run (see [`Builder`]: only with
+/// `VICTORY_BVH_BUILDER=1`, and then only whole, which a host of 32-lane
+/// waves does not manage yet). The title's ray-traced passes run all the
+/// same: 64 programs of its shader pack test rays against structure nodes
+/// (ray-traced shadows, screen probes, reflections, the irradiance cache;
+/// one of them, `CS_IrradianceCache_ShadowTrace_WithFar` f607780aa8e502d0,
+/// from the first world frame on in every run). Each walks, in a loop the
+/// title bounds at 65,535 steps a wave, whatever bytes lie where the
+/// structure would be: what it returns is not a picture of the scene, and
+/// how long it runs depends on those bytes. Upstream's pull request 2311
+/// measured a card hung in exactly that dispatch on an NVIDIA card, every
+/// run, and both card losses of ours since the draw windows' own fault was
+/// fixed (runs 208 and 224) came within a second of the first use of the
+/// programs that shade those rays' hits (`CS_RaytracingResolve`).
+///
+/// With the switch such a dispatch is dropped until the builder has run
+/// whole. What the passes would have written stays as the title left it
+/// (their targets are not cleared by us): the picture has to be looked at.
+#[cfg(windows)]
+pub(crate) fn walk_held(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let p = pipeline(this);
+    if !p.shaders.iter().any(|s| s.stage == "compute" && s.walks()) {
+        return false;
+    }
+    // (Asked only for the few programs that walk: the lock is the builder's.)
+    if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
+        return false;
+    }
+    if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                shaders = ?p.shaders,
+                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not                  built them (VICTORY_BVH_HOLD=1); the first one"
+            );
+        });
+    }
+    true
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -897,8 +1005,18 @@ pub(crate) use precompiled::{Precompiled, create_precompiled};
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;
+
+/// Host pipelines created and loaded from the library since the start
+/// (`crate::framelog`).
+#[cfg(windows)]
+pub(crate) fn frame_log_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub mod prewarm;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

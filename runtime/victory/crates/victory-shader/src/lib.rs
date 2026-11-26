@@ -33,6 +33,10 @@ pub use native::{
 /// translated again and compared) instead of being thrown away.
 pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
 
+/// Every `VICTORY_*` switch this crate's source names, comma-separated
+/// (`build.rs`, after fxceless 8dd30ab): the shader cache keys on their values.
+pub const SWITCHES: &str = env!("VICTORY_SHADER_SWITCHES");
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]

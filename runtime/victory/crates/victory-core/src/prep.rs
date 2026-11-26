@@ -171,6 +171,128 @@ pub fn pages_meet((a0, a1): (usize, usize), (b0, b1): (usize, usize), page: usiz
     a0 < b1 && b0 < a1
 }
 
+/// The root arguments a list has set per root parameter besides
+/// descriptor tables (`VICTORY_STATE_DEDUP`): 32-bit constants (all their
+/// words) and root views (kind and address), for skipping a set that
+/// repeats what the list already has. Like [`TableCache`] valid only while
+/// the root signature binding stands: [`RootArgCache::root_set`] forgets
+/// everything. Compared exactly (the words themselves, not a hash).
+#[derive(Clone, Debug, Default)]
+pub struct RootArgCache {
+    /// Per parameter: 32-bit constants as last set.
+    constants: Vec<Option<Vec<u32>>>,
+    /// Per parameter: a root view's kind (0 CBV, 1 SRV, 2 UAV) and address.
+    views: Vec<Option<(u8, u64)>>,
+    /// Bumped by every [`RootArgCache::root_set`]: the generation of what
+    /// is known.
+    pub generation: u64,
+}
+
+impl RootArgCache {
+    /// A root signature was set (or may have been): nothing is known set.
+    pub fn root_set(&mut self) {
+        self.constants.iter_mut().for_each(|c| {
+            if let Some(v) = c {
+                v.clear();
+            }
+            *c = None;
+        });
+        self.views.iter_mut().for_each(|v| *v = None);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Whether a set of `values` as the 32-bit constants at `param` must be
+    /// recorded (and notes them set).
+    pub fn set_constants(&mut self, param: u32, values: &[u32]) -> bool {
+        let p = param as usize;
+        if p >= 64 {
+            return true;
+        }
+        if self.constants.len() <= p {
+            self.constants.resize_with(p + 1, || None);
+        }
+        match &mut self.constants[p] {
+            Some(v) if v.as_slice() == values => false,
+            slot => {
+                let mut v = slot.take().unwrap_or_default();
+                v.clear();
+                v.extend_from_slice(values);
+                *slot = Some(v);
+                true
+            }
+        }
+    }
+
+    /// Whether a set of a root view of `kind` at `address` at `param` must
+    /// be recorded (and notes it set).
+    pub fn set_view(&mut self, param: u32, kind: u8, address: u64) -> bool {
+        let p = param as usize;
+        if p >= 64 {
+            return true;
+        }
+        if self.views.len() <= p {
+            self.views.resize(p + 1, None);
+        }
+        if self.views[p] == Some((kind, address)) {
+            return false;
+        }
+        self.views[p] = Some((kind, address));
+        true
+    }
+}
+
+/// What [`KickMerge::offer`] says of a title submission (`VICTORY_KICK_MERGE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kick {
+    /// Held with the pending ones; nothing goes to the card yet.
+    Joined,
+    /// Held, and the pending ones (it among them) go to the card now: the
+    /// most a merged submission takes was reached.
+    JoinedFlush,
+    /// Not mergeable: the pending ones go first, then this one on its own.
+    FlushThenAlone,
+}
+
+/// The title's submissions sent ahead with no wait between them, held for
+/// one host submission (`VICTORY_KICK_MERGE`). A title that submits early
+/// whenever its command ring is half full makes many small submissions;
+/// each one costs a whole preparing (settle checks, sweep, the compare of
+/// copies in the card, a flight to land). Order is kept: only submissions
+/// of one queue, one after another, with nothing between them that orders
+/// against the card (a fence signal or wait, a present, a submission of
+/// another queue, a synchronous one, a read of the card's results) are
+/// joined; anything else flushes the pending ones first.
+#[derive(Clone, Debug, Default)]
+pub struct KickMerge {
+    /// The queue the pending submissions are of, and how many there are.
+    pub queue: usize,
+    pub pending: usize,
+    /// Lists pending.
+    pub lists: usize,
+}
+
+impl KickMerge {
+    /// A submission of `lists` lists to `queue`; `mergeable`: it runs at
+    /// once as a whole, not waited for (no memory-value waits, nothing
+    /// held on its queue). `most`: the most submissions joined in one.
+    pub fn offer(&mut self, queue: usize, lists: usize, mergeable: bool, most: usize) -> Kick {
+        if !mergeable || (self.pending > 0 && self.queue != queue) {
+            return Kick::FlushThenAlone;
+        }
+        self.queue = queue;
+        self.pending += 1;
+        self.lists += lists;
+        if self.pending >= most.max(1) { Kick::JoinedFlush } else { Kick::Joined }
+    }
+
+    /// The pending ones were sent: how many submissions that was.
+    pub fn take(&mut self) -> usize {
+        let n = self.pending;
+        (self.pending, self.lists) = (0, 0);
+        n
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +460,59 @@ mod tests {
         // Byte ranges when no page size is given.
         assert!(!pages_meet((0, 10), (10, 20), 0));
         assert!(pages_meet((0, 11), (10, 20), 0));
+    }
+
+    #[test]
+    fn root_args_repeat_only_within_a_root_signature() {
+        let mut c = RootArgCache::default();
+        assert!(c.set_constants(2, &[1, 2, 3]));
+        assert!(!c.set_constants(2, &[1, 2, 3]));
+        assert!(c.set_constants(2, &[1, 2, 4]));
+        assert!(c.set_constants(2, &[1, 2]));
+        assert!(!c.set_constants(2, &[1, 2]));
+        assert!(c.set_constants(3, &[1, 2]));
+        assert!(c.set_view(4, 1, 0x1000));
+        assert!(!c.set_view(4, 1, 0x1000));
+        assert!(c.set_view(4, 0, 0x1000));
+        assert!(c.set_view(4, 0, 0x2000));
+        let g = c.generation;
+        c.root_set();
+        assert_ne!(g, c.generation);
+        assert!(c.set_constants(2, &[1, 2]));
+        assert!(c.set_view(4, 0, 0x2000));
+        // Past 63: always recorded.
+        assert!(c.set_constants(64, &[1]));
+        assert!(c.set_constants(64, &[1]));
+        assert!(c.set_view(70, 0, 1));
+        assert!(c.set_view(70, 0, 1));
+        // Empty constants are a set too.
+        assert!(c.set_constants(5, &[]));
+        assert!(!c.set_constants(5, &[]));
+    }
+
+    #[test]
+    fn kicks_join_on_one_queue_until_the_most() {
+        let mut k = KickMerge::default();
+        assert_eq!(k.offer(1, 2, true, 3), Kick::Joined);
+        assert_eq!(k.offer(1, 1, true, 3), Kick::Joined);
+        assert_eq!(k.lists, 3);
+        assert_eq!(k.offer(1, 1, true, 3), Kick::JoinedFlush);
+        assert_eq!(k.take(), 3);
+        assert_eq!((k.pending, k.lists), (0, 0));
+        // Another queue: the pending ones first.
+        assert_eq!(k.offer(1, 1, true, 8), Kick::Joined);
+        assert_eq!(k.offer(2, 1, true, 8), Kick::FlushThenAlone);
+        assert_eq!(k.pending, 1);
+        assert_eq!(k.take(), 1);
+        // Not mergeable (waits, held, synchronous): never joined.
+        assert_eq!(k.offer(2, 1, false, 8), Kick::FlushThenAlone);
+        assert_eq!(k.pending, 0);
+        // With nothing pending another queue joins.
+        assert_eq!(k.offer(2, 1, true, 8), Kick::Joined);
+        // A most of 0 or 1 sends each at once.
+        k.take();
+        assert_eq!(k.offer(2, 1, true, 1), Kick::JoinedFlush);
+        k.take();
+        assert_eq!(k.offer(2, 1, true, 0), Kick::JoinedFlush);
     }
 }

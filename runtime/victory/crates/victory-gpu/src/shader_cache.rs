@@ -117,6 +117,11 @@ pub fn use_shader_cache(dir: PathBuf) {
     }
 }
 
+/// The default (legacy) cache keyed as fx-cand keyed it (see `legacy::key_by_first_switches`).
+pub(crate) fn key_by_first_switches() {
+    legacy::key_by_first_switches();
+}
+
 /// Shaders found in the cache and translated since the start.
 pub(crate) fn counts() -> (u64, u64) {
     if !output_key() {
@@ -200,6 +205,10 @@ fn executable() -> Option<[u8; 32]> {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
+        // The view heap is in the key: probed before the key is made, whatever looks the cache
+        // up first (as `legacy::build`).
+        #[cfg(windows)]
+        crate::descriptor::host::probe_view_limit();
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -207,7 +216,7 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        let switches = SWITCHES.map(|name| (name, std::env::var_os(name)));
+        let switches = all_switches();
         // (VICTORY_RT_MISS, VIcky #6: ray-traced passes the translator cannot follow run with
         // every ray missing; the view heap the host keeps, which clamps view indices and gives
         // the heap map bindless views are looked up in (`VICTORY_HEAP_MAP`,
@@ -223,6 +232,11 @@ fn build() -> &'static [u8; 32] {
         // (`VICTORY_F3_VIEW_FIX=1` changes how typed buffer accesses are translated)
         if victory_shader::emit::words::f3_view_fix() {
             host.extend_from_slice(b"f3 view fix");
+        }
+        // (`VICTORY_WAVE64_LDS=1` makes LDS-sharing wave64 programs for 32-lane hosts exactly;
+        // off, the key is as before)
+        if victory_shader::emit::wave64_lds() {
+            host.extend_from_slice(b"wave64 lds");
         }
         context(
             limit,
@@ -248,6 +262,23 @@ const SWITCHES: [&str; 8] = [
     // (VIcky #6: the loop limit changes the translation too)
     "VICTORY_SHADER_LOOP_LIMIT",
 ];
+
+/// [`SWITCHES`] and every other `VICTORY_*` switch the translator's source
+/// names (`victory_shader::SWITCHES`, fxceless 8dd30ab), with their values.
+fn all_switches() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+    let extra = victory_shader::SWITCHES.split(',').filter(|n| !n.is_empty() && !SWITCHES.contains(n));
+    SWITCHES.into_iter().chain(extra).map(|name| (name, std::env::var_os(name))).filter(keyed).collect()
+}
+
+/// Switches of the translator named in the key only when set: added after the caches in use
+/// were filled, so a run without them keys as the builds before them did (naming them unset
+/// changed every key, and a run with a cache translated every shader anew).
+pub(super) const KEYED_WHEN_SET: [&str; 2] = ["VICTORY_PS_HWSGPR", "VICTORY_D16_UINT"];
+
+/// Whether a switch and its value join the key ([`KEYED_WHEN_SET`]).
+pub(super) fn keyed((name, value): &(&str, Option<std::ffi::OsString>)) -> bool {
+    value.is_some() || !KEYED_WHEN_SET.contains(name)
+}
 
 /// Serialization schema version of [`encode`] / [`decode`], and of the entries around them:
 /// bump it whenever [`HostShader`]'s on-disk format changes. It is part of the key, so what
@@ -282,6 +313,21 @@ fn context(
         settings.push(("executable", exe));
     }
     stamped::context_key(CACHE_SCHEMA_VERSION, &settings)
+}
+
+/// The offline warm-up (`victory translate --warm`, fxceless 8dd30ab):
+/// `container` is translated into the cache unless it is there already.
+/// `Ok(true)`: it was translated now. Needs [`use_shader_cache`] and the
+/// same host facts the run will have. Keys as [`host_shader`] does.
+pub fn warm(container: &[u8]) -> Result<bool, String> {
+    if !output_key() {
+        return legacy::warm(container);
+    }
+    if CACHE.get().is_none() {
+        return Err("no shader cache".into());
+    }
+    let translated = COUNTS[TRANSLATED].load(Ordering::Relaxed);
+    host_shader(container).map(|_| COUNTS[TRANSLATED].load(Ordering::Relaxed) != translated)
 }
 
 /// The translation of a console shader container, from the cache when
@@ -452,6 +498,16 @@ pub(crate) fn is_cached(container: &[u8]) -> bool {
     CACHE
         .get()
         .is_some_and(|cache| has_entry(cache, build(), container))
+}
+
+/// Whether a run made the translation of `container` into the cache: [`is_cached`], or (legacy
+/// cache) at the key of a run that looked the cache up before probing the view heap. For
+/// choosing what `victory prewarm manifest` lists.
+pub(crate) fn is_cached_by_runs(container: &[u8]) -> bool {
+    if !output_key() {
+        return legacy::is_cached_by_runs(container);
+    }
+    is_cached(container)
 }
 
 /// Whether `cache` holds an entry for `container` under the settings `context`.
@@ -674,6 +730,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -742,6 +803,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -752,6 +818,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        half_views,
     })
 }
 
@@ -786,6 +853,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

@@ -16,8 +16,18 @@
 //!   its frame clock to them (on by default with pacing or latency).
 //! * `VICTORY_PACE_STATS=1`: the per-second statistics line alone (on with
 //!   any of the above), for the baseline of an A/B run.
+//! * `VICTORY_LOW_LATENCY=1`: the low-latency defaults: a waitable swap
+//!   chain with one frame queued at most, waited on at the title's frame
+//!   start (the origin wait) instead of before the copy to the back buffer,
+//!   so the title begins (and reads input) as late as possible; tearing when
+//!   no cap is set at boot (sync interval is always 0); late input sampling
+//!   and the statistics line. Each `VICTORY_PACE_*` still wins when set.
+//! * `VICTORY_FPS_CAP=N` (live): a frame-time limiter at the title's frame
+//!   start, N frames a second, high-resolution waitable timer plus a short
+//!   spin. `VICTORY_LIMITER=0` (live) turns it off with the cap kept. Both
+//!   are A/B live switches ([`crate::live`]).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::Instant;
 
@@ -33,6 +43,8 @@ pub struct Switches {
     pub input: bool,
     pub feedback: bool,
     pub stats: bool,
+    /// `VICTORY_LOW_LATENCY=1`: the swap chain wait moves to the frame start.
+    pub low_latency: bool,
 }
 
 impl Switches {
@@ -40,30 +52,156 @@ impl Switches {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Switches {
         let on = |name: &str| get(name).map(|v| v.trim() == "1");
         let pace = on("VICTORY_PACE").unwrap_or(false);
+        let low_latency = on("VICTORY_LOW_LATENCY").unwrap_or(false);
+        let capped = get("VICTORY_FPS_CAP").and_then(|v| v.trim().parse::<u32>().ok()).is_some_and(|c| c > 0);
         let fps = get("VICTORY_PACE_FPS")
             .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|f| (1..=1000).contains(f));
         let latency = get("VICTORY_PACE_LATENCY")
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(0, |n| n.min(2));
-        let tearing = on("VICTORY_PACE_TEARING").unwrap_or(false);
-        let input = on("VICTORY_PACE_INPUT").unwrap_or(pace);
+            .map_or(if low_latency { 1 } else { 0 }, |n| n.min(2));
+        let tearing = on("VICTORY_PACE_TEARING").unwrap_or(low_latency && !capped);
+        let input = on("VICTORY_PACE_INPUT").unwrap_or(pace || low_latency);
         let feedback = on("VICTORY_PACE_FEEDBACK").unwrap_or(pace || latency > 0);
         let stats = on("VICTORY_PACE_STATS").unwrap_or(false)
             || pace
             || latency > 0
             || tearing
             || input
-            || feedback;
-        Switches { pace, fps, latency, tearing, input, feedback, stats }
+            || feedback
+            || low_latency;
+        Switches { pace, fps, latency, tearing, input, feedback, stats, low_latency }
     }
 }
 
-/// The process's switches (environment, read once).
+static FILE: OnceLock<toml::Table> = OnceLock::new();
+
+/// Takes `[pace]` from the config file: `pace`, `fps`, `latency`,
+/// `tearing`, `input`, `feedback`, each the file's say for the variable of
+/// the same name (`VICTORY_PACE_FPS` for `fps`); the environment wins. Call
+/// before [`switches`] is first read; later calls change nothing.
+pub fn configure(table: Option<&toml::Table>) {
+    if let Some(t) = table {
+        let _ = FILE.set(t.clone());
+    }
+}
+
+/// The file's value for the variable `name`, written as the variable would be.
+pub fn file_value(name: &str) -> Option<String> {
+    let key = match name {
+        "VICTORY_PACE" => "pace",
+        "VICTORY_PACE_FPS" => "fps",
+        "VICTORY_PACE_LATENCY" => "latency",
+        "VICTORY_PACE_TEARING" => "tearing",
+        "VICTORY_PACE_INPUT" => "input",
+        "VICTORY_PACE_FEEDBACK" => "feedback",
+        _ => return None,
+    };
+    match FILE.get()?.get(key)? {
+        toml::Value::Boolean(b) => Some(if *b { "1" } else { "0" }.to_string()),
+        toml::Value::Integer(i) => Some(i.to_string()),
+        _ => None,
+    }
+}
+
+/// The process's switches at start (the environment over the config file).
 pub fn switches() -> &'static Switches {
     static S: OnceLock<Switches> = OnceLock::new();
-    S.get_or_init(|| Switches::from_lookup(|n| std::env::var(n).ok()))
+    S.get_or_init(|| Switches::from_lookup(|n| std::env::var(n).ok().or_else(|| file_value(n))))
 }
+
+/// What the overlay can change while the title runs: pacing on or off, its
+/// fixed rate (0: the title's interval) and the late input sample. The rest
+/// of [`Switches`] shapes the swap chain and needs a restart.
+struct Live {
+    pace: AtomicBool,
+    fps: AtomicU32,
+    input: AtomicBool,
+}
+
+fn live() -> &'static Live {
+    static L: LazyLock<Live> = LazyLock::new(|| {
+        let s = switches();
+        Live {
+            pace: AtomicBool::new(s.pace),
+            fps: AtomicU32::new(s.fps.unwrap_or(0)),
+            input: AtomicBool::new(s.input),
+        }
+    });
+    &L
+}
+
+/// Whether presents are paced now.
+pub fn live_pace() -> bool {
+    live().pace.load(Ordering::Relaxed)
+}
+
+/// The fixed base rate now (None: the title's interval).
+pub fn live_fps() -> Option<u32> {
+    Some(live().fps.load(Ordering::Relaxed)).filter(|&f| f > 0)
+}
+
+/// Whether input is sampled again when the title reads it.
+pub fn live_input() -> bool {
+    live().input.load(Ordering::Relaxed)
+}
+
+/// Sets what [`live_pace`], [`live_fps`] and [`live_input`] answer.
+pub fn set_live(pace: bool, fps: Option<u32>, input: bool) {
+    let l = live();
+    l.pace.store(pace, Ordering::Relaxed);
+    l.fps.store(fps.filter(|f| (1..=1000).contains(f)).unwrap_or(0), Ordering::Relaxed);
+    l.input.store(input, Ordering::Relaxed);
+}
+
+/// `VICTORY_FPS_CAP` (live): the limiter's rate, 0 for none.
+pub static FPS_CAP: crate::live::Switch = crate::live::Switch::new("FPS_CAP", 0);
+/// `VICTORY_LIMITER` (live, on by default): whether the cap is applied.
+pub static LIMITER: crate::live::Switch = crate::live::Switch::new("LIMITER", 1);
+
+/// The limiter's period now (None: no cap, or the limiter is off).
+pub fn limiter_period() -> Option<u64> {
+    let cap = FPS_CAP.get().min(1000) as u32;
+    (cap > 0 && LIMITER.on()).then(|| period_of_fps(cap))
+}
+
+/// A frame-time limiter: frame starts on a grid of `period`. A start that
+/// is early waits for the next grid point; a little late (under half a
+/// period) goes at once and keeps the grid; later than that (a stall, a
+/// load) starts a new grid from now, so no burst of short frames follows.
+#[derive(Clone, Debug, Default)]
+pub struct Limiter {
+    next: Option<u64>,
+    period: u64,
+}
+
+impl Limiter {
+    /// A frame wants to start at `now`; when it may (`>= now`).
+    pub fn start_at(&mut self, now: u64, period: u64) -> u64 {
+        if period != self.period {
+            self.period = period;
+            self.next = None;
+        }
+        let at = match self.next {
+            Some(t) if now <= t => t,
+            _ => now,
+        };
+        // The grid goes on from the target when on time, from now after a stall.
+        let base = match self.next {
+            Some(t) if now < t + period / 2 => t,
+            _ => at,
+        };
+        self.next = Some(base + period);
+        at
+    }
+}
+
+/// ns the title's frame starts waited, since last taken: for the swap
+/// chain (`VICTORY_LOW_LATENCY`), by the limiter, and the swap chain waits
+/// that timed out.
+pub static START_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+pub static LIMIT_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+pub static START_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -464,6 +602,42 @@ mod tests {
         assert_eq!((s.latency, s.fps), (2, Some(60)));
         let s = Switches::from_lookup(|n| (n == "VICTORY_PACE_STATS").then(|| "1".into()));
         assert!(s.stats && !s.pace && !s.input && !s.feedback);
+    }
+
+    #[test]
+    fn limiter_holds_an_even_grid_and_resyncs_after_a_stall() {
+        let mut l = Limiter::default();
+        let mut now = 0;
+        let mut starts = Vec::new();
+        for c in [5, 20, 3, 30, 10, 5].map(|c| c * MS) {
+            let at = l.start_at(now, P30);
+            starts.push(at);
+            now = at + c;
+        }
+        assert!(gaps(&starts).iter().all(|&g| g == P30), "{:?}", gaps(&starts));
+        // 5 ms late: at once, grid kept.
+        let t = *starts.last().unwrap() + P30;
+        assert_eq!(l.start_at(t + 5 * MS, P30), t + 5 * MS);
+        assert_eq!(l.start_at(t + 6 * MS, P30), t + P30);
+        // A stall: a new grid from now, then a full period.
+        let s = t + 500 * MS;
+        assert_eq!(l.start_at(s, P30), s);
+        assert_eq!(l.start_at(s + MS, P30), s + P30);
+    }
+
+    #[test]
+    fn low_latency_defaults() {
+        let s = Switches::from_lookup(|n| (n == "VICTORY_LOW_LATENCY").then(|| "1".into()));
+        assert!(s.low_latency && s.tearing && s.input && s.stats && s.feedback);
+        assert_eq!(s.latency, 1);
+        let s = Switches::from_lookup(|n| match n {
+            "VICTORY_LOW_LATENCY" => Some("1".into()),
+            "VICTORY_FPS_CAP" => Some("30".into()),
+            "VICTORY_PACE_LATENCY" => Some("2".into()),
+            _ => None,
+        });
+        assert!(!s.tearing);
+        assert_eq!(s.latency, 2);
     }
 
     #[test]

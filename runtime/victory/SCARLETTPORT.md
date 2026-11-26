@@ -20,21 +20,23 @@ This tree is the VIctory-based runtime used by ScarlettPort, vendored as plain s
    - Not taken: upstream #1529 and 6d021fe, pipeline pre-build commits c47b529 / 9c58a1c / 819f622, #175, #186 (conflicting designs).
 7. **ScarlettPort changes** on top: Windows 10 Agility SDK opt-in, automatic input (`VICTORY_AUTO_INPUT`), a live press file with stick tokens, capture-every and frame dumps, fast boot (`VICTORY_FAST_BOOT`, testing only) and save slots (`VICTORY_SAVE_SLOT`), `SCARLETT_*` aliases for every `VICTORY_*` switch, a host descriptor-words table (descriptors read as numbers), exposure, ambient and shadow-mask stand-ins (off by default), `VICTORY_SHADER_OPT` and the relay left off by default, a `VICTORY_RAYTRACING=off` answer, and test switches (`VICTORY_TEST_NO_GPU`). Since the earlier snapshot: keyboard and mouse played like a PC game (`VICTORY_KBM`, `docs/input.md`), a splash inside the title's window, pipelined DirectStorage reads, precompiled graphics and compute pipelines (`VICTORY_PRECOMPILED_PSO`), linked mesh/pixel pairs, a geometry-stage path for merged ES-GS programs, ReBAR host copies (`VICTORY_REBAR`), and the opt-in speed switches for indirect clamps, barriers, synchronisation and memory copies (`VICTORY_INDIRECT_*`, `VICTORY_BARRIER_*`, `VICTORY_SYNC_PRECISE`, `VICTORY_KNOWN_WRITES`, `VICTORY_FAST_HASH`, `VICTORY_COPY_BACK_ONLY_READBACK`, ...; see `docs/RUNTIMES.md`). The ray-tracing node test (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) is emulated as inline DXIL in `crates/victory-shader/src/emit/intersect.rs`.
 
-Authors whose commits are in the range `4e17478..fx-cand` (kept in the history of our working repository, not in this snapshot): Xeltax, fever308, iurysf, fxceless, UNYTIX, sedzz, ruvenesh, marquezini, gdawid94, Matheus, Looper_Salty, Last Thylacine, Christian Blomert, Bennet0k, Adrito, myokex, sagouindupm, uiliannn, lukka, DoubleD17, AscilCH, AlanQiang0418, God489, iNaxxs, Rivaldo Freitas de Carvalho, Ziggy.
+Authors whose commits are in the range `4e17478..fx-cand4` (kept in the history of our working repository, not in this snapshot): Xeltax, fever308, iurysf, fxceless, UNYTIX, sedzz, ruvenesh, marquezini, gdawid94, Matheus, Looper_Salty, Last Thylacine, Christian Blomert, Bennet0k, Adrito, myokex, sagouindupm, uiliannn, lukka, DoubleD17, AscilCH, AlanQiang0418, God489, iNaxxs, Rivaldo Freitas de Carvalho, Ziggy.
 
 Also credited: XCL by ivall and contributors (https://github.com/ivall/xcl, GPL-2.0-only), used as a reference for how a title behaves under another layer.
 
 ## This snapshot
 
-- Source: branch `fx-cand` at `bce072d` of our fork's working repository: `fx-final` at `3b720c9` (the rectangle-list topology decode fix that removes the tile grid, `fx-wipe`, on top of `26f8afd`) plus the read-wait branches below. Every new switch is off by default in the runtime; `scripts/play-victory.ps1` and the launcher turn on the verified ones (see `docs/RUNTIMES.md`).
-- Merged since the previous snapshot (`fx-final` at `26f8afd`, which this repository took in 56e088e), by branch:
-  - rectangle-list pipelines decoded right (`fx-wipe`, in `fx-final` 3b720c9): the tile grid over gameplay is gone
-  - read-back fix (`VICTORY_READFIX`) and copy-back only for read-back buffers (`VICTORY_COPY_BACK_ONLY_READBACK`, `fx-rbonly`)
-  - narrow root signatures, views and BVH (`VICTORY_NARROW_ROOT`, `_VIEWS`, `_BVH`)
-  - prepared barriers, tables and list reuse (`VICTORY_PREP_BARRIERS`, `_TABLES`, `_REUSE`)
-  - f3 full view translation (`fx-f3full`, default off) and the cache key naming it
-  - the shader cache keeps fx-final's keys by default (`fx-cachekey`)
-- Merged in the previous snapshot (`fx-final` at `26f8afd`; before it `fx-harvest` at `38e8e7c`, which this repository took in 48ba23a), by branch:
+- Source: branch `fx-cand4` at `efcc7b9` of our fork's working repository. Every new switch is off by default in the runtime; `scripts/play-victory.ps1` and the launcher turn on the verified ones (see `docs/RUNTIMES.md`).
+- Merged since the previous snapshot (`fx-cand` at `bce072d`, which this repository took in a934da5):
+  - lazy remaps of title memory (`VICTORY_REMAP_LAZY`, `fx-remap3`) and sub-page refreshes (`VICTORY_MEM_SUBPAGE`): the yard stutter fix
+  - copies without the extra memory query (`VICTORY_COPY_NOQUERY`); copies cut from 286 to 84 MB per frame with the Stable settings
+  - fast boot fixed (`VICTORY_FAST_BOOT`, still optional)
+  - in-session A/B: live switches and `VICTORY_AB` windows
+  - shader prewarm (`fx-prewarm`), wave64 and mesh-link work, skin shaders (`fx-pedtex`), view-heap sizing (`fx-vram`), preparing cuts (`fx-prep3`), save fix (`fx-savefix`)
+  - upscaler and pacing work (`fx-upscale`, `fx-play2`, `VICTORY_LOW_LATENCY`, `VICTORY_FPS_CAP`), GPU and preparing profilers, a zero-copy test switch; all off by default
+  - the runtime now reads the launcher's `[display]`, `[game]`, `[pace]` and `[upscale]` sections itself (the acceptance test from #14 is kept)
+- Authors new in `bce072d..efcc7b9`: CRT, Chipsrain, Demon12388, Filip722, KaiserBloo, Lilith133T, Pilote Production, SpaghettiMaster545, alessiodeia, andrewpozdnakov7-jpg, avt0m4t48, beloooo, denkencar-sketch, desp, fxceless, gomeaw, larelgit, mgunes1311-lab, naixue2233, powplusplus, sagouindupm, traidy2222, yaajme, Ziggy.
+- Merged two snapshots ago (`fx-final` at `26f8afd`; before it `fx-harvest` at `38e8e7c`, which this repository took in 48ba23a), by branch:
   - boot fixes
   - saves fix (`fx-saves`, `fx-saves-h2`)
   - splash and account picker (`fx-splash`)

@@ -37,6 +37,57 @@ impl Semantic {
 
 thread_local! {
     static KEEP: RefCell<Option<Vec<Semantic>>> = const { RefCell::new(None) };
+    static MASKS: RefCell<Option<Vec<(Semantic, u8)>>> = const { RefCell::new(None) };
+}
+
+/// Experiment (`VICTORY_MESH_LINK=1`, off by default; Marvisak/VIctory
+/// #2398): a linked pair also leaves out the leading and trailing channels
+/// of a kept element the pixel shader does not read, so a mesh shader still
+/// past 32 KiB with whole elements kept can fit.
+pub fn channels_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MESH_LINK").is_ok_and(|v| v == "1"))
+}
+
+/// The channels (absolute mask) of each kept element a translation on this
+/// thread keeps, if limited by channel ([`with_masks`]).
+pub(super) fn kept_masks() -> Option<Vec<(Semantic, u8)>> {
+    MASKS.with(|k| k.borrow().clone())
+}
+
+/// `f` with [`kept_masks`] answering `masks` on this thread.
+pub fn with_masks<T>(masks: &[(Semantic, u8)], f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Vec<(Semantic, u8)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MASKS.with(|k| *k.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(MASKS.with(|k| k.borrow_mut().replace(masks.to_vec())));
+    f()
+}
+
+/// Kept arbitrary 32-bit elements cut to the channels `masks` reads
+/// (leading and trailing unread channels left out, as #2398 does); an
+/// element with nothing read, a 16-bit one or a system value stays whole.
+pub(super) fn trim_channels(elements: &mut [super::container::SigElement], masks: &[(Semantic, u8)]) {
+    for e in elements.iter_mut() {
+        if e.kind != 0 || e.half || e.row.is_none() || e.cols == 0 {
+            continue;
+        }
+        let used = masks
+            .iter()
+            .filter(|(s, _)| s.names(&e.name, e.index))
+            .fold(0u8, |a, (_, m)| a | m);
+        let rel = (used >> e.col) & ((1u8 << e.cols) - 1);
+        if rel == 0 {
+            continue;
+        }
+        let first = rel.trailing_zeros() as u8;
+        let last = 7 - rel.leading_zeros() as u8;
+        e.col += first;
+        e.cols = last - first + 1;
+    }
 }
 
 /// The arbitrary elements a translation on this thread keeps, if limited
@@ -106,6 +157,27 @@ pub fn pixel_reads(ps: &HostShader) -> Result<Vec<Semantic>, ShaderError> {
     reads.sort();
     reads.dedup();
     Ok(reads)
+}
+
+/// The arbitrary inputs a translated pixel shader reads with the channels
+/// (absolute mask) read of each, sorted.
+pub fn pixel_read_masks(ps: &HostShader) -> Result<Vec<(Semantic, u8)>, ShaderError> {
+    let c = Container::parse(&ps.dxil)?;
+    let Some(part) = c.part(FourCC::ISG1) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<(Semantic, u8)> = Vec::new();
+    for (s, sv, _, rw) in rows(part.data)? {
+        if sv != 0 || rw == 0 {
+            continue;
+        }
+        match out.iter_mut().find(|(t, _)| *t == s) {
+            Some((_, m)) => *m |= rw,
+            None => out.push((s, rw)),
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// A translated mesh shader's outputs in bytes as the validator measures
@@ -178,6 +250,7 @@ pub fn same_bindings(a: &HostShader, b: &HostShader) -> bool {
         && a.root_srvs == b.root_srvs
         && a.root_uavs == b.root_uavs
         && a.root_indexed_views == b.root_indexed_views
+        && a.half_views == b.half_views
 }
 
 #[cfg(test)]
@@ -211,6 +284,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         }
     }
 
@@ -261,5 +335,25 @@ mod tests {
         assert_eq!(mesh_output_bytes(&mesh(66)).unwrap(), 66 * 128 * 4);
         assert!(mesh_outputs_over(&mesh(66)));
         assert!(!mesh_outputs_over(&mesh(64)));
+    }
+
+    #[test]
+    fn channels_trimmed_to_the_reads() {
+        let mut els = vec![
+            element("SV_Position", 0, 3, 0, 4, 0xF),
+            element("TEXCOORD", 0, 0, 1, 4, 0xF),
+            element("TEXCOORD", 15, 0, 2, 4, 0xF),
+            element("TEXCOORD", 3, 0, 3, 4, 0xF),
+        ];
+        let masks = [
+            (Semantic::new("texcoord", 0), 0b0011),
+            (Semantic::new("TEXCOORD", 15), 0b1100),
+        ];
+        trim_channels(&mut els, &masks);
+        let cut: Vec<(u8, u8)> = els.iter().map(|e| (e.col, e.cols)).collect();
+        // system value whole; xy; zw; nothing read stays whole
+        assert_eq!(cut, [(0, 4), (0, 2), (2, 2), (0, 4)]);
+        let bytes = container::mesh_output_bytes(&els[..3], &[], 128, 128);
+        assert_eq!(bytes, 4 * 8 * 128);
     }
 }

@@ -57,6 +57,27 @@ fn main() {
         "cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={}",
         hasher.finalize().to_hex()
     );
+    // Every `VICTORY_*` switch the translator's source names (fxceless
+    // 8dd30ab): their values join the shader cache key at run time.
+    let mut all = Vec::new();
+    collect_rs(&src_dir, &src_dir, &mut all);
+    let mut switches = std::collections::BTreeSet::new();
+    for (_, full) in all {
+        let text = std::fs::read_to_string(&full).unwrap_or_default();
+        let mut rest = &text[..];
+        while let Some(at) = rest.find("\"VICTORY_") {
+            let tail = &rest[at + 1..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                .unwrap_or(tail.len());
+            if tail[end..].starts_with('"') {
+                switches.insert(tail[..end].to_string());
+            }
+            rest = &tail[end..];
+        }
+    }
+    let joined: Vec<_> = switches.into_iter().collect();
+    println!("cargo:rustc-env=VICTORY_SHADER_SWITCHES={}", joined.join(","));
     let mut out = String::from("pub(crate) const FILES: &[(&str, &str)] = &[
 ");
     for (rel, digest) in &file_digests {

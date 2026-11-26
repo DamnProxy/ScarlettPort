@@ -66,13 +66,41 @@ impl Module {
 /// for void). Integers are kept masked to their width, floats as f32 bits.
 /// Panics on an instruction it does not know or after `steps` blocks.
 pub(crate) fn run(m: &Module, call: &mut dyn FnMut(&str, &[Vec<u64>]) -> Vec<u64>) {
+    run_observed(m, call, &mut |_, _| {});
+}
+
+/// [`run`], with `seen` told each instruction's value as it is made.
+pub(crate) fn run_observed(
+    m: &Module,
+    call: &mut dyn FnMut(&str, &[Vec<u64>]) -> Vec<u64>,
+    seen: &mut dyn FnMut(u32, &[u64]),
+) {
     let mut vals: Vec<Option<Vec<u64>>> = vec![None; m.insts.len()];
+    // Shared and private memory, by pointer (a pointer is [PTR, global, index...]); a place
+    // never stored reads a number made from the pointer.
+    let mut memory: std::collections::HashMap<Vec<u64>, u64> = std::collections::HashMap::new();
+    const PTR: u64 = 0x5054_5200_0000_0000;
     let eval = |vals: &[Option<Vec<u64>>], v: V| -> Vec<u64> {
         match v {
             V::Inst(i) => vals[i as usize].clone().expect("a value defined before its use"),
             V::Const(c) => m.const_value(c),
-            _ => panic!("a global or function as a value"),
+            V::Global(g) => vec![PTR, u64::from(g)],
+            _ => panic!("a function as a value"),
         }
+    };
+    let read = |memory: &std::collections::HashMap<Vec<u64>, u64>, p: &Vec<u64>| -> u64 {
+        if let Some(&x) = memory.get(p) {
+            return x;
+        }
+        // A constant table: its initialiser's element.
+        if p.len() >= 2
+            && let Some(init) = m.globals.get(p[1] as usize).and_then(|g| g.init)
+        {
+            let flat = m.const_value(init);
+            let at = p.get(3).copied().unwrap_or(0) as usize;
+            return flat.get(at).copied().unwrap_or(0);
+        }
+        p.iter().fold(0xCBF2_9CE4_8422_2325u64, |h, &x| (h ^ x).wrapping_mul(0x100_0000_01B3)) & 0xFFFF_FFFF
     };
     let one = |vals: &[Option<Vec<u64>>], v: V| eval(vals, v)[0];
     let (mut b, mut from) = (0usize, usize::MAX);
@@ -192,10 +220,55 @@ pub(crate) fn run(m: &Module, call: &mut dyn FnMut(&str, &[Vec<u64>]) -> Vec<u64
                     let a: Vec<Vec<u64>> = args.iter().map(|&v| eval(&vals, v)).collect();
                     let name = m.funcs[*f as usize].name.as_str();
                     let name = name.strip_prefix("dx.op.").unwrap_or(name);
-                    call(name, &a)
+                    let mut r = call(name, &a);
+                    // An answer longer than the result (a test's made-up numbers): its scalars.
+                    r.truncate(m.width(inst.ty));
+                    r
+                }
+                Op::Gep(_, p, idx) => {
+                    let mut ptr = eval(&vals, *p);
+                    assert_eq!(ptr[0], PTR, "a pointer");
+                    if ptr.len() > 2 {
+                        // From an element: its first index adds to the last one.
+                        let first = one(&vals, idx[0]);
+                        let last = ptr.len() - 1;
+                        ptr[last] = ptr[last].wrapping_add(first) & 0xFFFF_FFFF;
+                        ptr.extend(idx[1..].iter().map(|&v| one(&vals, v)));
+                    } else {
+                        ptr.extend(idx.iter().map(|&v| one(&vals, v)));
+                    }
+                    ptr
+                }
+                Op::Load(p) => {
+                    let p = eval(&vals, *p);
+                    vec![read(&memory, &p)]
+                }
+                Op::Store(p, v) => {
+                    let p = eval(&vals, *p);
+                    let v = one(&vals, *v);
+                    memory.insert(p, v);
+                    vec![]
+                }
+                Op::AtomicRmw(op, p, v) => {
+                    let p = eval(&vals, *p);
+                    let v = one(&vals, *v);
+                    let old = read(&memory, &p);
+                    let new = (old.wrapping_mul(31) ^ v.wrapping_add(*op as u64)) & 0xFFFF_FFFF;
+                    memory.insert(p, new);
+                    vec![old]
+                }
+                Op::CmpXchg(p, e, n) => {
+                    let p = eval(&vals, *p);
+                    let (e, n) = (one(&vals, *e), one(&vals, *n));
+                    let old = read(&memory, &p);
+                    if old == e {
+                        memory.insert(p, n);
+                    }
+                    vec![old, u64::from(old == e)]
                 }
                 op => panic!("an instruction the interpreter does not run: {op:?}"),
             };
+            seen(i, &r);
             vals[i as usize] = Some(r);
         }
         from = b;
@@ -212,4 +285,42 @@ pub(crate) fn run(m: &Module, call: &mut dyn FnMut(&str, &[Vec<u64>]) -> Vec<u64
         };
     }
     panic!("no end after 100,000 blocks");
+}
+
+impl Module {
+    /// Instruction `i` and what it is made of, `depth` deep (tests only).
+    pub(crate) fn describe_around(&self, i: u32, depth: u32) -> String {
+        let mut out = String::new();
+        let mut seen = std::collections::HashSet::new();
+        self.describe_into(V::Inst(i), depth, 0, &mut out, &mut seen);
+        out
+    }
+
+    fn describe_into(&self, v: V, depth: u32, indent: usize, out: &mut String, seen: &mut std::collections::HashSet<u32>) {
+        use std::fmt::Write as _;
+        let pad = "  ".repeat(indent);
+        match v {
+            V::Const(c) => {
+                let _ = writeln!(out, "{pad}k{c} = {:?} : {:?}", self.consts[c as usize].1, self.types[self.consts[c as usize].0.0 as usize]);
+            }
+            V::Inst(i) => {
+                let inst = &self.insts[i as usize];
+                let op = match &inst.op {
+                    Op::Call(f, a) => format!("call {} {a:?}", self.funcs[*f as usize].name),
+                    op => format!("{op:?}"),
+                };
+                let _ = writeln!(out, "{pad}%{i} = {op} : {:?}", self.types[inst.ty.0 as usize]);
+                if depth == 0 || !seen.insert(i) {
+                    return;
+                }
+                if matches!(inst.op, Op::Phi(_)) {
+                    return;
+                }
+                super::for_each_operand(&inst.op, |w| self.describe_into(w, depth - 1, indent + 1, out, seen));
+            }
+            other => {
+                let _ = writeln!(out, "{pad}{other:?}");
+            }
+        }
+    }
 }

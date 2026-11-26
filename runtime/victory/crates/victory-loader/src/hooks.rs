@@ -160,8 +160,17 @@ fn parse_scale(text: &str) -> Option<f32> {
 /// # Safety
 /// As `disarm_watchdog`.
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
-    let scale = std::env::var(RENDER_SCALE_ENV).ok();
-    let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
+    // `VICTORY_RENDER_SCALE` wins; else a quality mode other than the
+    // title's own 2/3 ("quality") asks for its scale.
+    let scale = std::env::var(RENDER_SCALE_ENV).ok().or_else(|| {
+        let q = victory_core::upscale::switches().quality;
+        (q != victory_core::upscale::Quality::Quality).then(|| q.render_scale().to_string())
+    });
+    // `VICTORY_UPSCALER=title` (or the older `VICTORY_OWN_UPSCALER=1`)
+    // forces the title's own upscaler; any other choice keeps the title on
+    // its FidelityFX path, whose dispatch hands us colour, depth, motion
+    // and jitter (`victory_core::upscale`).
+    let own = victory_core::upscale::switches().upscaler.wants_own_upscaler();
     if scale.is_none() && !own {
         return 0;
     }

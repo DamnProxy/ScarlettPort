@@ -143,6 +143,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
+    let kept = name.clone();
     static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if victory_core::logging::sample(&OPENED) {
         tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
@@ -156,6 +157,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         overlapped: OnceLock::new(),
     };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), file);
+    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
 
@@ -465,8 +467,62 @@ impl Scheduler {
     }
 }
 
+/// The walls trace (`VICTORY_WALLS_TRACE`): 0 or unset: off; 1: a line for
+/// every read request that fails, with its file; 2: for every request (the
+/// list of a launch's reads, by file and offset, is what a launch with the
+/// first room's walls and one without are compared by).
+fn walls_trace() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_WALLS_TRACE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0)
+    })
+}
+
+/// The files opened, by the address of our file object, with their paths
+/// (for the walls trace: a request names its file by that address).
+static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+/// The walls trace's line for a request that is done.
+fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
+    let level = walls_trace();
+    if level == 0 || (level == 1 && result.is_ok()) {
+        return;
+    }
+    let file = if request.options & MEMORY_SOURCE != 0 {
+        "memory".to_string()
+    } else {
+        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let source = request.source as usize;
+        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+    };
+    let hr = match result {
+        Ok(()) => 0,
+        Err(hr) => *hr as u32,
+    };
+    tracing::info!(
+        file,
+        offset = request.offset,
+        source_size = request.source_size,
+        destination_size = request.destination_size,
+        to_pages = request.options & PAGE_DESTINATION != 0,
+        options = format_args!("{:#x}", request.options),
+        ms = started.elapsed().as_millis() as u64,
+        ok = result.is_ok(),
+        hr = format_args!("{hr:#010x}"),
+        "walls trace: a read request is done"
+    );
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    // `VICTORY_DISK_CORES=slow` (off by default; fx 0b0074e): the workers
+    // leave the fast cores to the title's threads.
+    {
+        static SLOW: OnceLock<bool> = OnceLock::new();
+        if *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow")) {
+            victory_gpu::cores::keep_on_slow_cores("dstorage worker");
+        }
+    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -476,6 +532,7 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request, None);
+        walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -493,6 +550,13 @@ impl Lanes {
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
         *busy += started.elapsed();
+        #[cfg(windows)]
+        {
+            use victory_gpu::framelog::{T, add};
+            add(T::DiskReads, 1);
+            add(T::DiskBytes, u64::from(job.request.destination_size));
+            add(T::DiskUs, started.elapsed().as_micros() as u64);
+        }
         if job.request.options & BCPACK != 0 {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
@@ -640,15 +704,22 @@ impl Lane {
 }
 
 /// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// the source and the destination. A memory source is borrowed, but
+/// combined zlib and BCPack decoding allocates an intermediate buffer.
 fn staging_bytes(request: &Request) -> u64 {
     let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
+    let source = if buffered && request.options & MEMORY_SOURCE == 0 {
         u64::from(request.source_size)
     } else {
         0
-    }
+    };
+    let intermediate = if request.options & ZLIB != 0 && request.options & BCPACK != 0 {
+        u64::from(request.intermediate_size)
+    } else {
+        0
+    };
+    // The input stays alive while zlib writes to the intermediate.
+    source + intermediate
 }
 
 /// The staging limit for a title's request: ours (`VICTORY_DS_STAGING_MB`,
@@ -700,7 +771,7 @@ struct Request {
     source: *const c_void,
     offset: u64,
     source_size: u32,
-    /// Compressed size between two decompression stages; unused here.
+    /// Buffer size for the BCPack stream produced by zlib.
     intermediate_size: u32,
     /// Matched by cancellation; the title leaves it 0.
     tag: u64,
@@ -850,10 +921,25 @@ fn execute(request: &Request, prefetched: Option<&[u8]>) -> Result<(), HRESULT> 
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
+        // A file read into a title address is the kernel's write, and the
+        // kernel does not fault into the GPU side's guard: a block guarded
+        // again between `kernel_will_write` and the read (the guard over all
+        // the views of a page protects other views from other threads) made
+        // the read fail with ERROR_INVALID_USER_BUFFER, and the title stops
+        // at the failed request (runs amd-C and amd-C2, seconds after the
+        // world's first frame). It is read beside and copied in: our copy
+        // faults into the guard like the title's own writes.
+        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
         return into_destination(request, size, |out| {
-            read_into(request, out, prefetched).map(|()| size)
+            if !bounce {
+                return read_into(request, out, prefetched).map(|()| size);
+            }
+            let mut data = vec![0; size];
+            read_into(request, &mut data, prefetched)?;
+            out.copy_from_slice(&data);
+            Ok(size)
         })
-            .map_err(|hr| fail(hr, "copying"));
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request, prefetched).map_err(|hr| fail(hr, "reading the source"))?;
@@ -995,24 +1081,59 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
+        // Pages lazily mapped (`VICTORY_REMAP_LAZY`, or translated by
+        // `VICTORY_MEM2_GPU_ONLY_NOVIEW`): filled beside and written
+        // through the table, not made views for the fill (a later remap
+        // retired and unmapped each one; run RL-B's world-entry burst, and
+        // a fill racing that unmap wrote reserved memory in RL-C).
+        let at = request.destination as usize;
+        if victory_gpu::title_memory_in_table(at, len) {
+            let mut data = vec![0; len];
+            let filled = fill(&mut data);
+            if let Ok(n) = filled {
+                victory_gpu::title_memory_write_through(at, &data[..n.min(len)]);
+            }
+            victory_gpu::title_memory_written(at, len, false);
+            return filled.map(drop);
+        }
+        // Opens the guarded blocks and tells the GPU side a placed texture
+        // there changes. `fill` writes from user mode (a file read is read
+        // beside first, see `execute`), so a block guarded again meanwhile
+        // faults into the guard instead of failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let filled = fill(out).map(drop);
+        // Said again now that the bytes are there (upstream's c75fdba holds
+        // the blocks open over the read and marks them once more at its
+        // end): a copy or a texture pass that took the memory while the
+        // read was under way took what was there before. Counted; acted on
+        // only with `VICTORY_PAGE_WRITES=all`.
+        victory_gpu::title_memory_written(request.destination as usize, len, false);
+        return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let filled = fill(window.bytes()).map(drop);
+        drop(window);
+        // The title maps pages where the card reads them and has them
+        // filled afterwards: the GPU side's copies of those addresses
+        // learn of the bytes only from this (upstream c75fdba, fork PR
+        // #571). After a decode that failed part way too: what it wrote
+        // is there.
+        super::xmem::pages_written(pages, offset, len);
+        return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
+        // As above, after the write that succeeded (fxceless 8dd30ab; ours
+        // `physical_written` ran inside `write_physical`).
+        super::xmem::pages_written(pages, offset, n);
         Ok(())
     } else {
         // Said aloud: the title never reads a request's result
@@ -1492,6 +1613,40 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    fn check_combined_decode_staging(source_options: u64, expected_staging: u64) {
+        let mut l = lanes(100);
+        let mut lane = Lane::new(0, 64);
+        let mut request = request(
+            source_options | ZLIB | 4 << 1,
+            std::ptr::null_mut(),
+            64,
+            std::ptr::null(),
+            0,
+            20,
+        );
+        request.intermediate_size = 60;
+        lane.unsubmitted
+            .extend([Command::Read(request), Command::Read(request)]);
+        l.lanes.insert(0, lane);
+        l.submit(0);
+
+        let first = l.start().unwrap();
+        assert!(l.start().is_none(), "the intermediate exceeds remaining space");
+        assert_eq!(first.staging, expected_staging);
+        l.finish(&first, Ok(()));
+        assert_eq!(l.start().unwrap().staging, expected_staging);
+    }
+
+    #[test]
+    fn staging_bounds_combined_memory_decode() {
+        check_combined_decode_staging(MEMORY_SOURCE, 60);
+    }
+
+    #[test]
+    fn staging_bounds_combined_file_decode() {
+        check_combined_decode_staging(0, 80);
     }
 
     #[test]

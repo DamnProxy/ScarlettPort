@@ -101,6 +101,8 @@ pub const USER_GROUP_BASE: u32 = 0x104;
 pub(crate) mod flags {
     /// Any double-precision value (`SFI0` Doubles).
     pub const DOUBLES: u64 = 1 << 2;
+    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     /// Double division, fused multiply-add or integer conversions (`SFI0` 11.1 double
     /// extensions).
     pub const DOUBLE_EXT: u64 = 1 << 6;
@@ -114,6 +116,7 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    pub const ROVS: u64 = 1 << 18;
 }
 
 pub(crate) struct Types {
@@ -150,6 +153,15 @@ pub(crate) struct Geometry {
 /// larger) hung its GPU on reads past the end (GPU-based validation: "descriptor heap index
 /// out of bounds"), which AMD's driver forgives.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// A test's user-data dwords for [`super::bitcode::Module::eval`]: each set is run on
+    /// the CPU over the finished module (after the clean-up passes) ...
+    pub(crate) static TEST_EVAL_IN: std::cell::RefCell<Vec<Vec<u32>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// ... and what each run stored.
+    pub(crate) static TEST_EVAL_OUT: std::cell::RefCell<Vec<Option<Vec<(u32, u32)>>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
@@ -226,6 +238,9 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// Every UAV the shader opens is rasterizer ordered ([`Self::annotate`]):
+    /// a POPS pixel program under `VICTORY_PS_HWSGPR=1`.
+    pub rov: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -283,6 +298,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
+            rov: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -450,7 +466,15 @@ impl Shader {
         self.annotate(block, h, 14 | cmp, 0)
     }
 
+    /// Bit 12 of `props0` is "UAV"; with [`Self::rov`] a UAV also gets bit 13,
+    /// rasterizer ordered.
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        let props0 = if self.rov && props0 & 0x1000 != 0 {
+            self.flags |= flags::ROVS;
+            props0 | 0x2000
+        } else {
+            props0
+        };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -475,8 +499,15 @@ impl Shader {
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         let limit = view_heap_limit();
+        // a constant index already within the bound needs no clamp (`opt::CLAMPS`)
+        let within = |m: &super::bitcode::Module, bound: u32| {
+            super::shader_opt() & super::bitcode::opt::CLAMPS != 0
+                && m.int_value(index).is_some_and(|k| (k as u32) <= bound)
+        };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
-        let index = if !sampler && limit != 0 {
+        let index = if !sampler && limit != 0 && within(&self.m, limit) || sampler && within(&self.m, 2047) {
+            index
+        } else if !sampler && limit != 0 {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
@@ -529,6 +560,7 @@ impl Shader {
             let used = self.m.usage();
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
+                (flags::ROVS, used.rov),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
@@ -538,6 +570,14 @@ impl Shader {
                 if !used {
                     self.flags &= !flag;
                 }
+            }
+        }
+        #[cfg(test)]
+        {
+            let ins = TEST_EVAL_IN.with(|c| c.borrow().clone());
+            if !ins.is_empty() {
+                let outs = ins.iter().map(|i| self.m.eval(i)).collect();
+                TEST_EVAL_OUT.with(|c| *c.borrow_mut() = outs);
             }
         }
         let mut resources = None;
@@ -648,6 +688,12 @@ impl Shader {
                     // Id, variable, name, space, lower bound, range size,
                     // shape (11: raw buffer), globally coherent, counter,
                     // rasterizer ordered, no extra properties.
+                    let ordered = if self.rov {
+                        let yes = self.m.bool(true);
+                        self.m.md_value(yes)
+                    } else {
+                        no
+                    };
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -658,7 +704,7 @@ impl Shader {
                         Some(i32c(&mut self, 11)),
                         Some(no),
                         Some(no),
-                        Some(no),
+                        Some(ordered),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
@@ -864,6 +910,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;

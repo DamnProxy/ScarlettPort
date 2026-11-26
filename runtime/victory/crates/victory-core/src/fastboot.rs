@@ -10,8 +10,11 @@
 //! prompt (`VICTORY_FAST_BOOT_MAX_FRAMES` still sets one). After the world
 //! is detected, with `VICTORY_SKIP_CUTSCENES=1`, A is still pressed for
 //! [`SKIP_SECONDS`] so the intro cutscene's prompt skips it.
-//! Only our own frame-pacing sleep and our synthetic keys depend on this;
-//! the title's clocks are never touched.
+//! Only our synthetic keys depend on this by default; the title's clocks
+//! are never touched. Skipping our own frame-pacing sleep (the frame clock's
+//! waits and the present hold) is its own switch,
+//! `VICTORY_FAST_BOOT_UNTHROTTLE=1`: with it every 3060 run hung the card
+//! (TDR, 0x887A0004) 30-50 s in, on the logo/legal screens, so it is off.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -57,12 +60,25 @@ pub fn active() -> bool {
     enabled() && !IN_WORLD.load(Ordering::Relaxed)
 }
 
+/// Fast boot is active and `VICTORY_FAST_BOOT_UNTHROTTLE=1`: our own
+/// pacing sleeps are skipped (off by default: it hung the card at boot).
+pub fn unthrottled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    active() && *ON.get_or_init(|| truthy(crate::env::env("VICTORY_FAST_BOOT_UNTHROTTLE")))
+}
+
 /// The world was detected less than [`SKIP_SECONDS`] ago: A is still
 /// pressed so the intro cutscene's skip prompt takes it.
 pub fn skipping() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| truthy(crate::env::env("VICTORY_SKIP_CUTSCENES")))
         && WORLD_AT.get().is_some_and(|t| t.elapsed().as_secs() < SKIP_SECONDS)
+}
+
+/// The detector saw the world (or gave up waiting: time or frame limit).
+/// Without fast boot this is always false.
+pub fn in_world() -> bool {
+    IN_WORLD.load(Ordering::Relaxed)
 }
 
 /// Presented frames seen so far (while fast boot is on).

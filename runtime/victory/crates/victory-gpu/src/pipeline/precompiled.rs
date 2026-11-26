@@ -462,6 +462,8 @@ pub struct PrecompileReport {
     pub made: usize,
     pub failed: usize,
     pub left_out: usize,
+    /// Records not made because their key was not asked for (`victory prewarm`).
+    pub not_listed: usize,
 }
 
 /// Offline: makes the host pipeline of every graphics record of the
@@ -484,10 +486,38 @@ pub fn precompile_graphics(
     mesh_only: bool,
     progress: &(dyn Fn(usize, &PrecompileReport) + Sync),
 ) -> Result<PrecompileReport, String> {
+    precompile(archive, index, jobs, limit, skip, mesh_only, Pick::All, progress).map(|(r, _)| r)
+}
+
+/// Which records [`precompile`] makes the pipelines of.
+#[derive(Clone, Copy)]
+pub(crate) enum Pick<'a> {
+    /// Every record (`victory precompile-graphics`).
+    All,
+    /// Only those whose title pipeline key is listed (`victory prewarm`: the keys a warm
+    /// cache's runs asked for); the others count as `not_listed`.
+    Listed(&'a HashSet<String>),
+    /// None: only the keys are worked out (no host GPU needed).
+    KeysOnly,
+}
+
+/// [`precompile_graphics`] with a choice of records; also the title pipeline keys of every
+/// record that decoded and mapped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn precompile(
+    archive: &std::path::Path,
+    index: Option<&std::path::Path>,
+    jobs: usize,
+    limit: Option<usize>,
+    skip: usize,
+    mesh_only: bool,
+    pick: Pick<'_>,
+    progress: &(dyn Fn(usize, &PrecompileReport) + Sync),
+) -> Result<(PrecompileReport, HashSet<String>), String> {
     use std::sync::atomic::AtomicUsize;
 
     background();
-    if crate::host::host().is_none() {
+    if !matches!(pick, Pick::KeysOnly) && crate::host::host().is_none() {
         return Err("no host GPU: graphics pipelines are not precompiled".into());
     }
     let shaders = pack::use_blocking(archive, index).map_err(|e| format!("shader archive {}: {e}", archive.display()))?;
@@ -545,11 +575,20 @@ pub fn precompile_graphics(
                         continue;
                     };
                     let graphics = super::host::GraphicsState::from_precompiled(&state);
-                    let (key, made) = super::make::warm_graphics(stages, graphics);
-                    if !keys.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
+                    let p = super::make::Pending::new(stages, Some(Box::new(graphics)));
+                    if !keys.lock().unwrap_or_else(|e| e.into_inner()).insert(p.key().to_owned()) {
                         count(&|r| r.duplicates += 1);
                         continue;
                     }
+                    match pick {
+                        Pick::All => {}
+                        Pick::Listed(wanted) if wanted.contains(p.key()) => {}
+                        Pick::Listed(_) | Pick::KeysOnly => {
+                            count(&|r| r.not_listed += 1);
+                            continue;
+                        }
+                    }
+                    let made = super::make::warm_pending(&p);
                     if made == Some(false) {
                         tracing::warn!(record = i, "precompile: the record's host pipeline failed");
                     }
@@ -565,12 +604,13 @@ pub fn precompile_graphics(
             });
         }
     });
-    Ok(report.into_inner().unwrap_or_else(|e| e.into_inner()))
+    let keys = keys.into_inner().unwrap_or_else(|e| e.into_inner());
+    Ok((report.into_inner().unwrap_or_else(|e| e.into_inner()), keys))
 }
 
 /// The calling thread at the lowest priority, in background mode.
 #[cfg(windows)]
-fn background() {
+pub(crate) fn background() {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRIORITY_LOWEST,
     };
@@ -653,6 +693,21 @@ pub(crate) mod tests {
         assert!(text.contains("POSITION"), "{text}");
         assert_eq!(g.topology, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
         assert_eq!(g.targets.NumRenderTargets, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_conservative_record_rasterises_conservatively() {
+        let hex = |s: &str| -> Vec<u8> {
+            let s = s.trim();
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        };
+        let a = hex(include_str!("../../../victory-game/src/pso_state_fixtures/r12151.a"));
+        let b = hex(include_str!("../../../victory-game/src/pso_state_fixtures/r12151.b"));
+        let d = pso_state::decode(&a, &b).unwrap();
+        let text = super::super::host::GraphicsState::from_precompiled(&d).describe();
+        assert!(text.contains("ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE(1)"), "{text}");
+        assert!(text.contains("DepthClipEnable: BOOL(0)"), "{text}");
     }
 
     #[test]

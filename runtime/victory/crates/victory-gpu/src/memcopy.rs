@@ -156,15 +156,93 @@ pub(crate) fn log(frames: f64) {
     );
 }
 
-/// The change hash of texture memory: BLAKE3, or [`lane_hash`] with
+/// `VICTORY_TEXTURE_DIGEST=blake3`: texture memory is digested with BLAKE3,
+/// as before alessiodeia's Marvisak #2283 ([`digest128`], the default).
+fn digest_blake3() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_DIGEST").is_some_and(|v| v == "blake3"))
+}
+
+/// A 128-bit non-cryptographic digest (alessiodeia, Marvisak #2283): four
+/// 64-bit lanes, 32 bytes a step, a SplitMix-style finish. It only has to
+/// tell whether the bytes changed: 13.9 GB/s against BLAKE3's 2.3 there
+/// (156 MB hashed a world frame, ~380 ms on an RTX 2070 SUPER).
+pub(crate) fn digest128(bytes: &[u8]) -> [u64; 2] {
+    const K0: u64 = 0x9E37_79B1_85EB_CA87;
+    const K1: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const K2: u64 = 0x1656_67B1_9E37_79F9;
+    const K3: u64 = 0x85EB_CA77_C2B2_AE63;
+    #[inline(always)]
+    fn mix64(mut x: u64) -> u64 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+    let mut a0 = K0 ^ (bytes.len() as u64);
+    let mut a1 = K1;
+    let mut a2 = K2;
+    let mut a3 = K3;
+    let (chunks, tail32) = bytes.as_chunks::<32>();
+    for chunk in chunks {
+        let w = |i: usize| u64::from_le_bytes(chunk[i * 8..i * 8 + 8].try_into().unwrap());
+        a0 = a0.wrapping_add(w(0)).wrapping_mul(K0).rotate_left(31);
+        a1 = a1.wrapping_add(w(1)).wrapping_mul(K1).rotate_left(29);
+        a2 = a2.wrapping_add(w(2)).wrapping_mul(K2).rotate_left(33);
+        a3 = a3.wrapping_add(w(3)).wrapping_mul(K3).rotate_left(27);
+    }
+    let (words, tail) = tail32.as_chunks::<8>();
+    for (i, word) in words.iter().enumerate() {
+        let w = u64::from_le_bytes(*word);
+        match i {
+            0 => a0 = a0.wrapping_add(w).wrapping_mul(K0).rotate_left(31),
+            1 => a1 = a1.wrapping_add(w).wrapping_mul(K1).rotate_left(29),
+            _ => a2 = a2.wrapping_add(w).wrapping_mul(K2).rotate_left(33),
+        }
+    }
+    if !tail.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..tail.len()].copy_from_slice(tail);
+        a3 = a3.wrapping_add(u64::from_le_bytes(buf)).wrapping_mul(K3).rotate_left(27);
+    }
+    let lo = mix64(a0 ^ a2.rotate_left(17) ^ (bytes.len() as u64).wrapping_mul(K1));
+    let hi = mix64(a1 ^ a3.rotate_left(23) ^ lo.wrapping_mul(K2));
+    [lo, hi]
+}
+
+#[cfg(test)]
+#[test]
+fn digest128_detects_single_bit_tail_and_order_changes() {
+    let mut data: Vec<u8> = (0..4099).map(|i| (i * 37 + 13) as u8).collect();
+    let base = digest128(&data);
+    assert_eq!(base, digest128(&data));
+    for pos in [0, 7, 8, 31, 32, 1024, 4088, 4095, 4096, 4098] {
+        data[pos] ^= 1;
+        assert_ne!(digest128(&data), base, "missed bit flip at {pos}");
+        data[pos] ^= 1;
+    }
+    data.swap(0, 8);
+    assert_ne!(digest128(&data), base, "missed a swap");
+    data.swap(0, 8);
+    assert_ne!(digest128(&data[..4098]), base, "missed a length change");
+}
+
+/// The change hash of texture memory: [`digest128`], BLAKE3, or [`lane_hash`] with
 /// `VICTORY_FAST_HASH=1`. Only ever compared with hashes made the same way
 /// in the same run.
 pub(crate) fn content_hash(bytes: &[u8]) -> blake3::Hash {
     let started = std::time::Instant::now();
     let hash = if fast_hash() {
         blake3::Hash::from(lane_hash(bytes))
-    } else {
+    } else if digest_blake3() {
         blake3::hash(bytes)
+    } else {
+        let [lo, hi] = digest128(bytes);
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&lo.to_le_bytes());
+        b[8..16].copy_from_slice(&hi.to_le_bytes());
+        blake3::Hash::from(b)
     };
     add(M::Hashes, 1);
     add(M::HashBytes, bytes.len() as u64);

@@ -29,7 +29,7 @@ The base's exact wave64 form "without skips, scalars followed" (`6a2d9f9`) is on
 - `VICTORY_WAVE_DEEP_SKIPS_ONLY=<hash>,...`: off for every program not listed;
 - `VICTORY_WAVE_DEEP_SKIPS=0`: off for all, as before.
 
-A program's decision is in its own shader cache key, so a new list translates again only the programs whose decision it changes. To find the programs offline: `VICTORY_HOST_WAVE=32 VICTORY_WAVE_WHY=1 victory translate --list`; a program in that form prints `WAVE64-RETRY #<hash> without skips, scalars followed: wave Some(32)` last.
+A program's decision is in its own shader cache key, so a new list translates again only the programs whose decision it changes. To find the programs offline: `VICTORY_HOST_MAX_WAVE=32 VICTORY_WAVE_WHY=1 victory translate --list`; a program in that form prints `WAVE64-RETRY #<hash> without skips, scalars followed: wave Some(32)` last.
 
 Tests: `victory-gpu` 129 passed (117 on the base), `victory-shader` 206 passed (198 on the base).
 

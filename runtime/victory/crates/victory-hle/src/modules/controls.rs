@@ -4,5 +4,6 @@
 //! unit-tested on every host; `gameinput` feeds it from the host's input.
 
 pub use victory_core::kbm::{
-    Controls, Counts, MOUSE_BUTTONS, Settings, configure, key_code, settings,
+    Controls, Counts, MOUSE_BUTTONS, Settings, configure, current, key_code, live_version,
+    settings,
 };

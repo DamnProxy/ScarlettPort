@@ -21,6 +21,7 @@ pub mod dstorage;
 pub mod files;
 pub mod controls;
 pub mod gameinput;
+pub mod hidpad;
 pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;
@@ -29,6 +30,8 @@ pub mod media;
 #[cfg(windows)]
 pub mod net;
 pub mod speech;
+#[cfg(windows)]
+pub mod vibration;
 pub mod storage;
 pub mod xasync;
 pub mod xg;
@@ -70,6 +73,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(net::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    #[cfg(windows)]
+    all.push(xmem::host_free::module());
     #[cfg(windows)]
     all.push(xsystem::module());
     all

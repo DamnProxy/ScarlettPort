@@ -26,6 +26,10 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     set_phase(BootPhase::Reading);
     let cfg = victory_core::Config::load()?;
+    // `[display]`, `[pace]` and the files the F1 overlay saves to, before the controls.
+    for problem in victory_core::overlay::configure(&cfg) {
+        eprintln!("VIctory: {problem}");
+    }
     victory_hle::modules::controls::configure(cfg.controls.as_ref())
         .map_err(anyhow::Error::msg)?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
@@ -98,6 +102,11 @@ pub fn run(
         {
             victory_hle::modules::ffx::set_real_dispatch(real);
         }
+        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+            && let Some(real) = dll.export("ffxCreateContext")
+        {
+            victory_hle::modules::ffx::set_real_create(real);
+        }
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
@@ -140,6 +149,14 @@ pub fn run(
             if ours {
                 return victory_loader::Resolution::Found {
                     address: victory_hle::modules::ffx::dispatch_address(),
+                    provenance: victory_loader::Provenance::Hle,
+                };
+            }
+            let create = dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+                && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxCreateContext");
+            if create {
+                return victory_loader::Resolution::Found {
+                    address: victory_hle::modules::ffx::create_address(),
                     provenance: victory_loader::Provenance::Hle,
                 };
             }

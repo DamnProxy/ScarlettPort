@@ -233,8 +233,10 @@ extern "system" fn window_proc(
     // hidden over the window while captured, captured by a click, freed when
     // the window loses focus. The title still sees every message.
     match message {
+        // (The settings overlay draws its own pointer: no system cursor then either.)
         wm::WM_SETCURSOR
-            if super::gameinput::cursor::captured() && lparam as u32 & 0xFFFF == wm::HTCLIENT =>
+            if (super::gameinput::cursor::captured() || victory_core::overlay::is_open())
+                && lparam as u32 & 0xFFFF == wm::HTCLIENT =>
         {
             // SAFETY: no cursor while it is over our client area.
             unsafe { wm::SetCursor(std::ptr::null_mut()) };

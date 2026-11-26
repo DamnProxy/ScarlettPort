@@ -66,6 +66,9 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+/// Pipelines made whose store the library refused (a name already stored
+/// with another description).
+pub(crate) static STORE_REFUSED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -523,7 +526,11 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    let load_only = LOAD_ONLY.load(Ordering::Relaxed);
     let Some(library) = library() else {
+        if load_only {
+            return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+        }
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
@@ -548,6 +555,9 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    if load_only {
+        return Err(refused);
+    }
     // Compiled outside any lock: compiles take up to seconds. A second
     // request for the same name while the first compiles waits for it
     // (`VICTORY_PSO_SHARE=1`, after Zettrox/ztrx#25's note that misses of
@@ -568,7 +578,7 @@ pub(crate) fn pipeline(
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
+            "pipeline library: made {label} in {:.1} ms (not in the library under this name: {refused})",
             began.elapsed().as_secs_f64() * 1e3
         )
     });
@@ -577,10 +587,29 @@ pub(crate) fn pipeline(
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    match unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) } {
+        Ok(()) => {
+            library.added.fetch_add(1, Ordering::Relaxed);
+        }
+        // The name is in the library with another description: the load
+        // above refused it (E_INVALIDARG, as for a name not there) and
+        // this one is never kept, so it is made again every run. Said,
+        // not left silent: the name misses something of the description.
+        Err(e) => {
+            STORE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            let label = LABEL.with(|l| l.borrow().clone());
+            tracing::warn!(name, %label, error = %e, "pipeline library: stored under this name with another description; made again every run");
+        }
     }
     Ok(pso)
+}
+
+/// `victory prewarm run --check`: pipelines are only loaded from the library, never made (a
+/// miss is an error), so the check compiles nothing and changes nothing.
+static LOAD_ONLY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_load_only(on: bool) {
+    LOAD_ONLY.store(on, Ordering::Relaxed);
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -656,6 +685,7 @@ pub(crate) fn save(now: bool) {
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            store_refused = STORE_REFUSED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),

@@ -36,6 +36,18 @@ pub(crate) struct GraphicsState {
     samples: DXGI_SAMPLE_DESC,
 }
 
+impl GraphicsState {
+    /// Whether these are a pass over the screen's pixels: no vertex input,
+    /// no depth or stencil test, triangles (Belobug 18e57db). Such passes
+    /// fill tables once; their shaders are few.
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+}
+
 impl Default for GraphicsState {
     fn default() -> Self {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -204,6 +216,11 @@ impl GraphicsState {
             DepthBiasClamp: d.depth_bias_clamp,
             SlopeScaledDepthBias: d.slope_scaled_depth_bias,
             DepthClipEnable: d.depth_clip.into(),
+            ConservativeRaster: if d.conservative_raster {
+                D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+            } else {
+                D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF
+            },
             ..Default::default()
         };
         let face = |f: &victory_game::pso_state::StencilFace| D3D12_DEPTH_STENCILOP_DESC {
@@ -654,6 +671,22 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
+            // A program that keeps console waves wider than the host's
+            // (`WaveSize(64)` on 32-lane NVIDIA) is refused by every driver
+            // (E_INVALIDARG): named here, never handed over. The 26 of the
+            // 29 such programs translate to 32 lanes with `VICTORY_WAVE64_LDS=1`.
+            if let Some(wave) = required_wave(&code_bytes(&code(0))) {
+                let lanes = victory_shader::emit::host_max_wave();
+                if lanes != 0 && wave > lanes {
+                    tracing::warn!(
+                        ?shaders,
+                        wave,
+                        lanes,
+                        "host pipeline refused: the program needs waves wider than the host runs (VICTORY_WAVE64_LDS=1 translates most to the host's)"
+                    );
+                    return None;
+                }
+            }
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
                 &name,
@@ -1077,7 +1110,9 @@ fn bounds_pipeline(
             add(s, kind, code);
         }
     }
-    add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend);
+    // The host's blend (no blending on integer targets), as the other
+    // forms have it: with the title's, D3D12 refused such pipelines.
+    add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend());
     add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask);
     add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer);
     let d = &g.depth;
@@ -1122,6 +1157,30 @@ fn bounds_pipeline(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+/// The wave size a DXIL container's program requires (its `PSV0` part's
+/// minimum expected lane count), if it requires one.
+fn required_wave(dxil: &[u8]) -> Option<u32> {
+    let u32_at = |at: usize| dxil.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    if dxil.get(..4)? != b"DXBC" {
+        return None;
+    }
+    let parts = u32_at(28)? as usize;
+    (0..parts.min(64)).find_map(|i| {
+        let at = u32_at(32 + 4 * i)? as usize;
+        if dxil.get(at..at + 4)? != b"PSV0" {
+            return None;
+        }
+        // The part's data: the runtime info's size, then the info, whose
+        // minimum and maximum lane counts are at 16 and 20.
+        let data = at + 8;
+        if u32_at(data)? < 24 {
+            return None;
+        }
+        let min = u32_at(data + 4 + 16)?;
+        (min != 0).then_some(min)
+    })
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -1388,5 +1447,32 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+}
+
+#[cfg(test)]
+mod wave_tests {
+    /// A container of one `PSV0` part whose info asks `min`..`max` lanes.
+    fn container(min: u32, max: u32) -> Vec<u8> {
+        let mut c = b"DXBC".to_vec();
+        c.resize(28, 0);
+        c.extend(1u32.to_le_bytes());
+        c.extend(36u32.to_le_bytes());
+        c.extend(b"PSV0");
+        c.extend(52u32.to_le_bytes());
+        c.extend(48u32.to_le_bytes());
+        let mut info = [0u8; 48];
+        info[16..20].copy_from_slice(&min.to_le_bytes());
+        info[20..24].copy_from_slice(&max.to_le_bytes());
+        c.extend(info);
+        c
+    }
+
+    #[test]
+    fn the_wave_a_program_requires_is_read_from_its_psv0_part() {
+        assert_eq!(super::required_wave(&container(64, 64)), Some(64));
+        assert_eq!(super::required_wave(&container(32, 32)), Some(32));
+        assert_eq!(super::required_wave(&container(0, u32::MAX)), None);
+        assert_eq!(super::required_wave(b"not a container"), None);
     }
 }

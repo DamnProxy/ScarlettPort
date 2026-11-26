@@ -33,6 +33,12 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// A pass over the screen ([`GraphicsState::screen_pass`]) with
+    /// [`screen_workers`] on.
+    screen: bool,
+    /// The first title frame a recording thread waited for this pipeline in
+    /// (`u64::MAX`: never), for [`wait_once`].
+    waited_frame: AtomicU64,
     /// Why it is not made, if it is not ([`left_out`]).
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
@@ -103,7 +109,9 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         let left_out = left_out(&shaders);
+        let screen = screen_workers() && graphics.as_ref().is_some_and(|g| g.screen_pass());
         Pending {
+            screen,
             shaders,
             graphics,
             left_out,
@@ -112,7 +120,13 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_frame: AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// What a run names it by (the early list's entries).
+    pub(crate) fn key(&self) -> &str {
+        &self.key
     }
 
     fn make(&self) {
@@ -156,15 +170,12 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
-        tracing::info!(millis, "host pipeline wait budget per frame");
-        Duration::from_millis(millis)
-    })
+    // Live (`victory_core::live`, `VICTORY_AB`).
+    static MS: victory_core::live::Switch = victory_core::live::Switch::new("PIPELINE_WAIT_MS", 500);
+    static SAID: std::sync::Once = std::sync::Once::new();
+    let millis = MS.get();
+    SAID.call_once(|| tracing::info!(millis, "host pipeline wait budget per frame"));
+    Duration::from_millis(millis)
 }
 
 /// Whether the host's driver has been at `p` for longer than most take
@@ -172,7 +183,10 @@ fn wait_budget() -> Duration {
 fn slow(p: &Pending) -> bool {
     // A pass a title runs once (it unpacks a model, say) is lost if its
     // pipeline is not there; a draw comes again in the next frame.
-    let most = if p.computes() { 10 } else { 3 };
+    // A screen pass (`VICTORY_SCREEN_WORKERS=1`) is waited for up to its own
+    // budget: given up on at 3 s, a lighting-table pass was still dropped
+    // (Marvisak #2433).
+    let most = if p.screen { SCREEN_BUDGET.as_secs() } else if p.computes() { 10 } else { 3 };
     p.begun.get().is_some_and(|at| at.elapsed() > Duration::from_secs(most))
 }
 
@@ -221,9 +235,32 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        let frame = crate::frame::current();
+        if !wait_once() || waits_in(p, frame) {
+            wait(p, frame);
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a pipeline not made yet is waited for in one title frame at most
+/// (`VICTORY_PIPELINE_WAIT_ONCE=1`; off by default): later frames draw
+/// without it until a worker has made it, and do not spend their wait
+/// budget on it again. fx #867 (powplusplus, d4e6556): the pipeline wait
+/// went from 416-500 ms a frame to 0 on an RTX 3080 (Proton, a cold cache).
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Whether `p` may be waited for in `frame`: the first frame that asks
+/// takes it, and only that frame waits.
+fn waits_in(p: &Pending, frame: u64) -> bool {
+    let first = match p.waited_frame.compare_exchange(u64::MAX, frame, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => frame,
+        Err(f) => f,
+    };
+    first == frame
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -246,22 +283,24 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
     Some(HostPipeline::new(&p.shaders, None).is_some())
 }
 
-/// As [`warm`], for a graphics pipeline with its state (the offline
-/// precompile of the title's cache, [`super::precompiled::precompile_graphics`]).
-/// Also the key a run will name it by.
-pub(crate) fn warm_graphics(shaders: Vec<Arc<Shader>>, graphics: GraphicsState) -> (String, Option<bool>) {
-    let p = Pending::new(shaders, Some(Box::new(graphics)));
+/// Makes the host pipeline of `p` (loaded from the library when it is there) for the caches
+/// on disk, as [`warm`] does; whether it has one (`None`: left out). The offline precompile of
+/// the title's cache ([`super::precompiled::precompile`]) and `victory prewarm`.
+pub(crate) fn warm_pending(p: &Pending) -> Option<bool> {
     if p.left_out.is_some() {
-        return (p.key, None);
+        return None;
     }
-    let made = HostPipeline::new(&p.shaders, p.graphics.as_deref()).is_some();
-    (p.key, Some(made))
+    Some(HostPipeline::new(&p.shaders, p.graphics.as_deref()).is_some())
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    // Turning off speculative starts keeps first-use scheduling and the disk caches available
+    // (`VICTORY_EARLY_PIPELINES=0`, Lilith133T fx #845: a diagnostic).
+    static PREWARM: OnceLock<bool> = OnceLock::new();
+    let enabled = *PREWARM.get_or_init(|| std::env::var_os("VICTORY_EARLY_PIPELINES").is_none_or(|v| v != "0"));
+    if enabled && p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -293,10 +332,12 @@ fn wait(p: &Pending, frame: u64) {
     let past_total = &LOADINGS[usize::from(compute)];
     let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
     let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
+    // Screen passes: a budget of their own, longer (`screen_workers`).
+    let budget = if p.screen { SCREEN_BUDGET } else { budget };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
-    let frame_spent = &SPENTS[usize::from(compute)];
+    static SPENTS: [Mutex<(u64, Duration)>; 3] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 3];
+    let frame_spent = &SPENTS[if p.screen { 2 } else { usize::from(compute) }];
     let shared = shared_budget();
     let left = {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
@@ -339,6 +380,7 @@ fn wait(p: &Pending, frame: u64) {
             }
         }
     }
+    crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -354,6 +396,9 @@ const MAKING: u8 = 3;
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    /// Requested screen passes ([`screen_workers`]): before the others,
+    /// and the only work of the screen workers.
+    screen: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -361,6 +406,7 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            screen: VecDeque::new(),
         }
     }
 
@@ -372,7 +418,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
+        if priority == REQUESTED && p.screen {
+            self.screen.push_back(p.clone());
+        } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
@@ -387,6 +435,13 @@ impl Queue {
     /// left for its first use instead (`skipped` of them are counted, to be taken off the
     /// waiting count).
     fn pop(&mut self, early_ok: bool, ready: impl Fn(&Pending) -> bool) -> Popped {
+        if let Some(p) = self.screen.pop_front() {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Popped {
+                made: Some((p, false)),
+                skipped: 0,
+            };
+        }
         if let Some(p) = self.requested.pop_front() {
             p.queue_state.store(MAKING, Ordering::Relaxed);
             return Popped {
@@ -492,6 +547,34 @@ fn next() -> (Arc<Pending>, bool) {
     }
 }
 
+/// The next screen pass to make (the screen workers').
+fn next_screen() -> Arc<Pending> {
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some(p) = queue.screen.pop_front() {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return p;
+        }
+        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Whether passes over the screen (no vertex input, no depth or stencil)
+/// have workers and a wait budget of their own (`VICTORY_SCREEN_WORKERS=1`;
+/// off by default). Belobug 18e57db: the title fills its lighting tables
+/// (PS_IntegrateEnvBRDF*, PS_AreaLightIlluminance) with draws it makes
+/// once, at the world's first frame; behind a world's worth of pipelines
+/// they waited minutes and were dropped, and that run had no diffuse light
+/// (grey, sepia image; white bloom indoors).
+fn screen_workers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCREEN_WORKERS").is_some_and(|v| v == "1"))
+}
+
+/// Waiting allowed per title frame for screen passes ([`screen_workers`]),
+/// below the title's 30 s watchdog.
+const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+
 /// A worker is done with an early pipeline: another may take one. Under the queue's lock, so
 /// that a worker that found the limit reached is waiting when this wakes it.
 fn early_done() {
@@ -512,6 +595,21 @@ fn workers() -> bool {
             std::env::var("VICTORY_EARLY_WORKERS").ok().as_deref(),
         );
         EARLY_CAP.store(cap, Ordering::Relaxed);
+        // Two of their own for screen passes (`screen_workers`).
+        for i in 0..if screen_workers() { 2 } else { 0 } {
+            let spawned = std::thread::Builder::new().name(format!("victory-pipelines-screen-{i}")).spawn(|| {
+                loop {
+                    let p = next_screen();
+                    p.make();
+                    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        drained();
+                    }
+                }
+            });
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "no screen pass pipeline worker");
+            }
+        }
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -668,5 +766,16 @@ mod tests {
         assert_eq!(queue.push(&cold, REQUESTED), Some(true));
         let (p, early) = queue.pop(true, |_| false).made.unwrap();
         assert!(Arc::ptr_eq(&p, &cold) && !early);
+    }
+
+    /// `VICTORY_PIPELINE_WAIT_ONCE`: the first frame that waits for a
+    /// pipeline is the only one (after fx #867's test).
+    #[test]
+    fn a_pipeline_is_waited_for_in_one_frame() {
+        let p = Pending::new(Vec::new(), None);
+        assert!(waits_in(&p, 7));
+        assert!(waits_in(&p, 7));
+        assert!(!waits_in(&p, 8));
+        assert!(!waits_in(&p, 6));
     }
 }

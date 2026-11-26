@@ -5,6 +5,7 @@
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
 
+pub mod ab;
 pub mod atomic;
 pub mod backup;
 pub mod batch;
@@ -12,12 +13,18 @@ pub mod config;
 pub mod env;
 pub mod fastboot;
 pub mod gpuown;
+pub mod hints;
 pub mod kbm;
+pub mod live;
 pub mod mem2;
 pub mod memmap;
+pub mod overlay;
 pub mod pace;
 pub mod pagemap;
 pub mod readring;
+pub mod savecheck;
+pub mod rumble;
+pub mod upscale;
 pub mod saves;
 pub mod logging;
 pub mod policy;

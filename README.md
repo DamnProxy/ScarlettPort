@@ -7,7 +7,7 @@ No emulator, no streaming. The title's own x64 code runs on your CPU, and its RD
 
 ### Where it stands
 
-Developed and tested so far against one open-world title. It boots, gets through the menus, saves and legal screens, reaches the world and starts gameplay: about 4 fps in the prologue on an RTX 3060 (Series S profile), now GPU-bound. The tile-grid overlay is fixed; streaming freezes and the GPU cost remain, so it is **not yet verified playable**.
+Developed and tested so far against one open-world title. It boots, gets through the menus, saves and legal screens, reaches the world and starts gameplay: about 5 fps in the cell scene and about 4 fps while moving on an RTX 3060 (Series S profile), with stable frame pacing. The yard stutter is fixed; the lighting is wrong (ray tracing is off) and first runs freeze on pipeline compiles while moving, so it is **not yet verified playable**.
 
 ![progress](https://img.shields.io/badge/progress-50%25-ff2d95?style=for-the-badge)
 
@@ -15,7 +15,7 @@ Developed and tested so far against one open-world title. It boots, gets through
 ██████████░░░░░░░░░░  50%
 ```
 
-`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `lit world` ✅ → `gameplay starts` ✅ (~4 fps) → `shadowed areas` 🔨 → `playable speed` ⏳
+`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `lit world` ✅ → `gameplay starts` ✅ (~4-5 fps) → `shadowed areas` 🔨 → `playable speed` ⏳
 
 <a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" height="45"/></a>
 <a href="https://ko-fi.com/ziggymar"><img src="https://img.shields.io/badge/BUY%20A%20COFFEE-Ko--fi-ff5f5f?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" height="45"/></a>
@@ -78,9 +78,9 @@ All captured on an RTX 3060 under Windows 10.
 
 Measured on an RTX 3060 (Series S profile, the title's own upscaler):
 
-- **Speed:** about 4 fps in the prologue, now GPU-bound: the per-frame read waits are cut from about 156 to about 26 ms. What is left is the GPU cost of the frame and streaming freezes. The intro cutscene is very slow unless it is skipped.
-- **Streaming freezes:** the picture stalls while world data streams in.
-- **Shadowed areas are too dark.** The title's ray-traced lighting and shadows do not run yet; the ray-tracing work so far is described in [`runtime/victory/docs/fork-ray-tracing.md`](runtime/victory/docs/fork-ray-tracing.md).
+- **Speed:** about 5 fps in the cell scene and about 4 fps while moving, with stable frame pacing. Memory copies are cut from 286 to 84 MB per frame. The intro cutscene is very slow unless it is skipped.
+- **Pipeline compile freezes:** on a first run, moving into new areas freezes while pipelines compile. The shader prewarm and the pipeline cache shorten this on later runs.
+- **Lighting and hair look wrong; shadowed areas are too dark.** The title's ray-traced lighting and shadows do not run yet (ray tracing is off); the ray-tracing work so far is described in [`runtime/victory/docs/fork-ray-tracing.md`](runtime/victory/docs/fork-ray-tracing.md).
 - **Not verified playable:** nobody has played a session end to end.
 
 Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROADMAP.md).
@@ -88,20 +88,30 @@ Questions: [`docs/FAQ.md`](docs/FAQ.md). Problems: [`docs/TROUBLESHOOTING.md`](d
 
 ---
 
-## 🧪 In progress (after v0.2.1)
+## 🆕 New in v0.4.0
 
-Nothing below is in a release yet. "In testing" means built and unit-tested, waiting for A/B game runs on our RTX 3060; "planned" means not built yet. The only measured number today is about 4 fps in the prologue on that card; none of these items has a measured fps gain on it yet.
+Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about 4 fps while moving, stable frame pacing.
+
+- **Yard stutter fixed:** lazy remapping of title memory plus the copy fix (`VICTORY_REMAP_LAZY`, `VICTORY_MEM_SUBPAGE`, `VICTORY_COPY_NOQUERY`).
+- **Copies cut** from 286 to 84 MB per frame.
+- **Fast boot fixed** (`VICTORY_FAST_BOOT`); it stays optional and off in the presets.
+- **In-session A/B tooling:** switch variants cycled live within one game session (`VICTORY_AB`), with a per-variant summary.
+- **Shader prewarm:** shaders are translated ahead of play, so fewer compiles land mid-session.
+- **Launcher 0.4.0:** the Stable preset uses the fx-cand4 settings above.
+- **Known issues:** the lighting and hair look wrong (ray tracing is off); pipeline compiles freeze the picture when moving on a first run.
+
+## 🧪 Still in progress
+
+"In testing" means built and unit-tested, waiting for A/B game runs on our RTX 3060; "planned" means not built yet. None of these items has a measured fps gain yet.
 
 | Work | Status | What it does |
 |---|:---:|---|
-| Streaming stutter fixes | 🧪 in testing | fewer waits on title memory while world data streams: narrower declared GPU write ranges, fills and buffer copies served on the card, a fixed copy-back mode that no longer gives a black picture |
 | Missing geometry: character skin shaders | 🧪 in testing | skin, hair and clothes pixel shaders that were refused (draws dropped) translate again |
 | Missing geometry: mesh output limit | 🧪 in testing | the 71 over-budget mesh shaders are linked under D3D12's 32 KiB output limit instead of being dropped on NVIDIA |
 | Missing geometry: view heap | 🧪 in testing | view heap sized so world draws no longer run out of slots on NVIDIA |
 | CPU recording cuts | 🧪 in testing | less per-draw preparing and recording cost on the CPU, with a per-part timing line to measure it |
 | FSR upscaler | 📋 planned | the title's FidelityFX calls answered by AMD's PC FidelityFX |
 | Frame generation | 📋 planned | only once the base frame rate is high enough for it to make sense |
-| Launcher v0.3 | 🧪 in testing | local build mode, switch presets, **Verify files**, fix for a blank launcher window |
 | Save safety | 🧪 in testing | protects your save folder from being overwritten by test runs |
 | One-command benchmark queue | 🧪 in testing | queues A/B runs of switch sets and collects the frame-time logs in one command |
 
@@ -115,7 +125,7 @@ Nothing below is in a release yet. "In testing" means built and unit-tested, wai
 | Intro, setup and menus | ✅ | 30 fps, audio plays |
 | Saves and legal screens | ✅ | the title saves a checkpoint and loads it again |
 | Open world loads | ✅ | world data streams in through DirectStorage |
-| Lit world renders | ✅ | about 4 fps in the prologue on an RTX 3060, Series S profile, GPU-bound (read waits cut from about 156 to about 26 ms per frame) |
+| Lit world renders | ✅ | about 5 fps in the cell scene, about 4 fps moving, on an RTX 3060 (Series S profile); lighting and hair wrong while ray tracing is off |
 | Gameplay starts | ✅ | the prologue runs; not played end to end |
 | Pipelines prebuilt | ✅ | 25,200 of 25,471 graphics pipelines made ahead of time, and used in play |
 | Shaders translate (VIctory-based translator) | ✅ | all 26,084 translate; 26,013 pass DXIL validation on their own, the other 71 (oversized mesh shaders) validate only when linked with their pixel shader. XCL's counts differ ([`docs/STATUS.md`](docs/STATUS.md)) |
@@ -123,7 +133,7 @@ Nothing below is in a release yet. "In testing" means built and unit-tested, wai
 | Tile-grid overlay over gameplay | ✅ | fixed (rectangle-list pipelines decode right) |
 | Shadowed areas | 🔨 | too dark |
 | Intro cutscene | 🔨 | very slow unless skipped |
-| Speed work | 🔨 | per-frame read waits cut from about 156 to about 26 ms; now GPU-bound, with streaming freezes |
+| Speed work | 🔨 | stable frame pacing, yard stutter fixed, copies cut from 286 to 84 MB per frame; pipeline compile freezes on first runs |
 | Playable | ⏳ | not verified |
 | 30 fps on a mid-range PC | ⏳ | the goal |
 

@@ -55,10 +55,103 @@ struct Upscale {
     motion_scale: [f32; 2],
     render: [u32; 2],
     upscale: [u32; 2],
+    sharpening: bool,
+    sharpness: f32,
+    frame_ms: f32,
+    pre_exposure: f32,
+    reset: bool,
+    near: f32,
+    far: f32,
+    fov_y: f32,
+    meters: f32,
+    flags: u32,
+}
+
+impl Upscale {
+    /// The numbers of the dispatch, for the host upscaler.
+    fn params(&self) -> victory_core::upscale::TitleParams {
+        victory_core::upscale::TitleParams {
+            jitter: self.jitter,
+            motion_scale: self.motion_scale,
+            render: self.render,
+            upscale: self.upscale,
+            sharpening: self.sharpening,
+            sharpness: self.sharpness,
+            frame_ms: self.frame_ms,
+            pre_exposure: self.pre_exposure,
+            reset: self.reset,
+            near: self.near,
+            far: self.far,
+            fov_y: self.fov_y,
+            meters: self.meters,
+            flags: self.flags,
+        }
+    }
+}
+
+/// `ffxCreateContextDescUpscale`: what the title makes its context with.
+#[repr(C)]
+struct CreateUpscale {
+    header: Header,
+    flags: u32,
+    max_render: [u32; 2],
+    max_upscale: [u32; 2],
+}
+
+/// `FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE`.
+const CREATE_UPSCALE: u64 = 0x0001_0000;
+
+static REAL_CREATE: AtomicUsize = AtomicUsize::new(0);
+
+/// The title's own `ffxCreateContext`.
+pub fn set_real_create(address: usize) {
+    REAL_CREATE.store(address, Ordering::Relaxed);
+}
+
+type CreateFn = extern "system" fn(*mut *mut c_void, *const Header, *const c_void) -> u32;
+
+/// Notes the flags of the title's upscale context (its depth and colour
+/// conventions, which our context must share), then makes it with the
+/// title's DLL as before.
+extern "system" fn create_context(context: *mut *mut c_void, desc: *const Header, memory: *const c_void) -> u32 {
+    let mut at = desc;
+    let mut hops = 0;
+    // SAFETY: the title's chain of descriptions, each with a header.
+    while let Some(h) = unsafe { at.as_ref() } {
+        if h.kind == CREATE_UPSCALE {
+            // SAFETY: an upscale creation description, by its type.
+            let c = unsafe { &*at.cast::<CreateUpscale>() };
+            tracing::info!(
+                flags = format_args!("{:#x}", c.flags),
+                max_render = ?c.max_render,
+                max_upscale = ?c.max_upscale,
+                "the title makes its upscale context"
+            );
+            #[cfg(windows)]
+            victory_gpu::fsr::set_title_flags(c.flags);
+            break;
+        }
+        hops += 1;
+        if hops > 16 {
+            break;
+        }
+        at = h.next;
+    }
+    match REAL_CREATE.load(Ordering::Relaxed) {
+        0 => ERROR,
+        // SAFETY: the title's own `ffxCreateContext`, with its own arguments.
+        real => unsafe { std::mem::transmute::<usize, CreateFn>(real)(context, desc, memory) },
+    }
+}
+
+/// What the title's import of `ffxCreateContext` is bound to.
+pub fn create_address() -> usize {
+    create_context as *const () as usize
 }
 
 const _: () = assert!(size_of::<Resource>() == 48);
 const _: () = assert!(std::mem::offset_of!(Upscale, output) == 0x138);
+const _: () = assert!(size_of::<Upscale>() == 0x1b0);
 
 /// `FFX_API_RETURN_ERROR`: what a dispatch nothing could answer returns.
 const ERROR: u32 = 1;
@@ -90,12 +183,47 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                 );
             }
             #[cfg(windows)]
+            {
+                use victory_core::upscale::Upscaler;
+                let wanted = victory_core::upscale::live_upscaler();
+                if wanted == Upscaler::Dlss && first {
+                    tracing::warn!("VICTORY_UPSCALER=dlss is not wired yet: FSR 3 answers instead");
+                }
+                if wanted.effective() == Upscaler::Fsr {
+                    let textures = victory_gpu::list::UpscaleTextures {
+                        colour: d.colour.resource,
+                        depth: d.depth.resource,
+                        motion: d.motion.resource,
+                        exposure: d.exposure.resource,
+                        reactive: d.reactive.resource,
+                        composition: d.composition.resource,
+                        output: d.output.resource,
+                    };
+                    if first {
+                        tracing::info!(
+                            depth = ?d.depth.resource,
+                            motion = ?d.motion.resource,
+                            jitter = ?d.jitter,
+                            motion_scale = ?d.motion_scale,
+                            near = d.near,
+                            far = d.far,
+                            fov_y = d.fov_y,
+                            "upscale inputs"
+                        );
+                    }
+                    if victory_gpu::list::upscale_fsr(d.list, &textures, &d.params()) {
+                        return 0;
+                    }
+                }
+            }
+            #[cfg(windows)]
             if victory_gpu::list::upscale_stretch(
                 d.list,
                 d.colour.resource,
                 d.output.resource,
                 d.render,
             ) {
+                victory_core::upscale::status::set_answered(2, d.render, d.upscale);
                 return 0;
             }
             if first {
@@ -144,8 +272,56 @@ mod tests {
         assert_eq!(offset_of!(Upscale, motion_scale), 0x170);
         assert_eq!(offset_of!(Upscale, render), 0x178);
         assert_eq!(offset_of!(Upscale, upscale), 0x180);
+        assert_eq!(offset_of!(Upscale, sharpening), 0x188);
+        assert_eq!(offset_of!(Upscale, sharpness), 0x18c);
+        assert_eq!(offset_of!(Upscale, frame_ms), 0x190);
+        assert_eq!(offset_of!(Upscale, pre_exposure), 0x194);
+        assert_eq!(offset_of!(Upscale, reset), 0x198);
+        assert_eq!(offset_of!(Upscale, near), 0x19c);
+        assert_eq!(offset_of!(Upscale, far), 0x1a0);
+        assert_eq!(offset_of!(Upscale, fov_y), 0x1a4);
+        assert_eq!(offset_of!(Upscale, meters), 0x1a8);
+        assert_eq!(offset_of!(Upscale, flags), 0x1ac);
+        assert_eq!(offset_of!(CreateUpscale, max_upscale), 28);
         assert_eq!(offset_of!(Resource, description), 8);
         assert_eq!(offset_of!(Resource, state), 40);
+    }
+
+    /// The title's numbers reach the host upscaler unchanged.
+    #[test]
+    fn the_dispatch_numbers_go_through_as_written() {
+        // SAFETY: plain data; zero is valid for every field.
+        let mut d: Upscale = unsafe { std::mem::zeroed() };
+        d.jitter = [0.3, -0.2];
+        d.motion_scale = [-1280.0, 720.0];
+        d.render = [1280, 720];
+        d.upscale = [1920, 1080];
+        d.near = 0.05;
+        d.far = 20000.0;
+        d.fov_y = 0.8;
+        d.reset = true;
+        let p = d.params();
+        assert_eq!(p.jitter, [0.3, -0.2]);
+        assert_eq!(p.motion_scale, [-1280.0, 720.0]);
+        assert_eq!((p.render, p.upscale), ([1280, 720], [1920, 1080]));
+        assert_eq!((p.near, p.far, p.fov_y), (0.05, 20000.0, 0.8));
+        assert!(p.reset);
+    }
+
+    /// A context creation with no DLL of the title's to pass it to is an
+    /// error, after the flags were noted.
+    #[test]
+    fn a_creation_nothing_answers_is_an_error() {
+        let before = REAL_CREATE.swap(0, Ordering::Relaxed);
+        let desc = CreateUpscale {
+            header: Header { kind: CREATE_UPSCALE, next: std::ptr::null() },
+            flags: 8,
+            max_render: [1280, 720],
+            max_upscale: [1920, 1080],
+        };
+        let mut ctx = std::ptr::null_mut();
+        assert_eq!(create_context(&mut ctx, &desc.header, std::ptr::null()), ERROR);
+        REAL_CREATE.store(before, Ordering::Relaxed);
     }
 
     /// A dispatch that is not an upscale, with no DLL of the title's to

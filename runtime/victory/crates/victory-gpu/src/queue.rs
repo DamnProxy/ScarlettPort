@@ -53,7 +53,108 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
+    /// With [`behind`]: the submission at the head of the line is being
+    /// prepared and sent by our thread, with the line unlocked, so the
+    /// title can add to its end meanwhile; whatever is added stays behind
+    /// this (the line is not empty), signals too.
+    Running,
+    /// With [`present_behind`]: the title's present of a frame, due after
+    /// what the queue holds before it: the host texture shown, the state
+    /// the title's lists leave it in, and the frame's number.
+    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
 }
+
+/// Presents that are in a queue's line and have not run ([`Held::Present`]).
+#[cfg(windows)]
+static PRESENTS_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a present goes behind the queue's line and returns at once
+/// (`VICTORY_ASYNC_PRESENT=1`; needs [`behind`] and presents that do not
+/// settle the flights, `crate::host::late_free_present`).
+///
+/// Why: with [`behind`] our thread prepares and sends the submissions, but
+/// the title's present still ran the line itself first, that is: it stood
+/// until our thread had prepared every submission of the frame. Run 225's
+/// frame log (the cell, 136 ms a frame): the title's render thread is 77 ms
+/// of every frame inside the present waiting for that, using 3 ms of
+/// processor itself, and only then begins to record the next frame (about
+/// 57 ms), during which our thread has nothing to prepare. The two phases
+/// ran one after the other.
+///
+/// With the switch the present is one more thing in the line
+/// ([`Held::Present`]): our thread shows the frame when it gets there, in
+/// order, and the title records the next frame meanwhile.
+///
+/// The title is one frame ahead at most: a present that finds the one
+/// before it still in a line runs the old way (the lines first, then
+/// itself), and so does a frame that is saved or listed, and a present
+/// that finds its queue's line empty. A wait nothing ever meets is
+/// therefore still forced, by the present after it.
+///
+/// What it assumes, beyond what [`behind`] does: title memory a submission
+/// reads stays as it was until the submission's fence is signalled, also
+/// across the title's present. On the console the card reads that memory
+/// when it runs the list, after the present call has returned.
+#[cfg(windows)]
+fn present_behind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_PRESENT").is_some_and(|v| v == "1")
+            && behind()
+            && crate::host::late_free_present();
+        if on {
+            tracing::info!("presents go behind the queue's line and return at once (VICTORY_ASYNC_PRESENT=1)");
+        }
+        on
+    })
+}
+
+/// With [`present_behind`]: puts the present of the next frame behind what
+/// the queue `this` holds. False if it has to run the old way.
+#[cfg(windows)]
+fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
+    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    let frame = FRAMES.load(Ordering::Relaxed) + 1;
+    // A frame that is saved or listed is read back at once.
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::wanted(frame) || crate::capture::listed(frame) {
+        return false;
+    }
+    // SAFETY: the title passes `planes` plane descriptions.
+    let Some(plane) = (unsafe { plane_parameters.as_ref() }) else {
+        return false;
+    };
+    if plane.count == 0 || plane.resources.is_null() {
+        return false;
+    }
+    // SAFETY: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    let Some(texture) = crate::resource::host_resource(resource) else {
+        return false;
+    };
+    // The state the lists recorded so far leave the texture in: what our
+    // copy finds it in when it runs behind them (looked at, not changed).
+    const COPY_SOURCE: u32 = 0x800;
+    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    let texture = texture.clone();
+    let sent = hold(this, || {
+        PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
+        Held::Present(texture, state, frame)
+    });
+    if sent {
+        PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
+        wake();
+    }
+    sent
+}
+
+/// Presents sent behind their queue's line since the start
+/// ([`send_behind`]), for the line every 512 of them.
+#[cfg(windows)]
+static PRESENTS_BEHIND: AtomicU64 = AtomicU64::new(0);
 
 /// The queues that hold something (their addresses).
 #[cfg(windows)]
@@ -131,14 +232,23 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let first = if lock(&queue(this).held).is_empty() {
-        lists
-            .iter()
-            .position(|&l| crate::list::cut_list(l))
-            .unwrap_or(lists.len())
-    } else {
-        0
+    let first_of = || {
+        if !behind() && lock(&queue(this).held).is_empty() {
+            lists
+                .iter()
+                .position(|&l| crate::list::cut_list(l))
+                .unwrap_or(lists.len())
+        } else {
+            0
+        }
     };
+    let mut first = first_of();
+    // `VICTORY_KICK_MERGE`: a submission that is not joined to the pending
+    // ones sends them first, and is looked at again behind them.
+    let mergeable = |first: usize| crate::host::late() && first == lists.len() && !lists.is_empty();
+    if crate::host::kick_merge() && !mergeable(first) && kick_flush() {
+        first = first_of();
+    }
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -159,7 +269,11 @@ fn submit_cut(this: This, lists: &[This]) {
         // from the title's lists (which it may reset before they have run)
         // and come back, with their tables' slots, when they are settled.
         let (taken, order) = crate::list::detach(&lists[..first]);
-        host.execute_late(taken, order);
+        if crate::host::kick_merge() {
+            kick_offer(host, this as usize, taken, order, mergeable(first));
+        } else {
+            host.execute_late(taken, order);
+        }
     } else if first > 0 {
         let now: Vec<_> = lists[..first]
             .iter()
@@ -307,22 +421,134 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 /// one.
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
+    if !all && behind() {
+        // A thread of ours runs what is free to run ([`behind`]).
+        wake();
+        return;
+    }
+    release_held_now(all);
+}
+
+/// Whether a submission is only put in its queue's line by the thread
+/// that submits it, and prepared and sent by a thread of ours
+/// (`VICTORY_ASYNC_SUBMIT=1`; needs flights and lists cut at their waits,
+/// both defaults).
+///
+/// Why: the profile of run 213 (292 ms a frame) has the title's render
+/// thread inside `queue::execute` for 202 ms of every frame: 155 ms in
+/// `Host::submit` (preparing: the copies of title memory, the write
+/// watch, descriptors, textures; and waiting for flights), while its five
+/// recording threads stand idle 78 % of the time and the card 43 %. The
+/// title's thread does nothing with the result of that work: it only has
+/// to be done before the lists run, in order.
+///
+/// With the switch a submission's lists are taken from the title's lists
+/// (as they already are when the queue holds anything) and put behind
+/// the queue's line; one thread of ours ([`worker`]) runs the line in
+/// order. A signal of the queue goes behind them, as it does behind
+/// anything held. Everything that must see earlier submissions done runs
+/// the line itself first: a present, and every submission of ours that
+/// is waited for ([`before_sync`]).
+///
+/// What it assumes: title memory a submission reads is not rewritten by
+/// the title between its submit call and the moment our thread prepares
+/// it, some milliseconds later. On the console the card reads that
+/// memory when it runs the list, later still, so a title that rewrote it
+/// earlier would be wrong there too.
+#[cfg(windows)]
+pub(crate) fn behind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") && crate::host::late() && cuts();
+        if on {
+            tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)");
+            let _ = std::thread::Builder::new().name("victory-submit".into()).spawn(worker);
+        }
+        on
+    })
+}
+
+/// Whether there is something for [`worker`] to look at.
+#[cfg(windows)]
+static WORK: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+#[cfg(windows)]
+fn wake() {
+    *lock(&WORK.0) = true;
+    WORK.1.notify_one();
+}
+
+/// The thread of [`behind`]: runs what queues hold as far as it is free
+/// to run, each time something was added or a fence moved.
+#[cfg(windows)]
+fn worker() {
+    crate::cores::keep_on_fast_cores("victory-submit");
+    loop {
+        {
+            let mut work = lock(&WORK.0);
+            while !*work {
+                work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
+            }
+            *work = false;
+        }
+        let started = std::time::Instant::now();
+        let (user, kernel) = crate::framelog::thread_times();
+        if crate::framelog::on() {
+            crate::framelog::add(crate::framelog::T::WorkerLooks, 1);
+            if crate::framelog::on_slow_core() {
+                crate::framelog::add(crate::framelog::T::WorkerSlow, 1);
+            }
+        }
+        release_held_now(false);
+        let (user_now, kernel_now) = crate::framelog::thread_times();
+        crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
+        crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// This thread is inside [`release_held_now`].
+    static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Before a submission of ours that is waited for, with [`behind`]: what
+/// the queues hold and is free to run runs first, on this thread, so the
+/// submission keeps its place behind them.
+#[cfg(windows)]
+pub(crate) fn before_sync() {
+    if behind() && !RELEASING_HERE.get() {
+        release_held_now(false);
+    }
+}
+
+#[cfg(windows)]
+fn release_held_now(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
     let _one = lock(&RELEASING);
+    let was_here = RELEASING_HERE.replace(true);
+    struct Leave(bool);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            RELEASING_HERE.set(self.0);
+        }
+    }
+    let _leave = Leave(was_here);
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
+            let line = unsafe { &(*(q as *const Queue)).held };
+            let mut held = lock(line);
             loop {
                 match held.first() {
-                    None => break,
+                    None | Some(Held::Running) => break,
                     Some(&Held::Wait(fence, value))
                         if !all
                             && crate::fence::completed(fence as This) < value
@@ -334,7 +560,7 @@ pub(crate) fn release_held(all: bool) {
                     Some(_) => {}
                 }
                 match held.remove(0) {
-                    Held::Wait(..) => {}
+                    Held::Wait(..) | Held::Running => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
@@ -376,7 +602,20 @@ pub(crate) fn release_held(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            host.execute_late(lists, order);
+                            if behind() && !all {
+                                // The line is open while this part is
+                                // prepared and sent: only this thread takes
+                                // from its head (one releaser at a time).
+                                held.insert(0, Held::Running);
+                                drop(held);
+                                host.execute_late(lists, order);
+                                held = lock(line);
+                                if matches!(held.first(), Some(Held::Running)) {
+                                    held.remove(0);
+                                }
+                            } else {
+                                host.execute_late(lists, order);
+                            }
                         } else {
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
@@ -404,6 +643,27 @@ pub(crate) fn release_held(all: bool) {
                                 );
                             }
                         }
+                    }
+                    Held::Present(texture, state, frame) => {
+                        let show = || {
+                            if let Some(host) = crate::host::host() {
+                                let _ = host.present(&texture, state, frame, None);
+                            }
+                        };
+                        if all {
+                            show();
+                        } else {
+                            // The line is open while the frame is shown,
+                            // as it is while a submission is prepared.
+                            held.insert(0, Held::Running);
+                            drop(held);
+                            show();
+                            held = lock(line);
+                            if matches!(held.first(), Some(Held::Running)) {
+                                held.remove(0);
+                            }
+                        }
+                        PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
                     }
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
@@ -515,7 +775,137 @@ extern "system" fn release(this: This) -> u32 {
 
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
+/// `VICTORY_KICK_MERGE`: the title's submissions held to go to the card as
+/// one (`victory_core::prep::KickMerge`), with when the first was held.
+#[cfg(windows)]
+struct Kicks {
+    plan: victory_core::prep::KickMerge,
+    runs: Vec<(Vec<crate::list::Detached>, Vec<usize>)>,
+    since: Option<std::time::Instant>,
+}
+
+// SAFETY: held host lists only move between threads behind the lock, as
+// `host::Line`'s landed lists do.
+#[cfg(windows)]
+unsafe impl Send for Kicks {}
+
+#[cfg(windows)]
+static KICKS: std::sync::Mutex<Kicks> = std::sync::Mutex::new(Kicks {
+    plan: victory_core::prep::KickMerge { queue: 0, pending: 0, lists: 0 },
+    runs: Vec::new(),
+    since: None,
+});
+
+#[cfg(windows)]
+thread_local! {
+    /// This thread is sending the pending submissions (a flush inside
+    /// that is nothing).
+    static FLUSHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sends the held submissions as one, in their order. The lock is held
+/// while they are sent: a submission made meanwhile waits behind them.
+#[cfg(windows)]
+fn kick_send(kicks: &mut Kicks) {
+    let n = kicks.plan.take();
+    kicks.since = None;
+    if n == 0 {
+        return;
+    }
+    let mut lists = Vec::new();
+    let mut order = Vec::new();
+    for (taken, o) in kicks.runs.drain(..) {
+        let at = lists.len();
+        order.extend(o.into_iter().map(|i| i + at));
+        lists.extend(taken);
+    }
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    crate::host::prof(crate::host::Prof::KicksOut, 1);
+    FLUSHING.with(|f| f.set(true));
+    host.execute_late(lists, order);
+    FLUSHING.with(|f| f.set(false));
+}
+
+/// Sends what [`KICKS`] holds, if anything; true if something was sent.
+#[cfg(windows)]
+pub(crate) fn kick_flush() -> bool {
+    // (Held kicks are sent even after the live switch went off.)
+    if !crate::host::KICK_EVER.load(Ordering::Relaxed) || FLUSHING.with(std::cell::Cell::get) {
+        return false;
+    }
+    let mut kicks = lock(&KICKS);
+    if kicks.plan.pending == 0 {
+        return false;
+    }
+    kick_send(&mut kicks);
+    true
+}
+
+/// A title submission sent ahead (`mergeable`: it runs at once, whole) is
+/// held with the pending ones of its queue, or sent behind them.
+#[cfg(windows)]
+fn kick_offer(
+    host: &crate::host::Host,
+    queue: usize,
+    taken: Vec<crate::list::Detached>,
+    order: Vec<usize>,
+    mergeable: bool,
+) {
+    use victory_core::prep::Kick;
+    kick_watch();
+    crate::host::prof(crate::host::Prof::KicksIn, 1);
+    let mut kicks = lock(&KICKS);
+    match kicks.plan.offer(queue, order.len(), mergeable, crate::host::kick_most()) {
+        Kick::Joined => {
+            kicks.runs.push((taken, order));
+            kicks.since.get_or_insert_with(std::time::Instant::now);
+        }
+        Kick::JoinedFlush => {
+            kicks.runs.push((taken, order));
+            kick_send(&mut kicks);
+        }
+        Kick::FlushThenAlone => {
+            kick_send(&mut kicks);
+            crate::host::prof(crate::host::Prof::KicksOut, 1);
+            FLUSHING.with(|f| f.set(true));
+            host.execute_late(taken, order);
+            FLUSHING.with(|f| f.set(false));
+        }
+    }
+}
+
+/// A thread that sends held submissions after 2 ms with nothing else
+/// coming (`VICTORY_KICK_MERGE`): a title may wait on the CPU for what
+/// they write without a fence or another submission.
+#[cfg(windows)]
+fn kick_watch() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-kicks".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_micros(500));
+            let mut kicks = lock(&KICKS);
+            if kicks.since.is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(2)) {
+                kick_send(&mut kicks);
+            }
+        });
+    });
+}
+
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(windows)]
+    let started = std::time::Instant::now();
+    execute_now(this, count, lists);
+    #[cfg(windows)]
+    {
+        let us = started.elapsed().as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::ExecuteUs, us);
+        crate::framelog::here(crate::framelog::H::ExecuteUs, us);
+    }
+}
+
+fn execute_now(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -527,6 +917,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             submit_cut(this, lists);
             return;
         }
+        // Not joined: the pending submissions go first.
+        kick_flush();
         if waits() && split() && !this.is_null() {
             submit_split(this, lists);
             return;
@@ -616,6 +1008,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    kick_flush();
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -638,6 +1032,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    #[cfg(windows)]
+    kick_flush();
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -751,6 +1147,11 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Frames presented since the start.
+pub(crate) fn frames_presented() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -761,40 +1162,88 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    let presenting = std::time::Instant::now();
+    #[cfg(windows)]
+    kick_flush();
+    let hr = present_now(this, planes, plane_parameters);
+    #[cfg(windows)]
+    {
+        crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
+        crate::framelog::frame();
+    }
+    hr
+}
+
+fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
+    #[cfg(windows)]
+    let presenting = std::time::Instant::now();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Read-back copy-backs old enough are done before the frame goes.
     #[cfg(windows)]
     crate::host::async_present();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::fxprof::frame();
+    #[cfg(windows)]
+    crate::gpuprof::frame();
+    // With `present_behind`: the frame is shown by our thread, behind what
+    // the queue holds, and nothing is run or waited for here.
+    #[cfg(windows)]
+    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
+    #[cfg(not(windows))]
+    let _ = this;
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
-    if crate::host::late() && !crate::host::late_free_present() {
+    if sent_behind {
+    } else if crate::host::late() && !crate::host::late_free_present() {
+        // (With `behind`: what the queues hold runs here first, and what
+        // it sent is settled with the rest.)
+        if behind() {
+            release_held_now(false);
+        }
         crate::host::settle_for_present();
-        release_held(false);
+        release_held_now(false);
         crate::host::settle_for_present();
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
-        release_held(false);
+        release_held_now(false);
     }
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
-    release_held(forces());
+    if !sent_behind {
+        release_held(forces());
+    }
+    #[cfg(windows)]
+    crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if let Some(line) = victory_core::fastboot::frame_presented() {
         tracing::warn!("{line}");
     }
+    // In-session A/B (`VICTORY_AB`): window bookkeeping, and a variant
+    // change here, at the frame boundary, with every flight settled.
+    #[cfg(windows)]
+    crate::ab::presented();
     // The title's frame this flips, for its statistics.
     // SAFETY: the title passes `planes` plane descriptions.
     if planes > 0 && let Some(plane) = unsafe { plane_parameters.as_ref() } {
         crate::frame::flipped(plane.token);
+    }
+    #[cfg(windows)]
+    if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
+        tracing::info!(
+            frame,
+            behind = PRESENTS_BEHIND.load(Ordering::Relaxed),
+            "presents sent behind their queue's line so far (VICTORY_ASYNC_PRESENT=1); the others ran the old way"
+        );
     }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -832,7 +1281,8 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
-    if planes > 0
+    if !sent_behind
+        && planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
         && plane.count > 0
@@ -1007,6 +1457,8 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    #[cfg(windows)]
+    kick_flush();
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };

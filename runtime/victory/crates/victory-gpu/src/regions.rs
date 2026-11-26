@@ -35,6 +35,23 @@ pub(crate) fn fast() -> bool {
     })
 }
 
+/// `VICTORY_COPY_NOQUERY=1` (off by default): a chunk whose mapping is
+/// being changed is waited for ([`wait_still`]) and read by the record,
+/// not through the kernel; and the kernel's sparse read
+/// (`host::read_sparse`) takes its runs from the record ([`sparse_runs`]),
+/// asking `VirtualQuery` only about memory it does not know.
+/// With it on the copy-path line is logged at `warn`.
+pub(crate) fn noquery() -> bool {
+    // Live (`victory_core::live`): flipped at frame boundaries by `VICTORY_AB`.
+    static ON: victory_core::live::Switch = victory_core::live::Switch::new("COPY_NOQUERY", 0);
+    static SAID: std::sync::Once = std::sync::Once::new();
+    let on = ON.on();
+    if on {
+        SAID.call_once(|| tracing::warn!("title memory copies: busy chunks waited for, sparse reads by the record (VICTORY_COPY_NOQUERY=1)"));
+    }
+    on
+}
+
 /// The runtime reserved `[at, at + len)` as a placeholder for physical
 /// pages: holes until it maps views there.
 pub fn title_memory_placeholder(at: usize, len: usize) {
@@ -155,11 +172,73 @@ pub(crate) fn around(at: usize) -> Option<victory_core::memmap::Run> {
 /// them waits that long at most (some milliseconds).
 const CHUNK: usize = 4 << 20;
 
+/// The longest [`wait_still`] waits: a change takes 10-20 us; one that
+/// waits on a read in place the caller itself holds (a texture refresh
+/// holds `title_memory_reading` around its `copy_mapped`) never ends, so
+/// the wait is bounded and polls (`title_memory_reading_now`) instead of
+/// blocking in `title_memory_reading`: no lock is held while it waits, and
+/// no new lock order is made.
+const WAIT_MOST: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// [`noquery`]: `[at, at + len)` held still once the change of its mapping
+/// under way is done; `None` after [`WAIT_MOST`] (the caller reads through
+/// the kernel, as before).
+fn wait_still(at: usize, len: usize) -> Option<crate::watch::Reading> {
+    let begun = std::time::Instant::now();
+    let mut spins = 0u32;
+    let still = loop {
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+        spins += 1;
+        if let Some(r) = crate::watch::title_memory_reading_now(at, len) {
+            break Some(r);
+        }
+        if begun.elapsed() >= WAIT_MOST {
+            break None;
+        }
+    };
+    add(S::WaitUs, begun.elapsed().as_micros() as u64);
+    add(if still.is_some() { S::Waited } else { S::WaitGaveUp }, 1);
+    still
+}
+
+/// [`noquery`]: the record's runs of `[at, at + len)` for the kernel's
+/// sparse read, if it knows any of it (`None`: ask Windows, as before).
+/// Not held still: the runs are a map of where to read, and the read
+/// itself is the kernel's guarded one, as after a `VirtualQuery` (whose
+/// answer was no fresher by the time of the read).
+pub(crate) fn sparse_runs(at: usize, len: usize) -> Option<Vec<victory_core::memmap::Run>> {
+    if !noquery() {
+        return None;
+    }
+    sparse_runs_any(at, len)
+}
+
+/// [`sparse_runs`] whatever the switch.
+pub(crate) fn sparse_runs_any(at: usize, len: usize) -> Option<Vec<victory_core::memmap::Run>> {
+    if !fast() || len == 0 {
+        return None;
+    }
+    let m = map();
+    if m.is_empty() || !m.knows_any(at, len) {
+        return None;
+    }
+    Some(m.runs(at, len, false))
+}
+
 /// Copies title memory `[src, src + len)` into host memory at `dst`: the
 /// mapped runs as they are, zeros for the holes, the rest through `os`
 /// (the kernel's guarded read). False if the record knows nothing of the
 /// range (the caller copies as before).
 pub(crate) fn copy(dst: *mut u8, src: *const u8, len: usize, os: impl Fn(*mut u8, *const u8, usize)) -> bool {
+    copy_by(dst, src, len, os, noquery())
+}
+
+/// [`copy`]; `wait`: busy chunks waited for ([`noquery`]).
+pub(crate) fn copy_by(dst: *mut u8, src: *const u8, len: usize, os: impl Fn(*mut u8, *const u8, usize), wait: bool) -> bool {
     if len == 0 || !fast() {
         return false;
     }
@@ -177,7 +256,13 @@ pub(crate) fn copy(dst: *mut u8, src: *const u8, len: usize, os: impl Fn(*mut u8
         // The runtime changes no mapping of these bytes while they are
         // read (it waits); one under way or waiting: read through the
         // kernel, which tells a hole from a page itself.
-        let Some(_still) = crate::watch::title_memory_reading_now(from, to - from) else {
+        // `VICTORY_COPY_NOQUERY=1`: wait for the change (microseconds)
+        // rather than read 4 MiB region by region through the kernel.
+        let still = match crate::watch::title_memory_reading_now(from, to - from) {
+            None if wait => wait_still(from, to - from),
+            still => still,
+        };
+        let Some(_still) = still else {
             add(S::Busy, 1);
             os(at(from), from as *const u8, to - from);
             add(S::OsBytes, (to - from) as u64);
@@ -288,9 +373,16 @@ pub(crate) enum S {
     /// Ranges given to the prefetch thread, and their bytes.
     Prefetched,
     PrefetchBytes,
+    /// `VICTORY_COPY_NOQUERY`: busy chunks waited for and then read by the
+    /// record, ones given up on ([`WAIT_MOST`]), the microseconds waited;
+    /// `VirtualQuery` calls the sparse read left out (runs the record had).
+    Waited,
+    WaitGaveUp,
+    WaitUs,
+    QueriesSaved,
 }
 
-const COUNTERS: usize = S::PrefetchBytes as usize + 1;
+const COUNTERS: usize = S::QueriesSaved as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(s: S, n: u64) {
@@ -343,11 +435,12 @@ pub(crate) fn tick() {
         let m = map();
         m.generation()
     };
-    tracing::info!(
+    let line = format!(
         "copy path over {secs:.1} s ({}): {} copies by the record in {} runs ({:.1} MB plain, {:.1} MB holes, {:.1} MB through \
          the kernel; {} holes looked at, {} found mapped; {} chunks busy) {:.1} ms; {} copies as before {:.1} MB {:.1} ms; \
          {:.0} MB/s; system calls {} (reads {}, queries {} {:.1} ms, protects {} {:.1} ms, write-watch {}, {} left out); \
-         {} flushes {:.1} ms (longest {:.1} ms), {} page faults in them; {} prefetched {:.1} MB; mapping record changes so far {regions}",
+         {} flushes {:.1} ms (longest {:.1} ms), {} page faults in them; {} prefetched {:.1} MB; mapping record changes so far {regions}; busy chunks waited {} ({} given up) {:.1} ms, \
+         queries avoided {} (VICTORY_COPY_NOQUERY {})",
         if fast() { "fast" } else { "as before" },
         g(S::Copies),
         g(S::Runs),
@@ -376,7 +469,18 @@ pub(crate) fn tick() {
         g(S::FlushFaults),
         g(S::Prefetched),
         mb(g(S::PrefetchBytes)),
+        g(S::Waited),
+        g(S::WaitGaveUp),
+        ms(g(S::WaitUs)),
+        g(S::QueriesSaved),
+        if noquery() { "on" } else { "off" },
     );
+    // Seen at the default `VICTORY_LOG=warn` with the switch on.
+    if noquery() {
+        tracing::warn!(target: "victory_gpu::regions", "{line}");
+    } else {
+        tracing::info!(target: "victory_gpu::regions", "{line}");
+    }
 }
 
 /// Whether views the runtime maps are brought into memory ahead, off the

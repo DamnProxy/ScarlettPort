@@ -26,6 +26,14 @@ pub struct Config {
     pub source: Option<PathBuf>,
     /// `[controls]`: keyboard and mouse bindings, read by `victory-hle`.
     pub controls: Option<toml::Table>,
+    /// `[display]`: window mode and the overlay's graph, read by `overlay`.
+    pub display: Option<toml::Table>,
+    /// `[pace]`: the pacing switches, read by `pace`.
+    pub pace: Option<toml::Table>,
+    /// `[game]`: vibration and the keyboard hints, read by `rumble` and `hints`.
+    pub game: Option<toml::Table>,
+    /// `[upscale]`: the upscaler and frame generation, read by `upscale`.
+    pub upscale: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -34,16 +42,10 @@ struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
     controls: Option<toml::Table>,
-    // Sections the ScarlettPort launcher writes for runtime features this build does not have
-    // yet (its environment variables carry the same settings). Accepted so the file still parses.
-    #[serde(default, rename = "display")]
-    _display: Option<toml::Table>,
-    #[serde(default, rename = "game")]
-    _game: Option<toml::Table>,
-    #[serde(default, rename = "pace")]
-    _pace: Option<toml::Table>,
-    #[serde(default, rename = "upscale")]
-    _upscale: Option<toml::Table>,
+    display: Option<toml::Table>,
+    pace: Option<toml::Table>,
+    game: Option<toml::Table>,
+    upscale: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -85,6 +87,10 @@ impl Config {
         };
         let mut cfg = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
         cfg.controls = parsed.controls;
+        cfg.display = parsed.display;
+        cfg.pace = parsed.pace;
+        cfg.game = parsed.game;
+        cfg.upscale = parsed.upscale;
         Ok(cfg)
     }
 
@@ -113,6 +119,10 @@ impl Config {
             test_titles,
             source,
             controls: None,
+            display: None,
+            pace: None,
+            game: None,
+            upscale: None,
         })
     }
 

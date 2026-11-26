@@ -82,7 +82,7 @@ static UNTHROTTLED: AtomicBool = AtomicBool::new(false);
 /// wait runs unthrottled. When fast boot ends the clock restarts from now,
 /// so the ticks run ahead meanwhile are not slept off.
 fn unthrottled() -> bool {
-    if victory_core::fastboot::active() {
+    if victory_core::fastboot::unthrottled() {
         UNTHROTTLED.store(true, Ordering::Relaxed);
         return true;
     }
@@ -182,6 +182,12 @@ pub(crate) extern "system" fn wait(
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
+    #[cfg(windows)]
+    {
+        let us = wait.min(limit).as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::PaceUs, us);
+        crate::framelog::here(crate::framelog::H::PaceUs, us);
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};
@@ -190,6 +196,12 @@ pub(crate) extern "system" fn wait(
     }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
+        // The frame begins here: wait for swap chain room and the cap now,
+        // so the title reads input as late as it can.
+        #[cfg(windows)]
+        if hr == S_OK {
+            crate::host::frame_start_wait();
+        }
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
         issued(frame);

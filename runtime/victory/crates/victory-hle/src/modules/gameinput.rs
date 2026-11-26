@@ -1,5 +1,5 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3). The keyboard and mouse play as a pad (`controls`): on
+//! (host slots 0-3); with `VICTORY_PAD_PS=1` also Sony pads over HID (`hidpad`).  The keyboard and mouse play as a pad (`controls`): on
 //! the first connected host pad, or on one stand-in gamepad while none is
 //! connected. With `[controls] enabled = false` the stand-in pad is the old
 //! fixed layout (`FALLBACK_BUTTONS`). The keyboard is a device of its own
@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -52,7 +52,7 @@ const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
+const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 /// `VICTORY_PACE_INPUT=1`: a title read finding the host's input older than
 /// this samples it again first, so a frame starts from input as fresh as
@@ -94,6 +94,11 @@ const _: () = assert!(size_of::<KeyState>() == 12);
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
+    /// All host slots at once (a source mixing several kinds of pad sees
+    /// them together).
+    fn pads(&mut self) -> [Option<PadState>; PADS] {
+        std::array::from_fn(|slot| self.pad(slot))
+    }
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
     /// Mouse buttons held down (`controls::MOUSE_BUTTONS`); none while the
@@ -103,6 +108,11 @@ trait Source: Send {
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// All four motors (`victory_core::rumble`). The default drives the main
+    /// two only; the host with a path to the trigger motors overrides it.
+    fn rumble_motors(&mut self, slot: usize, motors: &victory_core::rumble::Motors) {
+        self.rumble(slot, motors.left, motors.right);
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -328,6 +338,8 @@ struct State {
     keys: Vec<KeyState>,
     /// Scripted input as a pad (none when nothing is scripted now).
     script: Option<PadState>,
+    /// A radial dead zone on the host pads' sticks (`[controls] pad_deadzone`).
+    pad_deadzone: f32,
 }
 
 pub struct Hub {
@@ -341,6 +353,12 @@ pub struct Hub {
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
+    /// The settings overlay's changes taken so far (`kbm::live_version`).
+    live_seen: AtomicU64,
+    /// The overlay was open at the last poll, and the mouse was captured
+    /// when it opened (it is captured again when it closes).
+    overlay_was: AtomicBool,
+    restore_capture: AtomicBool,
 }
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -367,6 +385,7 @@ impl Hub {
         settings: super::controls::Settings,
     ) -> &'static Hub {
         cursor::ENABLED.store(settings.enabled && settings.capture, Ordering::Relaxed);
+        let pad_deadzone = settings.pad_deadzone;
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -384,8 +403,12 @@ impl Hub {
                 host_pads: [None; PADS],
                 keys: Vec::new(),
                 script: None,
+                pad_deadzone,
             }),
             returned: Condvar::new(),
+            live_seen: AtomicU64::new(0),
+            overlay_was: AtomicBool::new(false),
+            restore_capture: AtomicBool::new(false),
         }));
         // SAFETY: just allocated and never freed; nothing else sees it yet.
         unsafe {
@@ -439,15 +462,34 @@ impl Hub {
 
     /// Reads the host and records it; the callbacks due.
     fn sample(&self) -> Vec<Event> {
+        self.sample_with(self.overlay_pauses())
+    }
+
+    /// [`Hub::sample`] with the title's input paused or not.
+    fn sample_with(&self, paused: bool) -> Vec<Event> {
         let at = victory_core::pace::now_ns();
-        let (pads, keys, buttons) = {
+        let (mut pads, mut keys, mut buttons) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let pads = source.pads();
             (pads, source.keys(), source.mouse_buttons())
         };
         victory_core::pace::input_sampled(at);
+        // The settings overlay (F1) has the keyboard, the mouse and the
+        // pads while it is open: the title sees every pad at rest and no
+        // key or button down.
+        if paused {
+            for pad in pads.iter_mut().filter(|p| p.is_some()) {
+                *pad = Some(PadState::default());
+            }
+            keys.clear();
+            buttons.clear();
+        }
         {
             let mut state = self.state();
+            let live = super::controls::live_version();
+            if live != self.live_seen.swap(live, Ordering::Relaxed) {
+                state.apply_settings(super::controls::current());
+            }
             let events = state.poll(&self.devices, pads, keys, &buttons, &self.counts);
             if let Some(c) = &mut state.controls
                 && std::mem::take(&mut c.release_cursor)
@@ -456,6 +498,22 @@ impl Hub {
             }
             events
         }
+    }
+
+    /// Whether the settings overlay is open; the mouse is let go while it
+    /// is (its own pointer is drawn) and captured again when it closes, if
+    /// it was captured when it opened.
+    fn overlay_pauses(&self) -> bool {
+        let open = victory_core::overlay::is_open();
+        if open != self.overlay_was.swap(open, Ordering::Relaxed) {
+            if open {
+                self.restore_capture.store(cursor::captured(), Ordering::Relaxed);
+                cursor::release("settings overlay opened");
+            } else if self.restore_capture.swap(false, Ordering::Relaxed) {
+                cursor::capture("settings overlay closed");
+            }
+        }
+        open
     }
 
     /// Runs callbacks, never under our lock: they call back into us. One
@@ -494,6 +552,15 @@ impl Hub {
 }
 
 impl State {
+    /// New settings from the overlay: what the keys and the mouse do, the
+    /// sticks' dead zone.
+    fn apply_settings(&mut self, s: super::controls::Settings) {
+        self.pad_deadzone = s.pad_deadzone;
+        if let Some(c) = &mut self.controls {
+            c.s = s;
+        }
+    }
+
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
@@ -502,6 +569,7 @@ impl State {
         mouse_buttons: &[u8],
         counts: &Counts,
     ) -> Vec<Event> {
+        let pads = pads.map(|p| p.map(|p| p.with_deadzone(self.pad_deadzone)));
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         // Scripted input (auto input, press file, fast boot) is a third
@@ -795,7 +863,11 @@ pub(crate) mod cursor {
     }
 
     pub(crate) fn capture(why: &str) {
-        if ENABLED.load(Ordering::Relaxed) && !CAPTURED.swap(true, Ordering::Relaxed) {
+        // Not while the settings overlay is open: its pointer is the mouse.
+        if ENABLED.load(Ordering::Relaxed)
+            && !victory_core::overlay::is_open()
+            && !CAPTURED.swap(true, Ordering::Relaxed)
+        {
             tracing::info!(why, "mouse cursor captured");
         }
     }
@@ -948,7 +1020,7 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    if victory_core::pace::switches().input
+    if victory_core::pace::live_input()
         && victory_core::pace::now_ns().saturating_sub(victory_core::pace::last_sampled()) >= LATE_SAMPLE_NS
     {
         hub.poll_late();
@@ -1275,24 +1347,24 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; the title sends trigger levels in slot 0x50.
+// The four levels are low frequency, high frequency, left trigger, right
+// trigger (`GameInputRumbleParams`). `victory_core::rumble` scales them
+// (`VICTORY_RUMBLE`, `VICTORY_RUMBLE_STRENGTH`) and maps them to motors;
+// `vibration` carries the trigger motors to Xbox pads.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let params = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let motors = victory_core::rumble::plan(params, &victory_core::rumble::current());
+    lock(&device.hub().source).rumble_motors(device.index, &motors);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1550,6 +1622,10 @@ mod host {
         /// Why focus was last judged lost (for the release log).
         lost: String,
         empty_until: [Option<Instant>; PADS],
+        /// Sony pads over HID (`VICTORY_PAD_PS=1`) and who fills each slot.
+        hid: Option<crate::modules::hidpad::win::Hid>,
+        merger: crate::modules::hidpad::Merger,
+        started: Instant,
         /// Where scripted mouse motion goes (diagnostics).
         #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
         counts: Arc<Counts>,
@@ -1570,6 +1646,10 @@ mod host {
                 no_foreground: None,
                 lost: String::new(),
                 empty_until: [None; PADS],
+                hid: crate::modules::hidpad::enabled(std::env::var("VICTORY_PAD_PS").ok().as_deref())
+                    .then(crate::modules::hidpad::win::Hid::start),
+                merger: Default::default(),
+                started: Instant::now(),
                 counts,
                 was_focused: false,
                 was_captured: false,
@@ -1766,6 +1846,20 @@ mod host {
         if got == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE {
             return;
         }
+        // The settings overlay scrolls its lists with the wheel.
+        if victory_core::overlay::is_open() {
+            // SAFETY: a mouse event, so the mouse member is the one written.
+            let buttons = unsafe { raw.data.mouse.Anonymous.Anonymous };
+            if buttons.usButtonFlags & RI_MOUSE_WHEEL != 0 {
+                *wheel += i32::from(buttons.usButtonData as i16);
+                let steps = *wheel / 120;
+                *wheel -= steps * 120;
+                if steps != 0 {
+                    victory_core::overlay::add_wheel(steps);
+                }
+            }
+            return;
+        }
         if !(cursor::FOCUSED.load(Ordering::Relaxed) && cursor::captured()) {
             *wheel = 0;
             return;
@@ -1787,8 +1881,9 @@ mod host {
         }
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        /// XInput's pad in `slot` (with the scripted keys on slot 0).
+        fn xinput_pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1814,6 +1909,28 @@ mod host {
                 }
             }
             Some(pad)
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            self.pads()[slot]
+        }
+
+        /// XInput pads keep their slots; Sony pads over HID take the others
+        /// (and stay out while XInput already presents them: Steam Input,
+        /// DS4Windows).
+        fn pads(&mut self) -> [Option<PadState>; PADS] {
+            let xinput: [_; PADS] = std::array::from_fn(|slot| self.xinput_pad(slot));
+            let Some(hid) = &self.hid else { return xinput };
+            let now = self.started.elapsed().as_millis() as u64;
+            let pads = self.merger.merge(now, xinput, &hid.snapshot());
+            for slot in 0..PADS {
+                if let crate::modules::hidpad::Owner::Hid(id) = self.merger.owner(slot) {
+                    hid.set_slot(id, Some(slot));
+                }
+            }
+            pads
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1874,12 +1991,21 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            use crate::modules::hidpad::Owner;
+            if let (Owner::Hid(id), Some(hid)) = (self.merger.owner(slot), &self.hid) {
+                hid.rumble(id, low, high);
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+
+        fn rumble_motors(&mut self, slot: usize, motors: &victory_core::rumble::Motors) {
+            crate::modules::vibration::apply(slot, motors);
         }
     }
 
@@ -2334,6 +2460,60 @@ mod tests {
     }
 
     #[test]
+    fn the_title_sees_no_input_while_the_overlay_has_it() {
+        let (hub, host) = fake_kbm();
+        {
+            let mut h = host.lock().unwrap();
+            h.pads[0] = Some(PadState { buttons: A, left_x: 0.8, right_trigger: 1.0, ..Default::default() });
+            h.keys = vec![key(b'W'), key(0x20)];
+            h.buttons = vec![0x01];
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).buttons & A, A, "before: the pad is read");
+        release(r);
+        // The overlay opens: the pad is still connected, at rest; no key is held.
+        let events = hub.sample_with(true);
+        hub.deliver(events);
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r), PadState::default());
+        release(r);
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70);
+        assert_eq!(count(r), 0);
+        release(r);
+        // It closes: input is back at once.
+        let events = hub.sample_with(false);
+        hub.deliver(events);
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        let p = pad(r);
+        assert_eq!((p.buttons & A, p.right_trigger, p.left_y), (A, 1.0, 0.0), "the pad rides on the host pad again");
+        release(r);
+    }
+
+    #[test]
+    fn new_settings_reach_the_keys_and_the_pad_dead_zone() {
+        let (hub, host) = fake_kbm();
+        host.lock().unwrap().pads[0] = Some(PadState { left_x: 0.25, right_x: 0.9, ..Default::default() });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).left_x, 0.25, "no dead zone to start with");
+        release(r);
+        let mut s = super::super::controls::Settings { pad_deadzone: 0.2, ..Default::default() };
+        s.on_foot.rebind(victory_core::kbm::Output::Button(X), None, Some(b'Y'));
+        s.on_foot.rebind(victory_core::kbm::Output::Button(X), Some(0x20), None);
+        hub.state().apply_settings(s);
+        host.lock().unwrap().keys = vec![key(b'Y')];
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        let p = pad(r);
+        assert!((p.left_x - 0.0625).abs() < 1e-6, "the stick near the zone is pulled in: {}", p.left_x);
+        assert!(p.right_x > 0.85 && p.right_x < 0.9, "outside it, rescaled: {}", p.right_x);
+        assert_eq!(p.buttons & X, X, "Y is jump now");
+        release(r);
+    }
+
+    #[test]
     fn keyboard_and_mouse_drive_the_stand_in_pad_without_a_host_pad() {
         let (hub, host) = fake_kbm();
         {
@@ -2504,6 +2684,6 @@ mod tests {
         rumble(device, &[0.5, 1.0, 1.0, 1.0]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        assert_eq!(host.lock().unwrap().rumble, [(2, 32768, 65535), (2, 0, 0)]);
     }
 }

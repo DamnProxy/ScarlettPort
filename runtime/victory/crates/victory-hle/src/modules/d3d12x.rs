@@ -21,7 +21,7 @@ extern "system" fn create_device(
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     victory_gpu::use_title_memory(super::xmem::title_own_bytes);
     victory_gpu::use_cpu_free(super::xmem::cpu_free);
-    if super::xmem::pagemap_runs() {
+    if super::xmem::pagemap_runs() || super::xmem::remap_lazy() {
         victory_gpu::resource::use_page_batch_mapper(super::xmem::map_alias_batch);
     }
     #[cfg(windows)]
@@ -39,6 +39,19 @@ fn host_gpu_failed(what: &str) -> ! {
     // SAFETY: ends our own process.
     unsafe { TerminateProcess(GetCurrentProcess(), DXGI_ERROR_DEVICE_REMOVED) };
     unreachable!("the process has ended")
+}
+
+/// The offline warm-up: see `victory_gpu::shader_cache::warm`.
+pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::warm(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no shader cache on this host".into())
+    }
 }
 
 /// Keeps the host's translations of the title's shaders in `dir` (a
@@ -62,7 +75,7 @@ pub fn use_shader_pack(archive: std::path::PathBuf, index: std::path::PathBuf) {
 }
 
 #[cfg(windows)]
-pub use victory_gpu::pipeline::{pipeline_counts, precompile_graphics, save_pipeline_cache, warm};
+pub use victory_gpu::pipeline::{pipeline_counts, precompile_graphics, prewarm, save_pipeline_cache, warm};
 #[cfg(windows)]
 pub use victory_gpu::shader_cache::{Report as ShaderCacheReport, report as shader_cache_report, set_revalidation};
 

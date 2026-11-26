@@ -190,6 +190,8 @@ fn with_state_how(
     f(list, &mut state);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
+    #[cfg(feature = "diagnostics")]
+    crate::fxprof::seen(crate::fxprof::Seen::Record);
 }
 
 /// The title records something on its list outside [`with_state`] (a copy,
@@ -335,7 +337,12 @@ fn idle_limits() -> (usize, u64) {
     static LIMITS: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(8, usize::from);
-        idle_most(crate::total_system_ram_bytes(), cores)
+        // Lists: at least 512 (fxceless f85101b, since its run 221: with
+        // submissions prepared by a thread of ours the title has its lists
+        // back at once and resets them while the flights of the frame
+        // before are still in the air, so more than 128 are out at a time).
+        let (lists, bytes) = idle_most(crate::total_system_ram_bytes(), cores);
+        (lists.max(512), bytes)
     })
 }
 
@@ -420,6 +427,9 @@ fn cut(this: This, wait: ValueWait) {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    // The clamps hoisted so far stand before the wait, as the draws
+    // recorded before it do; draws after it get clamps of their own.
+    end_hoist(list);
     let Some(current) = list.host.as_ref() else {
         return;
     };
@@ -450,6 +460,61 @@ fn cut(this: This, wait: ValueWait) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .replay(host);
+    }
+}
+
+/// The list of hoisted clamps of list `list`, if one is open: closed, and
+/// kept as the part before the host list that draws.
+#[cfg(windows)]
+fn end_hoist(list: &mut List) {
+    let ended = list.state.lock().unwrap_or_else(|e| e.into_inner()).end_hoist();
+    if let Some(h) = ended {
+        list.earlier.push(Part { waits: h.waits, host: h.clamps });
+    }
+}
+
+/// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
+/// of the list's draws already go to a list before it and nothing since may
+/// have written arguments, the recording is cut here; a list for the clamps
+/// of the draws to come follows what was recorded, and the recording goes
+/// on in another list after it, with the state the title set. A run of
+/// draws is then not interleaved with our dispatches and barriers.
+#[cfg(windows)]
+fn hoist(this: This) {
+    if this.is_null() || !crate::indirect::hoisting() {
+        return;
+    }
+    // SAFETY: one of our lists; the title uses it on one thread at a time,
+    // and no reference to the host list is in use here.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    {
+        let Some(current) = list.host.as_ref() else { return };
+        if list.state.lock().unwrap_or_else(|e| e.into_inner()).hoists_into(current) {
+            return;
+        }
+    }
+    end_hoist(list);
+    let Some(next) = fresh_list() else { return };
+    let busy = list.host.as_ref().is_some_and(|h| !h.untouched());
+    // What was recorded keeps its place; with no work in it, it holds the
+    // clamps itself (the state set in it does them no harm), behind the
+    // waits that stood before it.
+    let (clamps, waits) = if busy {
+        let Some(clamps) = fresh_list() else { return };
+        if let Some(old) = list.host.replace(next) {
+            old.close();
+            let waits = std::mem::take(&mut list.gate);
+            list.earlier.push(Part { waits, host: old });
+        }
+        (clamps, Vec::new())
+    } else {
+        let Some(old) = list.host.replace(next) else { return };
+        (old, std::mem::take(&mut list.gate))
+    };
+    if let Some(next) = list.host.as_ref() {
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.replay(next);
+        state.hoist(clamps, waits, next);
     }
 }
 
@@ -735,6 +800,12 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    #[cfg(windows)]
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists, and records nothing
+        // into it while it closes.
+        end_hoist(unsafe { &mut *this.cast_mut().cast::<List>() });
+    }
     #[cfg(windows)]
     if let Some(host) = host_list_rec(this) {
         host.close();
@@ -1045,6 +1116,77 @@ pub fn upscale_stretch(
     done
 }
 
+/// The title textures of an upscale dispatch (`victory_hle::modules::ffx`).
+#[cfg(windows)]
+pub struct UpscaleTextures {
+    pub colour: *const std::ffi::c_void,
+    pub depth: *const std::ffi::c_void,
+    pub motion: *const std::ffi::c_void,
+    pub exposure: *const std::ffi::c_void,
+    pub reactive: *const std::ffi::c_void,
+    pub composition: *const std::ffi::c_void,
+    pub output: *const std::ffi::c_void,
+}
+
+/// Answers the console upscaler's dispatch on title list `this` with FSR 3
+/// on the host ([`crate::fsr`]): the title's textures and numbers, our
+/// copies of the textures. False if nothing was recorded (no FidelityFX
+/// DLL, textures we do not hold, a refused dispatch): the caller stretches.
+#[cfg(windows)]
+pub fn upscale_fsr(
+    this: *const std::ffi::c_void,
+    t: &UpscaleTextures,
+    params: &victory_core::upscale::TitleParams,
+) -> bool {
+    const SHADER_READ: u32 = 0x40;
+    const UNORDERED: u32 = 0x8;
+    if !crate::fsr::available() {
+        return false;
+    }
+    let this: This = this.cast();
+    let cast = |p: *const std::ffi::c_void| -> This { p.cast() };
+    let (colour, output) = (cast(t.colour), cast(t.output));
+    if this.is_null() || colour.is_null() || output.is_null() {
+        return false;
+    }
+    let optional = [t.depth, t.motion, t.exposure, t.reactive, t.composition].map(cast);
+    let mut done = false;
+    with_state(this, |list, state| {
+        let (Some(to), Some(from), Some(host)) = (
+            crate::resource::host_resource(output),
+            crate::resource::host_resource(colour),
+            crate::host::host(),
+        ) else {
+            return;
+        };
+        let held = optional.map(|r| if r.is_null() { None } else { crate::resource::host_resource(r) });
+        ensure_state(list, colour, SHADER_READ);
+        for (r, h) in optional.iter().zip(&held) {
+            if h.is_some() {
+                ensure_state(list, *r, SHADER_READ);
+            }
+        }
+        ensure_state(list, output, UNORDERED);
+        let inputs = crate::fsr::Inputs {
+            colour: from,
+            depth: held[0],
+            motion: held[1],
+            exposure: held[2],
+            reactive: held[3],
+            composition: held[4],
+            output: to,
+        };
+        done = crate::fsr::record(&host.device, &list.list, &inputs, params);
+        if done {
+            crate::texture::host_written(output);
+            list.uav_work(true);
+        }
+        // FSR leaves its own heaps, root signature and pipeline set.
+        state.replay(list);
+    });
+    done
+}
+
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
@@ -1109,6 +1251,11 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// Copies left out because both sides were one host texture
+/// ([`copy_resource`], [`copy_texture_region`]), since the start.
+#[cfg(windows)]
+pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -1122,6 +1269,17 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if unlike(dst, src) {
                 return;
             }
+            // Two title textures over the same memory have one host
+            // texture between them: the copy would be of that texture onto
+            // itself, which the host does not allow, and it would change
+            // nothing. It was recorded all the same, with the texture left
+            // in the source state as the copy's destination (run 205's
+            // debug layer: "CopyResource with its destination in the
+            // COPY_SOURCE state", 37 times, a 2560x1440 depth texture).
+            // Only the two state changes and the copy are left out: what
+            // is noted of the textures stays as it was. After
+            // triippywhale 6e502b3b.
+            let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {
@@ -1130,11 +1288,27 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
+            // A destination made level by level gets its levels' memory
+            // ahead of this list (`crate::tiles`).
+            crate::texture::card_writes(list, dst, to, None);
+            crate::texture::host_written(dst);
+            if same {
+                SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        ?dst,
+                        ?src,
+                        "a copy between two title textures that share one host texture is left out: the first one"
+                    );
+                });
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            list.count_write();
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -1225,6 +1399,8 @@ extern "system" fn copy_texture_region(
             return;
         }
         let mut from = src;
+        // Both sides are the same subresource of one host texture (set below).
+        let mut same = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -1253,18 +1429,37 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            // The same subresource of one host texture on both sides (two
+            // title textures over one memory): not a copy the host allows.
+            // The states and the copy are left out below; the rest is
+            // noted as before.
+            same = texture.as_raw() == to.as_raw()
+                && src.kind != FOOTPRINT
+                && dst.kind != FOOTPRINT
+                && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            if !same {
+                ensure_state(list, src.resource, COPY_SOURCE);
+            }
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
-        ensure_state(list, dst.resource, COPY_DEST);
+        // A destination made level by level gets the level's memory ahead
+        // of this list (`crate::tiles`): the title's bake copies each level
+        // of its result into a block-compressed texture of that kind, and
+        // a copy into a level without memory is dropped.
+        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
+        if same {
+            SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -1416,6 +1611,8 @@ extern "system" fn resolve(
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
+        // As for a copy (`crate::tiles`).
+        crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1969,6 +2166,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if kind != DISPATCH {
+            hoist(this);
+        }
         with_state_indirect(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -2394,13 +2594,16 @@ fn value_written(this: This, address: u64, value: u64) {
         // SAFETY: the title passes one of our lists; a list is recorded by
         // one thread at a time and is not submitted while it records.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(current) = list.host.as_ref() else {
+        if list.host.is_none() {
             return;
-        };
+        }
         let Some(fresh) = fresh_list() else {
             return;
         };
-        current.close();
+        end_hoist(list);
+        if let Some(current) = list.host.as_ref() {
+            current.close();
+        }
         if let Some(done) = list.host.replace(fresh) {
             // The part so far keeps its waits; nothing stands before the
             // next one but this part itself.

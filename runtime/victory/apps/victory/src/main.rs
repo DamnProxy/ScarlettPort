@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prewarm;
 mod run;
 mod saves;
 mod shader;
@@ -101,6 +102,13 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Warm the run's shader cache: a file of shader hashes (the 16
+        /// hex digits a run's log names a shader by, anywhere in a line);
+        /// the containers with those hashes are translated into the
+        /// cache and nothing else is done. Set `VICTORY_HOST_MAX_WAVE` and
+        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
+        #[arg(long)]
+        warm: Option<PathBuf>,
     },
     /// Translate the shaders of a title's archives into the cache and make
     /// their compute pipelines, so that a run finds them there.
@@ -144,6 +152,12 @@ enum Command {
         #[arg(long)]
         mesh: bool,
     },
+    /// First-boot prewarm: a manifest (hashes only) of what a warm cache holds, and making it
+    /// into this machine's caches from its own game files.
+    Prewarm {
+        #[command(subcommand)]
+        action: Prewarm,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -173,6 +187,40 @@ enum Command {
         title: Option<String>,
         #[command(subcommand)]
         action: saves::Saves,
+    },
+}
+
+#[derive(Subcommand)]
+enum Prewarm {
+    /// Write the manifest of the configured cache (it must be warm): the hashes of the
+    /// containers of the game files it holds translations of, and the pipeline keys its runs
+    /// asked for. Needs the host GPU the cache was warmed on (the keys depend on it).
+    Manifest {
+        /// Game files (default: the configured game folder's shaders.rpf).
+        paths: Vec<PathBuf>,
+        #[arg(long, short)]
+        out: PathBuf,
+        /// Worker threads (default: every logical core but one).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// The cache was warmed by fx-cand, whose key names only its eight switches (fx-cand2
+        /// names every switch of the translator, so it finds none of those entries).
+        #[arg(long)]
+        cand_key: bool,
+    },
+    /// Translate and compile what the manifest lists into the configured cache, at background
+    /// priority; prints `PREWARM <phase> <done> <total>`. Stopping it keeps what was done.
+    Run {
+        /// Game files (default: the configured game folder's shaders.rpf).
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Worker threads (default: every logical core but one).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Make nothing: say what share of the manifest the next boot finds in the caches.
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -220,14 +268,17 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
+            warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
-                victory_shader::emit::set_host_max_wave(n);
+            // `VICTORY_HOST_MAX_WAVE=32`: one name, read in one place (`translate::apply_host_max_wave`),
+            // for the warm-up and the walk alike (adapted from Zettrox/ztrx#120)
+            translate::apply_host_max_wave();
+            if let Some(file) = warm {
+                return translate::warm_listed(paths, &file, jobs);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
@@ -245,6 +296,10 @@ fn main() -> Result<()> {
             incremental,
             verify_all,
         } => translate::warm(paths, jobs, !no_pipelines, incremental, verify_all),
+        Command::Prewarm { action } => match action {
+            Prewarm::Manifest { paths, out, jobs, cand_key } => prewarm::manifest(paths, &out, jobs, cand_key),
+            Prewarm::Run { paths, manifest, jobs, check } => prewarm::run(paths, &manifest, jobs, check),
+        },
         Command::Run {
             exe,
             unimplemented,

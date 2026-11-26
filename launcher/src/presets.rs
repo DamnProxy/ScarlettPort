@@ -9,7 +9,7 @@ pub const CUSTOM: &str = "custom";
 pub const ALL: [&str; 3] = [STABLE, EXPERIMENTAL, CUSTOM];
 
 /// The runtime build the bundled runtime folder is made from (see the repository's runtime/).
-pub const BUNDLED_BUILD: &str = "fx-cand bce072d";
+pub const BUNDLED_BUILD: &str = "fx-cand4 efcc7b9";
 /// The build the Experimental switches were merged into (fx-cand2); older builds ignore them.
 pub const EXPERIMENTAL_BUILD: &str = "fx-cand2";
 
@@ -24,6 +24,15 @@ pub const C1: [&str; 9] = [
     "VICTORY_PREP_BARRIERS",
     "VICTORY_PREP_TABLES",
     "VICTORY_PREP_REUSE",
+];
+
+/// fx-cand4 additions to Stable: lazy remapping and sub-page memory (the yard stutter fix), copies
+/// without the extra query, and a 4 GB card-buffer pool. Fast boot stays optional (not set here).
+pub const CAND4: [(&str, &str); 4] = [
+    ("VICTORY_REMAP_LAZY", "1"),
+    ("VICTORY_MEM_SUBPAGE", "1"),
+    ("VICTORY_COPY_NOQUERY", "1"),
+    ("VICTORY_CARD_BUFFERS_MB", "4096"),
 ];
 
 /// Variables play.ps1 clears before a plain run (so nothing left in the launcher's own
@@ -65,7 +74,7 @@ pub fn blurb(preset: &str) -> &'static str {
     match preset {
         EXPERIMENTAL => "C1 plus the safe fx-cand2 switches (indirect window and keep, tabled skip frames). Own cache.",
         CUSTOM => "Your World options from Settings (ray tracing, stand-in light, debug view).",
-        _ => "The verified C1 setup: Series S profile, the game's upscaler, precise syncs, the speed switches.",
+        _ => "The verified fx-cand4 setup: precise syncs, the speed switches, lazy remap, sub-page memory, copy cuts.",
     }
 }
 
@@ -85,6 +94,7 @@ pub fn stable_env(game: &Path, victory_cache: &Path) -> Vec<(&'static str, Strin
         ("VICTORY_READ_SETTLE_PRECISE", "1".to_string()),
     ];
     v.extend(C1.iter().map(|k| (*k, "1".to_string())));
+    v.extend(CAND4.iter().map(|(k, x)| (*k, x.to_string())));
     v
 }
 
@@ -123,7 +133,7 @@ mod tests {
     #[test]
     fn stable_matches_play_ps1() {
         let e = stable_env(Path::new("D:/dump"), Path::new("F:/c"));
-        assert_eq!(e.len(), 10 + 9);
+        assert_eq!(e.len(), 10 + 9 + 4);
         for (k, v) in [
             ("VICTORY_SAVE_SLOT", "default"),
             ("VICTORY_OWN_UPSCALER", "1"),
@@ -139,6 +149,10 @@ mod tests {
         for k in C1 {
             assert_eq!(get(&e, k).as_deref(), Some("1"), "{k}");
         }
+        for (k, v) in CAND4 {
+            assert_eq!(get(&e, k).as_deref(), Some(v), "{k}");
+        }
+        assert!(get(&e, "VICTORY_FAST_BOOT").is_none());
         for k in CLEARED {
             assert!(get(&e, k).is_none());
         }
