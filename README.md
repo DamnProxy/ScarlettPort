@@ -238,7 +238,7 @@ ScarlettPort/
 │   ├── xcl/          XCL (ivall/xcl) with our changes: console OS layer, D3D12.X, RDNA2 -> HLSL -> DXIL
 │   └── victory/      VIctory-based runtime: fxceless/victory-fork + merged community work + our changes (see SCARLETTPORT.md)
 ├── launcher/         native launcher (Rust, egui); runs the engines from a runtime\ folder beside it
-├── patches/          our changes to each runtime as plain diffs (xcl-stack.patch, victory-stack.patch)
+├── patches/          our changes to each runtime as plain diffs (xcl-stack.patch, victory-stack-*.patch)
 ├── docs/             STATUS, RUNTIMES, BUILDING, ROADMAP, FAQ, TROUBLESHOOTING
 ├── assets/           screenshots
 └── LICENSE.md        licensing overview
