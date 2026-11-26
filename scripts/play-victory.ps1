@@ -1,7 +1,7 @@
 # Launches a title on the VIctory-based runtime from your own dump (you need your own legally
 # obtained copy; nothing is included in this repository).
 # Usage: .\scripts\play-victory.ps1 -Game "D:\path\to\dump" [-AutoInput] [-Console series-s|series-x]
-#          [-NoOwnUpscaler] [-KeepWatchdog] [-FastBoot] [-SaveSlot name] [-Precompile] [-SkipPrecompile]
+#          [-NoOwnUpscaler] [-KeepWatchdog] [-FastBoot] [-RayTracing] [-SaveSlot name] [-Precompile] [-SkipPrecompile]
 #
 # Environment it sets (you can also set these by hand before running the exe):
 #   VICTORY_GAME_DIR       the dump folder
@@ -17,6 +17,7 @@
 #   VICTORY_RELAY=2        submission relay, form 2 (needed by the two settings above)
 #   VICTORY_PIPELINE_WAIT_MS=0  do not hold a draw back waiting for a pipeline build
 #   VICTORY_FAST_BOOT=1    with -FastBoot: press through logos and menus (testing only)
+#   VICTORY_RAYTRACING=1   with -RayTracing: the title's ray-traced lighting, for that launch only
 #   VICTORY_SAVE_SLOT      with -SaveSlot: pick a save slot by name
 #   VICTORY_AUTO_INPUT=1   with -AutoInput: press A on a timer so menus advance without a pad
 #   VICTORY_PRESS_FILE     press.txt in the repo root: write button names ("A", "DOWN DOWN A") to press them
@@ -32,6 +33,8 @@ param(
     [switch]$KeepWatchdog,
     # Testing only: VICTORY_FAST_BOOT=1.
     [switch]$FastBoot,
+    # Run the title's ray-traced lighting passes with its software BVH traversal.
+    [switch]$RayTracing,
     # Save slot name (VICTORY_SAVE_SLOT).
     [string]$SaveSlot = '',
     # Run `victory precompile-graphics` even if it already ran once.
@@ -93,5 +96,14 @@ Write-Host "Starting on the $Console profile... log: $log" -ForegroundColor Cyan
 # Windows PowerShell 5.1 turns a native program's stderr into a terminating error under 'Stop'
 # when it is redirected, which would kill the run on the first log line.
 $ErrorActionPreference = 'Continue'
-& $vic run $exe --execute --console $Console *> $log
+# For this launch only: PowerShell's environment belongs to the whole session, so a plain launch
+# after one with -RayTracing in the same window would still run with ray tracing. A value set by
+# hand before running the script is kept when the switch is left out.
+$rayTracingBefore = $env:VICTORY_RAYTRACING
+if ($RayTracing) { $env:VICTORY_RAYTRACING = '1' }
+try {
+    & $vic run $exe --execute --console $Console *> $log
+} finally {
+    $env:VICTORY_RAYTRACING = $rayTracingBefore
+}
 exit $LASTEXITCODE

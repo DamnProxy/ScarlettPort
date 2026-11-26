@@ -13,7 +13,11 @@
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
 //! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! runs only once and whose pipeline takes longer is lost, unless it is
+//! known to run once ([`ScreenPass::Once`]: the lighting tables, the
+//! decoration bakes of characters' heads and their block compression),
+//! which is waited for up to 12 s whatever the budget while screen workers
+//! are on ([`screen_workers`]).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -22,6 +26,17 @@ use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline, TargetFormats};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScreenPass {
+    None,
+    Other,
+    /// A pass the title records once and keeps the output of: dropped, the
+    /// output stays empty for the rest of the run. Waited for even when play
+    /// skips other pending pipelines (`VICTORY_PIPELINE_WAIT_MS=0`), unless
+    /// screen workers are off ([`screen_workers`]).
+    Once,
+}
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -40,9 +55,8 @@ pub(crate) struct Pending {
     /// ([`for_formats`]): a chain from the title's pipeline, one link per
     /// set of formats met, never shortened.
     variant: OnceLock<Arc<Pending>>,
-    /// A pass over the screen ([`GraphicsState::screen_pass`]) with
-    /// [`screen_workers`] on.
-    screen: bool,
+    /// A lighting table, or another screen pass given its own compilation budget.
+    screen: ScreenPass,
     /// The first title frame a recording thread waited for this pipeline in
     /// (`u64::MAX`: never), for [`wait_once`].
     waited_frame: AtomicU64,
@@ -92,8 +106,34 @@ fn too_dear(shaders: &[Arc<Shader>]) -> bool {
 fn without_structures(shaders: &[Arc<Shader>]) -> bool {
     static MADE: OnceLock<bool> = OnceLock::new();
     let on = |name| std::env::var_os(name).is_some_and(|v| v == "1");
-    let made = *MADE.get_or_init(|| on("VICTORY_RT_RESOLVE") || on("VICTORY_BVH_BUILDER"));
+    let made = *MADE.get_or_init(|| on("VICTORY_RT_RESOLVE") || super::builder_requested());
     !made && named(shaders, b"CS_RaytracingResolve")
+}
+
+/// What kind of pass a pipeline of `shaders` and the state `graphics`
+/// makes. With screen workers off (`workers`, [`screen_workers`]) none is
+/// a screen pass or a pass run once: all are queued and waited for alike,
+/// as before either existed.
+fn screen_pass(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>, workers: bool) -> ScreenPass {
+    if !workers {
+        return ScreenPass::None;
+    }
+    // The six draws that build the environment BRDF, area-light and scattering tables
+    // share this vertex program. The title records them once when it enters the world.
+    const LIGHT_TABLE_VERTEX: &str = "ce57291b5a1750ca";
+    let light_table = shaders.iter().any(|s| s.stage == "vertex" && s.hash == LIGHT_TABLE_VERTEX);
+    // A character's head textures are baked once when the title makes the character,
+    // during the load screen while hundreds of pipelines are queued. With these passes
+    // dropped, the heads of the cell's characters drew as nothing for the whole run (the
+    // eyes and teeth floated). In ten earlier runs the first decoration bake and the
+    // first BC3 compression were dropped in every one.
+    if light_table || shaders.iter().any(|s| s.bakes()) {
+        ScreenPass::Once
+    } else if graphics.is_some_and(|g| g.screen_pass()) {
+        ScreenPass::Other
+    } else {
+        ScreenPass::None
+    }
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -116,7 +156,7 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         let left_out = left_out(&shaders);
-        let screen = screen_workers() && graphics.as_ref().is_some_and(|g| g.screen_pass());
+        let screen = screen_pass(&shaders, graphics.as_deref(), screen_workers());
         Pending {
             screen,
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
@@ -195,7 +235,7 @@ fn slow(p: &Pending) -> bool {
     // A screen pass ([`screen_workers`]) is waited for up to its own
     // budget: given up on at 3 s, a lighting-table pass was still dropped
     // (Marvisak #2433).
-    let most = if p.screen { SCREEN_BUDGET.as_secs() } else if p.computes() { 10 } else { 3 };
+    let most = if p.screen != ScreenPass::None { SCREEN_BUDGET.as_secs() } else if p.computes() { 10 } else { 3 };
     p.begun.get().is_some_and(|at| at.elapsed() > Duration::from_secs(most))
 }
 
@@ -245,11 +285,27 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         let frame = crate::frame::current();
+        let asked = Instant::now();
         if !wait_once() || waits_in(p, frame) {
             wait(p, frame);
         }
+        if p.screen == ScreenPass::Once {
+            once_waited(p, asked.elapsed());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// How a pass the title runs once fared when its pipeline was not made at
+/// its use: made within the wait, or dropped (its table or texture then
+/// stays empty for the rest of the run).
+fn once_waited(p: &Pending, waited: Duration) {
+    let ms = waited.as_millis() as u64;
+    match p.made.get() {
+        Some(Some(_)) => tracing::info!(ms, pipeline = ?p.shaders, "a pass the title runs once waited for its pipeline"),
+        Some(None) => tracing::warn!(pipeline = ?p.shaders, "a pass the title runs once has no host pipeline: dropped"),
+        None => tracing::warn!(ms, pipeline = ?p.shaders, "a pass the title runs once was dropped: its pipeline was not made in time"),
+    }
 }
 
 /// Whether a pipeline not made yet is waited for in one title frame at most
@@ -384,25 +440,47 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+fn frame_wait_budget(ordinary: Duration, loading: Duration, compute: bool, screen: ScreenPass) -> Duration {
+    if ordinary.is_zero() && screen != ScreenPass::Once {
+        return Duration::ZERO;
+    }
+    if screen != ScreenPass::None { return SCREEN_BUDGET; }
+    let startup = if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME };
+    ordinary.max(startup.min(loading))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
-    if budget.is_zero() || slow(p) {
-        return;
-    }
     // What was waited past the budget since the start, in milliseconds; the
     // second of each is the compute pipelines'.
     static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let compute = p.computes();
     let past_total = &LOADINGS[usize::from(compute)];
     let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
-    let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
-    // Screen passes: a budget of their own, longer (`screen_workers`).
-    let budget = if p.screen { SCREEN_BUDGET } else { budget };
+    let budget = frame_wait_budget(wait_budget(), loading, compute, p.screen);
+    if budget.is_zero() || slow(p) {
+        return;
+    }
+    let started = Instant::now();
+    let waited = if p.screen == ScreenPass::None {
+        wait_ordinary(p, frame, budget, compute)
+    } else {
+        static SCREEN: Mutex<Overlap> = Mutex::new(Overlap::NONE);
+        wait_overlapping(p, frame, budget, &SCREEN)
+    };
+    let Some(waited) = waited else { return };
+    let past = waited.saturating_sub(wait_budget());
+    past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
+    note_wait(started);
+}
+
+/// [`wait`] for an ordinary pipeline (`compute` or graphics), within what
+/// the frame has left of `budget`; how long it waited, if it did.
+fn wait_ordinary(p: &Pending, frame: u64, budget: Duration, compute: bool) -> Option<Duration> {
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENTS: [Mutex<(u64, Duration)>; 3] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 3];
-    let frame_spent = &SPENTS[if p.screen { 2 } else { usize::from(compute) }];
+    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let frame_spent = &SPENTS[usize::from(compute)];
     let shared = shared_budget();
     let left = {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
@@ -416,13 +494,45 @@ fn wait(p: &Pending, frame: u64) {
         left
     };
     if left.is_zero() {
-        return;
+        return None;
     }
     let started = Instant::now();
+    wait_until(p, started + left);
+    let waited = started.elapsed().min(left);
+    let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
+    // A frame that began meanwhile has its own budget.
+    if spent.0 == frame {
+        if shared {
+            spent.1 = spent.1.saturating_sub(left - waited);
+        } else {
+            spent.1 += waited;
+        }
+    }
+    Some(waited)
+}
+
+/// [`wait`] for a screen pass or a pass run once: until the deadline of the
+/// waits of frame `frame` that overlap it ([`Overlap`]); how long it waited,
+/// if it did. Reserved whole, the budget went to the first recording thread
+/// that waited, and a second thread waiting for another such pass in the
+/// same frame got nothing: that pass was dropped for good even when its
+/// pipeline was made a moment later.
+fn wait_overlapping(p: &Pending, frame: u64, budget: Duration, waits: &Mutex<Overlap>) -> Option<Duration> {
+    let started = Instant::now();
+    let deadline = waits.lock().unwrap_or_else(|e| e.into_inner()).begin(frame, budget, started)?;
+    wait_until(p, deadline);
+    let now = Instant::now();
+    waits.lock().unwrap_or_else(|e| e.into_inner()).end(frame, now);
+    Some(now.saturating_duration_since(started))
+}
+
+/// Waits until `p` is made, has become a slow one ([`slow`]), or
+/// `deadline` has passed.
+fn wait_until(p: &Pending, deadline: Instant) {
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !slow(p) {
-        let rest = left.saturating_sub(started.elapsed());
+        let rest = deadline.saturating_duration_since(Instant::now());
         if rest.is_zero() {
             break;
         }
@@ -430,21 +540,59 @@ fn wait(p: &Pending, frame: u64) {
         let rest = rest.min(Duration::from_millis(250));
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    drop(held);
-    let waited = started.elapsed().min(left);
-    let past = waited.saturating_sub(wait_budget());
-    past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
-    {
-        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
-        // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
+}
+
+/// The waits of one title frame that share a budget by the clock: waits
+/// that overlap count once, so recording threads waiting at the same time
+/// all wait until the same deadline, and successive waits add up to the
+/// budget at most.
+struct Overlap {
+    frame: u64,
+    /// Time of the frame's waits that have all ended.
+    spent: Duration,
+    /// Waits under way, and since when one has been.
+    waiting: u32,
+    since: Option<Instant>,
+}
+
+impl Overlap {
+    const NONE: Overlap = Overlap { frame: u64::MAX, spent: Duration::ZERO, waiting: 0, since: None };
+
+    /// A wait of frame `frame` begins at `now`: its deadline (that of every
+    /// wait it overlaps), or `None` if `budget` is used up.
+    fn begin(&mut self, frame: u64, budget: Duration, now: Instant) -> Option<Instant> {
+        if self.frame != frame {
+            *self = Overlap { frame, ..Overlap::NONE };
+        }
+        let running = self.since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+        let left = budget.saturating_sub(self.spent + running);
+        if left.is_zero() {
+            return None;
+        }
+        if self.waiting == 0 {
+            self.since = Some(now);
+        }
+        self.waiting += 1;
+        Some(now + left)
+    }
+
+    /// A wait begun in frame `frame` ends at `now` (one of a frame that
+    /// has since ended counts for nothing).
+    fn end(&mut self, frame: u64, now: Instant) {
+        if self.frame != frame || self.waiting == 0 {
+            return;
+        }
+        self.waiting -= 1;
+        if self.waiting == 0
+            && let Some(since) = self.since.take()
+        {
+            self.spent += now.saturating_duration_since(since);
         }
     }
+}
+
+/// Sends the time a wait took to the frame lines.
+fn note_wait(started: Instant) {
     crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
@@ -483,7 +631,7 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && p.screen {
+        if priority == REQUESTED && p.screen != ScreenPass::None {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
@@ -624,9 +772,10 @@ fn next_screen() -> Arc<Pending> {
     }
 }
 
-/// Whether passes over the screen (no vertex input, no depth or stencil)
-/// have workers and a wait budget of their own (on by default;
-/// `VICTORY_SCREEN_WORKERS=0`: off, as before). Belobug 18e57db: the title fills its lighting tables
+/// Whether passes over the screen (no vertex input, no depth or stencil),
+/// and passes the title runs once ([`ScreenPass::Once`]), have workers and
+/// a wait budget of their own (on by default; `VICTORY_SCREEN_WORKERS=0`:
+/// off, as before: they are queued and waited for as any other). Belobug 18e57db: the title fills its lighting tables
 /// (PS_IntegrateEnvBRDF*, PS_AreaLightIlluminance) with draws it makes
 /// once, at the world's first frame; behind a world's worth of pipelines
 /// they waited minutes and were dropped, and that run had no diffuse light
@@ -738,6 +887,118 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passes_run_once_keep_their_wait_when_play_skips_other_pending_pipelines() {
+        let loading = Duration::from_secs(60);
+        for compute in [false, true] {
+            assert_eq!(frame_wait_budget(Duration::ZERO, loading, compute, ScreenPass::Once), SCREEN_BUDGET);
+        }
+        for compute in [false, true] {
+            assert_eq!(frame_wait_budget(Duration::ZERO, loading, compute, ScreenPass::None), Duration::ZERO);
+        }
+        assert_eq!(frame_wait_budget(Duration::ZERO, loading, false, ScreenPass::Other), Duration::ZERO);
+        let ordinary = Duration::from_millis(500);
+        assert_eq!(frame_wait_budget(ordinary, loading, true, ScreenPass::None), LOADING_FRAME_COMPUTE);
+        assert_eq!(frame_wait_budget(ordinary, Duration::ZERO, false, ScreenPass::None), ordinary);
+    }
+
+    /// The decoration bake of a character's clothing and the block
+    /// compression of what it baked run once: their pipelines are waited
+    /// for. A program that only reads a baked texture is not.
+    #[test]
+    fn decoration_bakes_and_their_compression_run_once() {
+        let pass = |stage, container: &[u8]| screen_pass(&[super::super::shader(stage, container)], None, true);
+        assert!(pass("compute", b"DXBC texturecompression:CS_CompressBC3Mip0 code") == ScreenPass::Once);
+        assert!(pass("pixel", b"DXBC PS_BakeDecorations_1010 code") == ScreenPass::Once);
+        assert!(pass("pixel", b"DXBC PS_DecorationBlend_0000 code") == ScreenPass::Once);
+        assert!(pass("pixel", b"DXBC PS_DeferredPedTexturedNC code") == ScreenPass::None);
+        assert!(pass("compute", b"DXBC CS_ScreenProbes_Temporal code") == ScreenPass::None);
+    }
+
+    /// Waits that overlap share one deadline and count once; successive
+    /// ones add up to the budget; the next frame has it whole again.
+    #[test]
+    fn overlapping_waits_count_once_and_successive_ones_add_up() {
+        let ms = Duration::from_millis;
+        let (t0, budget) = (Instant::now(), ms(1000));
+        let mut o = Overlap::NONE;
+        assert_eq!(o.begin(1, budget, t0), Some(t0 + ms(1000)));
+        assert_eq!(o.begin(1, budget, t0 + ms(200)), Some(t0 + ms(1000)));
+        o.end(1, t0 + ms(300));
+        o.end(1, t0 + ms(400));
+        // 400 ms of the frame are gone, not 300 + 200.
+        assert_eq!(o.begin(1, budget, t0 + ms(500)), Some(t0 + ms(1100)));
+        o.end(1, t0 + ms(1100));
+        assert_eq!(o.begin(1, budget, t0 + ms(1200)), None);
+        assert_eq!(o.begin(2, budget, t0 + ms(1300)), Some(t0 + ms(2300)));
+        // A wait of the frame before ends: the new frame's count stays.
+        o.end(1, t0 + ms(1400));
+        assert_eq!(o.waiting, 1);
+    }
+
+    /// Two recording threads wait in one frame for two different passes run
+    /// once, the second while the first waits. Both pipelines are made
+    /// before the deadline, and both threads come back with theirs.
+    #[test]
+    fn two_threads_waiting_for_passes_run_once_in_one_frame_both_get_them() {
+        let pass = |container: &[u8]| Arc::new(Pending::new(vec![super::super::shader("compute", container)], None));
+        let (a, b) = (pass(b"DXBC CS_CompressBC1Mip0 wait test a"), pass(b"DXBC CS_CompressBC3Mip0 wait test b"));
+        assert!(a.screen == ScreenPass::Once && b.screen == ScreenPass::Once);
+        let waits = Mutex::new(Overlap::NONE);
+        let made_after = |p: &Arc<Pending>, after: Duration| {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                let _ = p.made.set(None);
+                let (lock, done) = &DONE;
+                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                done.notify_all();
+            })
+        };
+        let budget = Duration::from_secs(5);
+        let (first, second) = std::thread::scope(|s| {
+            let first = s.spawn(|| (wait_overlapping(&a, 7, budget, &waits), a.made.get().is_some()));
+            std::thread::sleep(Duration::from_millis(50));
+            let second = s.spawn(|| (wait_overlapping(&b, 7, budget, &waits), b.made.get().is_some()));
+            let makers = [made_after(&a, Duration::from_millis(250)), made_after(&b, Duration::from_millis(400))];
+            let results = (first.join().unwrap(), second.join().unwrap());
+            for m in makers {
+                m.join().unwrap();
+            }
+            results
+        });
+        assert!(first.0.is_some() && first.1, "the first thread waited for its pipeline");
+        assert!(second.0.is_some() && second.1, "the second thread waited for its pipeline");
+        let waits = waits.lock().unwrap();
+        assert_eq!(waits.waiting, 0);
+        assert!(waits.spent < budget);
+    }
+
+    /// `VICTORY_SCREEN_WORKERS=0` restores the queue and waits from before:
+    /// neither the lighting tables nor the bakes keep a budget of their own.
+    #[test]
+    fn screen_workers_off_leaves_no_pass_its_own_wait() {
+        let bake = [super::super::shader("compute", b"DXBC texturecompression:CS_CompressBC1Mip0 code")];
+        assert!(screen_pass(&bake, None, true) == ScreenPass::Once);
+        assert!(screen_pass(&bake, None, false) == ScreenPass::None);
+        // The lighting tables' vertex program, by its hash.
+        let table = [Arc::new(Shader {
+            stage: "vertex",
+            hash: "ce57291b5a1750ca".to_owned(),
+            container: b"DXBC lighting table vertex".to_vec(),
+            translated: OnceLock::new(),
+            walks: OnceLock::new(),
+            thread_limited: false,
+            limited_twin: OnceLock::new(),
+            group: OnceLock::new(),
+            bakes: OnceLock::new(),
+        })];
+        assert!(screen_pass(&table, None, true) == ScreenPass::Once);
+        assert!(screen_pass(&table, None, false) == ScreenPass::None);
+        let loading = Duration::from_secs(60);
+        assert_eq!(frame_wait_budget(Duration::ZERO, loading, false, screen_pass(&table, None, false)), Duration::ZERO);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

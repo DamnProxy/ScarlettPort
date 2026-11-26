@@ -100,6 +100,16 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// parts, each with the groups before it here. Asked for by compute programs
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes, read by
+/// a compute program translated for dispatches by thread counts
+/// ([`super::translate_thread_limited`]): dword `d` (0 to 2) is the number
+/// of threads the title dispatched along x, y or z (asked only along a
+/// dimension whose groups are more than one thread wide). The console's
+/// `DispatchX` with `USE_THREAD_DIMENSIONS` counts threads, not groups: the
+/// last group along a dimension is cut short, and the threads past the
+/// count are not launched (their lanes are outside EXEC from the start,
+/// and a wave with none is not launched at all).
+pub const USER_THREAD_LIMIT: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -198,6 +208,27 @@ pub fn set_view_heap_map(map: Option<(u32, u32)>) {
     VIEW_MAP.store(packed, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether a copied root table on a capped heap reads descriptor words of its
+/// own, past the title's ([`super::words::table_slot`]). The host sets it with
+/// ray tracing, whose passes read acceleration-structure addresses through
+/// such tables. Off (the default), a table reads the title's words as before.
+static TABLE_SNAPSHOTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets [`table_snapshots`]; before the first translation.
+pub fn set_table_snapshots(on: bool) {
+    TABLE_SNAPSHOTS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether copied root tables read descriptor words of their own
+/// ([`set_table_snapshots`]).
+pub fn table_snapshots() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TABLE_SNAPSHOTS.get() {
+        return on;
+    }
+    TABLE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The heap map shaders are translated with now ([`set_view_heap_map`]).
 pub fn view_heap_map() -> Option<(u32, u32)> {
     #[cfg(test)]
@@ -215,6 +246,8 @@ thread_local! {
     /// [`VIEW_MAP`], without reaching other tests' translations.
     pub(crate) static TEST_VIEW_HEAP: std::cell::Cell<Option<(u32, Option<(u32, u32)>)>> =
         const { std::cell::Cell::new(None) };
+    /// Tests: [`table_snapshots`] for this thread's translations.
+    pub(crate) static TEST_TABLE_SNAPSHOTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) struct Shader {

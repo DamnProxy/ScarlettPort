@@ -70,6 +70,20 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Translated for dispatches by thread counts whose last groups are cut
+    /// short ([`Shader::thread_limited`]).
+    #[cfg(windows)]
+    thread_limited: bool,
+    /// The same container in that form, made on first need.
+    #[cfg(windows)]
+    limited_twin: OnceLock<Arc<Shader>>,
+    /// A compute program's thread group size, as the console runs it.
+    #[cfg(windows)]
+    group: OnceLock<Option<[u32; 3]>>,
+    /// Whether it makes a texture the title bakes once, once looked at
+    /// ([`Shader::bakes`]).
+    #[cfg(windows)]
+    bakes: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -122,6 +136,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                thread_limited: false,
+                #[cfg(windows)]
+                limited_twin: OnceLock::new(),
+                #[cfg(windows)]
+                group: OnceLock::new(),
+                #[cfg(windows)]
+                bakes: OnceLock::new(),
             })
         })
         .clone()
@@ -144,6 +166,10 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         container: container.to_vec(),
         translated: OnceLock::new(),
         walks: OnceLock::new(),
+        thread_limited: false,
+        limited_twin: OnceLock::new(),
+        group: OnceLock::new(),
+        bakes: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
@@ -175,7 +201,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container, self.thread_limited);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -184,7 +210,8 @@ impl Shader {
                     let stem = format!("{}.{}", self.hash, self.stage);
                     let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
                     if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                        let suffix = if self.thread_limited { ".threads" } else { "" };
+                        let _ = std::fs::write(dir.join(format!("{stem}{suffix}.dxil")), &t.host.dxil);
                     }
                 }
                 if let Ok(t) = &done {
@@ -197,7 +224,14 @@ impl Shader {
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
+                        thread_counts = self.thread_limited,
                         "shader translated"
+                    ),
+                    Err(e) if self.thread_limited => tracing::warn!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        error = %e,
+                        "shader translation failed for a partial thread group"
                     ),
                     Err(e) => {
                         static FAILED: std::sync::atomic::AtomicU64 =
@@ -215,6 +249,46 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// The same container translated for dispatches by thread counts whose
+    /// last groups are cut short (`victory_shader::emit::translate_thread_limited`):
+    /// the console's `DispatchX` with `USE_THREAD_DIMENSIONS` launches no
+    /// thread past the counts, and the host runs whole groups.
+    pub(crate) fn thread_limited(self: &Arc<Self>) -> Arc<Shader> {
+        if self.thread_limited {
+            return self.clone();
+        }
+        self.limited_twin
+            .get_or_init(|| {
+                Arc::new(Shader {
+                    stage: self.stage,
+                    hash: self.hash.clone(),
+                    container: self.container.clone(),
+                    translated: OnceLock::new(),
+                    thread_limited: true,
+                    limited_twin: OnceLock::new(),
+                    group: OnceLock::new(),
+                    walks: OnceLock::new(),
+                    bakes: OnceLock::new(),
+                })
+            })
+            .clone()
+    }
+
+    /// A compute program's thread group size as the console runs it (the
+    /// host's may differ: the paired form runs half as many threads).
+    pub(crate) fn group_size(&self) -> Option<[u32; 3]> {
+        *self.group.get_or_init(|| {
+            use victory_shader::native::StageIo;
+            use victory_shader::{Container, FourCC};
+            let c = Container::parse(&self.container).ok()?;
+            let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+            programs.iter().find_map(|p| match &p.io {
+                StageIo::Cs(cs) => Some(cs.threads),
+                _ => None,
+            })
+        })
     }
 }
 
@@ -307,7 +381,7 @@ pub(crate) fn linked(ms: &Shader, ps: Option<&Shader>) -> Option<(Arc<Vec<u8>>, 
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8], thread_limited: bool) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -316,7 +390,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = if thread_limited {
+        crate::shader_cache::host_shader_thread_limited(container)?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let writes = stores || programs.iter().any(image_stores);
     // Only with a switch on: it traces the program again (the translation
@@ -422,6 +500,21 @@ impl Shader {
     fn walks(&self) -> bool {
         *self.walks.get_or_init(|| container_walks(&self.container))
     }
+
+    /// Whether the program belongs to a pass that makes a texture once and
+    /// keeps it: the decoration bake and blend of a character's head
+    /// (`PS_BakeDecorations_*`, `PS_DecorationBlend_*` and their vertex
+    /// program) and the block compression of what it baked
+    /// (`texturecompression:CS_CompressBC*`). Each container holds one of
+    /// these names, and no other program of the title does.
+    pub(crate) fn bakes(&self) -> bool {
+        *self.bakes.get_or_init(|| {
+            const NAMES: [&[u8]; 3] = [b"BakeDecorations", b"DecorationBlend", b"CS_CompressBC"];
+            NAMES
+                .iter()
+                .any(|name| self.container.windows(name.len()).any(|w| w == *name))
+        })
+    }
 }
 
 /// Whether a console container's code tests rays against the nodes of a
@@ -511,12 +604,20 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
-/// At a dispatch of a builder pipeline: whether the builder runs (see
-/// [`Builder`]).
+/// The launcher and play script set the rendering option. The builder override
+/// takes precedence for diagnostic runs.
+#[cfg(windows)]
+pub(crate) fn builder_requested() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER")
+        .or_else(|| std::env::var_os("VICTORY_RAYTRACING"))
+        .is_some_and(|v| v == "1"))
+}
+
+/// Run the builder only once all its pipeline stages are available.
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_requested() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -607,6 +708,11 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A compute pipeline's host pipeline for dispatches by thread counts
+    /// whose last groups are cut short ([`thread_limited_pipeline`]), made
+    /// on first need.
+    #[cfg(windows)]
+    limited: OnceLock<Option<host::HostPipeline>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -661,6 +767,44 @@ pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> 
         return make::for_formats(p, bound);
     }
     make::ready(p)
+}
+
+/// A compute pipeline's thread group size as the console runs it.
+#[cfg(windows)]
+pub(crate) fn group_size(this: This) -> Option<[u32; 3]> {
+    if this.is_null() {
+        return None;
+    }
+    match pipeline(this).shaders.as_slice() {
+        [cs] if cs.stage == "compute" => cs.group_size(),
+        _ => None,
+    }
+}
+
+/// The host pipeline of a compute pipeline for dispatches by thread counts
+/// whose last groups are cut short (the console's `DispatchX` with
+/// `USE_THREAD_DIMENSIONS`): its program translated so that the threads past
+/// the counts leave at once ([`Shader::thread_limited`]). Made on this
+/// thread at its first need: few programs are dispatched so (the
+/// ray-tracing structure builder's). `None` if it cannot be made (the
+/// program is in a form whose threads cannot leave alone, or the host
+/// refuses it).
+#[cfg(windows)]
+pub(crate) fn thread_limited_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    p.limited
+        .get_or_init(|| {
+            let shaders: Vec<Arc<Shader>> = p.shaders.iter().map(Shader::thread_limited).collect();
+            let made = host::HostPipeline::new(&shaders, None).filter(|h| h.compute);
+            if made.is_none() {
+                tracing::warn!(?shaders, "no host pipeline for a partial thread group");
+            }
+            made
+        })
+        .as_ref()
 }
 
 /// Host pipelines queued and not made yet.
@@ -840,6 +984,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        limited: OnceLock::new(),
         shaders,
         precompiled,
         bound: std::sync::atomic::AtomicBool::new(false),
