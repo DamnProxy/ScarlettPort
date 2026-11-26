@@ -647,10 +647,10 @@ impl Launcher {
         let rows = [
             ("Engine", engine_sub.as_str()),
             ("Console profile", "World engine. Series S reports the smaller console to the game."),
-            ("Ray tracing", "World engine. Hardware ray-traced lighting."),
-            ("Fallback lighting", "World engine. Simple lighting where the game's own is missing."),
-            ("Debug view", "World engine. Shows a debug render target (slower)."),
-            ("Auto-advance menus", "Presses through the title and account screens."),
+            ("Ray tracing", "Custom preset. The game's own ray-traced light (SCARLETT_BVH_BUILDER): costs about a third of the frame rate."),
+            ("Fallback lighting", "Custom preset, local builds only (the bundled runtime ignores it). Simple light where the game's is missing."),
+            ("Debug view", "Custom preset, local builds only (the bundled runtime ignores it). Shows a debug render target (slower)."),
+            ("Auto-advance menus", "Classic engine; World only with a local build that has it. Presses through the title screens."),
         ];
         for (i, (title, sub)) in rows.iter().enumerate() {
             let row = row_at(i);
@@ -1049,7 +1049,7 @@ impl Launcher {
         p.text(pos2(c.min.x, y + CONTROL + 14.), Align2::LEFT_TOP, format!("Runtime folder: {}", self.runtime_note), font(12.5, "regular"), TEXT_MUTED);
         let y = y + 100.;
         p.line_segment([pos2(c.min.x, y), pos2(c.max.x, y)], Stroke::new(1.0_f32, LINE));
-        let text = "The launcher makes no network connections. The only outside access is the links you click, which open in your browser. Settings live in %LOCALAPPDATA%\\ScarlettPort\\launcher.json.";
+        let text = "The launcher connects only to GitHub, to check for a newer release (at start, unless turned off in Options) and to download one when you click Update. Discord presence talks to the Discord app on this PC when it is on. Reports open in your browser for you to check and submit. Settings live in %LOCALAPPDATA%\\ScarlettPort\\launcher.json.";
         let g = p.layout(text.into(), font(13., "regular"), TEXT_MUTED, c.width().min(560.));
         p.galley(pos2(c.min.x, y + 20.), g, TEXT_MUTED);
         if link(ui, pos2(c.min.x, y + 100.), Align2::LEFT_CENTER, "site", "github.com/ZigZagBoi1/ScarlettPort") {

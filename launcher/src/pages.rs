@@ -191,8 +191,11 @@ impl Launcher {
         let p = ui.painter().clone();
         card(&p, r, LINE);
         p.text(pos2(r.min.x + 18., r.center().y - 9.), Align2::LEFT_CENTER, title, font(14.5, "semibold"), TEXT);
-        if restart {
-            let x = r.min.x + 18. + text_width(ui, title, font(14.5, "semibold")) + 10.;
+        let x = r.min.x + 18. + text_width(ui, title, font(14.5, "semibold")) + 10.;
+        if !self.local_selected() && crate::presets::names_unread_switch(sub) {
+            // The bundled runtime does not read this switch; only a local build that has it does.
+            pill(ui, pos2(x, r.center().y - 9.), "not in the bundled runtime yet", WARNING);
+        } else if restart {
             let (t, c) = if changed { ("restart the game to apply", ACCENT) } else { ("restart needed", TEXT_FAINT) };
             pill(ui, pos2(x, r.center().y - 9.), t, c);
         }
