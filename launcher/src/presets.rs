@@ -26,10 +26,10 @@ pub const C1: [&str; 9] = [
     "VICTORY_PREP_REUSE",
 ];
 
-/// fx-cand4 additions to Stable: lazy remapping and sub-page memory (the yard stutter fix), copies
-/// without the extra query, and a 4 GB card-buffer pool. Fast boot stays optional (not set here).
-pub const CAND4: [(&str, &str); 4] = [
-    ("VICTORY_REMAP_LAZY", "1"),
+/// fx-cand4 additions to Stable: sub-page memory, copies without the extra query, and a 4 GB
+/// card-buffer pool. Lazy remapping (`VICTORY_REMAP_LAZY`) is left out: a moving A/B showed it
+/// now slows the world down. Fast boot stays optional (not set here).
+pub const CAND4: [(&str, &str); 3] = [
     ("VICTORY_MEM_SUBPAGE", "1"),
     ("VICTORY_COPY_NOQUERY", "1"),
     ("VICTORY_CARD_BUFFERS_MB", "4096"),

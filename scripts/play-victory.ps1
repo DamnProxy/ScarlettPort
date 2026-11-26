@@ -59,8 +59,9 @@ $env:VICTORY_SYNC_PRECISE = '1'
 $env:VICTORY_READ_SETTLE_PRECISE = '1'
 # The rest of the verified speed settings. The grid fix is in this runtime, so precompiled graphics pipelines are on.
 foreach ($k in 'VICTORY_PRECOMPILED_GRAPHICS','VICTORY_READFIX','VICTORY_COPY_BACK_ONLY_READBACK','VICTORY_NARROW_ROOT','VICTORY_NARROW_VIEWS','VICTORY_NARROW_BVH','VICTORY_PREP_BARRIERS','VICTORY_PREP_TABLES','VICTORY_PREP_REUSE') { Set-Item "env:$k" '1' }
-# fx-cand4: lazy remap and sub-page memory (yard stutter fix), copies without the extra query, 4 GB card buffers.
-$env:VICTORY_REMAP_LAZY = '1'; $env:VICTORY_MEM_SUBPAGE = '1'; $env:VICTORY_COPY_NOQUERY = '1'; $env:VICTORY_CARD_BUFFERS_MB = '4096'
+# fx-cand4: sub-page memory, copies without the extra query, 4 GB card buffers. VICTORY_REMAP_LAZY is left
+# out: a moving A/B showed it now slows the world down.
+$env:VICTORY_MEM_SUBPAGE = '1'; $env:VICTORY_COPY_NOQUERY = '1'; $env:VICTORY_CARD_BUFFERS_MB = '4096'
 $env:VICTORY_PIPELINE_WAIT_MS = '0'
 if ($FastBoot) { $env:VICTORY_FAST_BOOT = '1' }
 if ($SaveSlot) { $env:VICTORY_SAVE_SLOT = $SaveSlot }
