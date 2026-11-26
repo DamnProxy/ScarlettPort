@@ -1,6 +1,6 @@
 # Roadmap: 30 fps on a mid-range NVIDIA GPU
 
-Current state is in [STATUS.md](STATUS.md): the lit world at about 5 fps in the cell scene and about 4 fps while moving on an RTX 3060 (Series S profile), with stable frame pacing, shadowed areas too dark, the intro cutscene very slow unless skipped, not yet verified playable. The target is 30 fps in the open world on a card such as an RTX 3060 with a correct image. Items are ordered roughly by what blocks the next one; none has a date.
+Current state is in [STATUS.md](STATUS.md): the lit world at about 4 fps while walking and turning on an RTX 3060 (Series S profile), with steady pacing (95th-percentile frame about 270 ms), hair too bright, shadowed areas too dark, the intro cutscene very slow unless skipped, not yet verified playable. The target is 30 fps in the open world on a card such as an RTX 3060 with a correct image. Items are ordered roughly by what blocks the next one; none has a date.
 
 ## 1. Light in shadow
 
@@ -11,7 +11,7 @@ The title's ray-traced bounce light and shadows do not run yet, so anything the 
 
 ## 2. Frame time
 
-About 4-5 fps means roughly 200-250 ms per frame. Done in v0.4.0: the yard stutter (lazy remap plus the copy fix) and memory copies cut from 286 to 84 MB per frame. Remaining candidates: title-memory copies, submission waits (the opt-in relay), shader efficiency, and the 64-lane programs that run as two 32-lane halves on NVIDIA.
+About 4 fps means roughly 250 ms per frame. The GPU profiler (`VICTORY_GPU_PROFILE`) measures about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines, so the gain has to come from many passes at once: the shader optimizer's safe mask removes 51% of instructions offline, and its in-game test is pending. Done in v0.4.0: the yard stutter (lazy remap plus the copy fix) and memory copies cut from 286 to 84 MB per frame. Remaining candidates: title-memory copies, submission waits (the opt-in relay), shader efficiency, and the 64-lane programs that run as two 32-lane halves on NVIDIA.
 
 ## 3. Intro cutscene
 
@@ -34,6 +34,19 @@ Run the title the way the smaller console does (its memory budget, resolution an
 Play a session end to end, with saves, and record what breaks.
 
 ## Changelog
+
+### v0.4.2
+
+Runtime synced to fx-cand4 (b3882b9); launcher 0.4.2. Measured on an RTX 3060 (Series S profile): about 4 fps while walking and turning in the world, with steady pacing (95th-percentile frame about 270 ms).
+
+- **Fixed:** the screen lighting passes (their workers are on by default).
+- **Fixed:** the texture reserve (the room kept for card copies is capped, `VICTORY_CARD_ROOM_KEPT_MB`, 512 by default).
+- **Faster:** load time from an internal SSD: the world is reached in about 212 s, against 300 s or more before.
+- **New:** in-session A/B tooling for comparing switches live.
+- **New:** GPU profiler (`VICTORY_GPU_PROFILE`): about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines.
+- **In testing:** the shader optimizer's safe mask removes 51% of instructions offline; the in-game test is pending.
+- **Launcher:** the Stable preset adds `VICTORY_FRIENDLY=1`.
+- **Known issues:** hair renders too bright, ray tracing is off, and the speed is far from 30 fps.
 
 ### v0.4.0
 

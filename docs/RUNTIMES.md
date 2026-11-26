@@ -122,4 +122,4 @@ Offline path: the runtime journals every pipeline the title creates; `xcl pipeli
 | Patch | Base |
 |---|---|
 | `xcl-stack.patch` | upstream XCL `main` |
-| `victory-stack-*.patch` | fxceless/victory-fork `main` at `4e17478`; the diff of `fx-cand4` (`efcc7b9`) against it, as `git diff 4e17478 fx-cand4`, split in parts under 2 MB |
+| `victory-stack-*.patch` | fxceless/victory-fork `main` at `4e17478`; the diff of `fx-cand4` (`b3882b9`, plus the pull requests merged here since) against it, as `git diff 4e17478 fx-cand4`, split in parts under 2 MB |

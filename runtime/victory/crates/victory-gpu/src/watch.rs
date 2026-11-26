@@ -1173,6 +1173,7 @@ pub(crate) fn forgot(at: usize, len: usize) {
 }
 
 pub fn writing(at: usize, len: usize) {
+    crate::native::probe::release(at, len, true);
     // A kernel call writes there next: pages shown through the translation
     // table (`VICTORY_MEM2_GPU_ONLY_NOVIEW`) are made views first, which
     // the kernel can write.
@@ -1632,6 +1633,11 @@ static GPU_ONLY: std::sync::RwLock<Vec<(usize, usize)>> = std::sync::RwLock::new
 /// The title reserved `[at, at + len)` for the GPU alone (no CPU access).
 pub fn title_memory_gpu_only(at: usize, len: usize) {
     GPU_ONLY.write().unwrap_or_else(|e| e.into_inner()).push((at, at.saturating_add(len)));
+}
+
+/// The GPU-only reservations, `[start, end)` (`crate::native`).
+pub(crate) fn gpu_only_ranges() -> Vec<(usize, usize)> {
+    GPU_ONLY.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Which title pool `at` is in, for the memory line: 0 a GPU-only

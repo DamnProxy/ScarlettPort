@@ -810,6 +810,8 @@ fn install() {
                 // A view now, for the mapping record: copies read it in
                 // place, the guards take its writes as they do any view's.
                 crate::regions::mapped(page, PAGE);
+                // SAFETY: the system passes the context with the record.
+                crate::native::probe::lazy_touch(at, r.ExceptionInformation[0], unsafe { (*(*info).ContextRecord).Rip });
                 LAZY[3].fetch_add(1, Relaxed);
                 EXCEPTION_CONTINUE_EXECUTION
             }

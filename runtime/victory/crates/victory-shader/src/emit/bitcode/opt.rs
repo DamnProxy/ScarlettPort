@@ -77,10 +77,22 @@ pub const LDSSYNC: u32 = 512;
 /// holds) is answered by each host wave alone, without an exchange (two
 /// group barriers).
 pub const UNIFORM: u32 = 1024;
+/// Not a pass over the module: a heap index whose every value is within the
+/// bound ([`super::Module::bound`]: masks, shifts, thread numbers, sums that
+/// cannot wrap) gets no clamp, as a constant one does with [`CLAMPS`]
+/// (`shader.rs`, `heap_handle`). `UMin(x, k) == x` for `x <= k`: exact.
+pub const BOUNDS: u32 = 2048;
+/// Not a pass over the module: a heap handle whose index is proven the same
+/// in every lane ([`super::Module::uniform`]: constants, constant-buffer
+/// reads, first-lane reads, group numbers and arithmetic on them) is made
+/// without the non-uniform flag, so the driver adds no per-lane loop of its
+/// own (`shader.rs`, `heap_handle`). Exact: the flag only permits indices
+/// that differ between lanes.
+pub const UNIFORM_INDEX: u32 = 4096;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | MERGE;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST | CLAMPS | MUL24 | LDSSYNC | UNIFORM;
+pub const ALL: u32 = MODULE | FIRST | CLAMPS | MUL24 | LDSSYNC | UNIFORM | BOUNDS | UNIFORM_INDEX;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").

@@ -35,6 +35,21 @@ pub const LIVE: &[&str] = &[
     "MEM_SUBPAGE",
     "FPS_CAP",
     "LIMITER",
+    "BIND_CACHE",
+    "TABLE_BUFFERS",
+    "SYNC_NULL_SKIP",
+    "DECLARE_ONCE",
+    "INDIRECT_GATHER",
+    "INDIRECT_REST",
+    "HEAP_SYNC_THREADS",
+    "TEXTURE_HEAPS",
+    "STAGING_BLOCKS",
+    "PIPE_OWNED_MERGE",
+    "CARD_ROOM_KEPT_MB",
+    "CARD_SYNC_BATCH",
+    "TARGET_VARIANTS",
+    "FAIR_DUE",
+    "RELOOK_MS",
 ];
 
 /// Switches known and NOT settable live (see the table in live-ab.md).
@@ -51,6 +66,8 @@ pub const BOOT_ONLY: &[&str] = &[
     "PS_HWSGPR",
     "D16_UINT",
     "FAST_BOOT",
+    "SCREEN_WORKERS",
+    "ALIAS_CAST",
 ];
 
 /// `VICTORY_CB_RUNS` -> `CB_RUNS`.

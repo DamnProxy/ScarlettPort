@@ -4,9 +4,6 @@
 //! nothing of the title itself). Every hook checks the build's hash and the
 //! exact bytes it replaces, and does nothing otherwise.
 
-use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// First 16 hex digits of the BLAKE3 of the Series X 1.0.2.1 executable.
 const BUILD_1_0_2_1: &str = "b99f876b74d4a77f";
@@ -204,23 +201,11 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
 /// # Safety
 /// See `disarm_watchdog`.
 unsafe fn apply(base: usize, p: &Patch<'_>) -> bool {
-    let at = (base + p.rva) as *mut u8;
+    // The write primitive is shared with the native replacements.
     // SAFETY: the offset is inside the mapped .text of this exact build.
-    let now = unsafe { std::slice::from_raw_parts(at, p.expect.len()) };
-    if now != p.expect || p.new.len() != p.expect.len() {
+    if !unsafe { victory_native::write_code(base + p.rva, p.expect, p.new) } {
         tracing::warn!(what = p.what, "hook skipped: the bytes are not the expected ones");
         return false;
-    }
-    let mut old = 0;
-    // SAFETY: changing the protection of those bytes only, restored below.
-    if unsafe { VirtualProtect(at as _, p.new.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
-        return false;
-    }
-    // SAFETY: writable now; the bytes are the ones checked above.
-    unsafe {
-        std::ptr::copy_nonoverlapping(p.new.as_ptr(), at, p.new.len());
-        VirtualProtect(at as _, p.new.len(), old, &mut old);
-        FlushInstructionCache(GetCurrentProcess(), at as _, p.new.len());
     }
     tracing::info!(what = p.what, "hook applied");
     true

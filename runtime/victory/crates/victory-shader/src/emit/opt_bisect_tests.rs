@@ -195,7 +195,7 @@ fn shader_opt_bisect_over_real_programs() {
     let threads: usize = std::env::var("VICTORY_OPT_BISECT_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
     let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).collect();
     files.sort();
-    let mut bits: Vec<u32> = (0..11).map(|k| 1u32 << k).collect();
+    let mut bits: Vec<u32> = (0..13).map(|k| 1u32 << k).collect();
     bits.push(opt::ALL);
     let next = AtomicUsize::new(0);
     let out = Mutex::new(std::fs::File::create(&outp).unwrap());
@@ -305,4 +305,83 @@ fn shader_opt_bisect_one() {
         println!("--- optimised:
 {}", m1.describe_around(i, 12));
     }
+}
+
+/// The static cost of one translation: each instruction by kind, weighted by
+/// what it roughly costs a host GPU (ALU 1; constant reads 2; buffer reads
+/// 4; texture reads 8; stores 4; atomics 8; LDS 2; handles 2 and annotations
+/// 0 (folded by the driver); dimension queries 4; barriers 16; wave
+/// operations 2; a non-uniform heap handle 32 more, for the driver's own
+/// per-lane loop). An estimate for ranking, not a time.
+fn static_cost(c: &super::bitcode::census::Census) -> u64 {
+    use super::bitcode::census::KINDS;
+    let w = |k: &str| -> u64 {
+        match k {
+            "total" | "blocks" | "guard_select" | "clamp" | "loop_counter" | "annotate" => 0,
+            "cbuffer_load" | "lds_load" | "lds_store" | "handle" | "wave_op" => 2,
+            "buffer_load" | "buffer_store" | "dimensions" => 4,
+            "texture_read" | "atomic" => 8,
+            "barrier" => 16,
+            _ => 1,
+        }
+    };
+    KINDS.iter().zip(c.counts).map(|(k, n)| w(k) * u64::from(n)).sum::<u64>() + 32 * u64::from(c.nonuniform)
+}
+
+/// The cost survey (ignored; run by hand): every container in
+/// `VICTORY_OPT_BISECT_DIR` translated with each mask of
+/// `VICTORY_COST_MASKS` (comma-separated; default the safe mask 479 and it
+/// with each new bit), a line per program and mask to
+/// `VICTORY_OPT_BISECT_OUT`: hash, stage, mask, instructions, clamps,
+/// handles, non-uniform handles, barriers, static cost (`static_cost`).
+/// Needs `VICTORY_SHADER_CENSUS=1`.
+#[test]
+#[ignore]
+fn shader_cost_survey() {
+    let dir = std::env::var("VICTORY_OPT_BISECT_DIR").expect("VICTORY_OPT_BISECT_DIR");
+    let outp = std::env::var("VICTORY_OPT_BISECT_OUT").expect("VICTORY_OPT_BISECT_OUT");
+    assert!(super::bitcode::census::enabled(), "set VICTORY_SHADER_CENSUS=1");
+    let masks: Vec<u32> = std::env::var("VICTORY_COST_MASKS")
+        .unwrap_or_else(|_| "0,479,2527,4575,6623,8191".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let threads: usize = std::env::var("VICTORY_OPT_BISECT_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).collect();
+    files.sort();
+    let k = |s: &str| super::bitcode::census::KINDS.iter().position(|k| *k == s).unwrap();
+    let next = AtomicUsize::new(0);
+    let out = Mutex::new(std::fs::File::create(&outp).unwrap());
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| {
+                host_like();
+                while let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let name = path.file_stem().unwrap().to_string_lossy().to_string();
+                    let bytes = std::fs::read(path).unwrap();
+                    let mut lines = Vec::new();
+                    for &m in &masks {
+                        let Some((stage, dxil, _)) = translate_with(&bytes, m) else {
+                            lines.push(format!("{name}\t?\t{m}\tERR"));
+                            continue;
+                        };
+                        let Some(c) = super::bitcode::census::take(&dxil) else { continue };
+                        lines.push(format!(
+                            "{name}\t{stage}\t{m}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            c.counts[0],
+                            c.counts[k("clamp")],
+                            c.counts[k("handle")],
+                            c.nonuniform,
+                            c.counts[k("barrier")],
+                            static_cost(&c)
+                        ));
+                    }
+                    let mut f = out.lock().unwrap();
+                    for l in lines {
+                        let _ = writeln!(f, "{l}");
+                    }
+                }
+            });
+        }
+    });
 }

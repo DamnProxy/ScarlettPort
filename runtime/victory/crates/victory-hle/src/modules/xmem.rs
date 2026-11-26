@@ -513,6 +513,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // opened as a host heap.
     let committed = committed_whole();
     victory_gpu::title_memory_section(handle as usize, size as u64, committed);
+    victory_gpu::native::physical_pages(handle as usize, n);
     PHYSICAL_BYTES.fetch_add(size, Ordering::Relaxed);
     let section = Arc::new(Section(handle, size, std::sync::OnceLock::new(), committed));
     let mut physical = physical();
@@ -1121,6 +1122,7 @@ fn shows(at: usize, slice: &Slice) {
 }
 
 fn shows_n(at: usize, len: usize, slice: &Slice) {
+    victory_gpu::native::shown(at, len, slice.section.0 as usize, slice.index);
     if !victory_gpu::mem2_nosnap() {
         return;
     }
@@ -1499,6 +1501,7 @@ fn reach(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
+    victory_gpu::native::unmapped(base, len);
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).

@@ -80,6 +80,12 @@ pub(crate) struct Staging {
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
     pooled: u64,
+    /// Where its bytes start in `buffer`: 0, or its range's offset in a
+    /// block (`VICTORY_STAGING_BLOCKS`).
+    base: u64,
+    /// Its range of a block, given back when this is dropped.
+    #[allow(dead_code)]
+    piece: Option<Piece>,
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -109,7 +115,135 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// dip. Buffers of up to 8 MiB are now kept by size and used again,
 /// zeroed as a new one is (levels not there yet must read as zeros).
 /// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
-fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64, Option<Piece>)> {
+    match staging_range(host, total) {
+        Some((buffer, data, piece)) => Some((buffer, data, 0, Some(piece))),
+        None => staging_buffer_alone(host, total).map(|(buffer, data, size)| (buffer, data, size, None)),
+    }
+}
+
+/// Whether staging buffers are ranges of big blocks (`VICTORY_STAGING_BLOCKS=1`;
+/// off by default: buffers of their own, kept by size). After shadowdog00's
+/// vi-pc-combo `0781f61` (GPL-3.0). The spare buffers help only what was
+/// used before: a burst of a thousand textures in a frame, held until the
+/// frame's lists are reset, makes most of its buffers anew.
+fn staging_blocks() -> bool {
+    // Live (`victory_core::live`): asked per staging buffer made; a range
+    // goes back to its block when its staging goes, whatever the switch says.
+    static ON: victory_core::live::Switch = victory_core::live::Switch::new("STAGING_BLOCKS", 0);
+    ON.on()
+}
+
+/// The size of a block of upload memory, the unit ranges are cut on (a page;
+/// copies want 512), and the bytes of free blocks kept.
+const BLOCK: u64 = 64 << 20;
+const GRAIN: u64 = 4096;
+const BLOCKS_KEPT: u64 = 256 << 20;
+
+/// A block of upload memory, mapped for its life, and what is free in it.
+struct Block {
+    buffer: ID3D12Resource,
+    data: usize,
+    ranges: crate::ranges::Ranges,
+}
+// SAFETY: a free-threaded D3D12 object and the address of its mapping.
+unsafe impl Send for Block {}
+
+/// The blocks (`None` where one was given back) and their free bytes.
+static BLOCKS: Mutex<(Vec<Option<Block>>, u64)> = Mutex::new((Vec::new(), 0));
+
+/// A staging buffer's range of a block; dropping it gives the range back
+/// (and the block, if that leaves it free and [`BLOCKS_KEPT`] are).
+struct Piece {
+    block: usize,
+    offset: u64,
+    len: u64,
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        let mut gone = None;
+        {
+            let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+            let (all, free) = &mut *blocks;
+            if let Some(Some(block)) = all.get_mut(self.block) {
+                block.ranges.give(self.offset, self.len);
+                *free += self.len;
+                if block.ranges.room() == BLOCK && *free >= BLOCKS_KEPT + BLOCK {
+                    *free -= BLOCK;
+                    gone = all[self.block].take();
+                }
+            }
+        }
+        // (Nothing holds a staging buffer of it any more: lists keep theirs
+        // until they are reset, after their submission has run.)
+        drop(gone);
+    }
+}
+
+/// A range of a block for a staging buffer of `total` bytes, if the switch
+/// is on ([`staging_blocks`], [`cut_from_blocks`]).
+fn staging_range(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, Piece)> {
+    if staging_blocks() { cut_from_blocks(host, total) } else { None }
+}
+
+/// A range of a block for a staging buffer of `total` bytes, all zeros as a
+/// new buffer is (levels not there yet must read as zeros): the block's
+/// buffer, where the range is mapped, and the range. `None` for a quarter of
+/// a block and more, and when the host refuses.
+fn cut_from_blocks(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, Piece)> {
+    let len = total.max(1).next_multiple_of(GRAIN);
+    if len > BLOCK / 4 {
+        return None;
+    }
+    let (buffer, data, piece, used_before) = {
+        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let (all, free) = &mut *blocks;
+        let found = all.iter_mut().enumerate().find_map(|(i, b)| {
+            let b = b.as_mut()?;
+            b.ranges.take(len, GRAIN).map(|(offset, used)| (i, offset, used))
+        });
+        let (index, offset, used) = match found {
+            Some(found) => found,
+            None => {
+                let (buffer, data) = host.upload_buffer(BLOCK)?;
+                crate::host::name(&buffer, || "staging block".to_owned());
+                let mut ranges = crate::ranges::Ranges::new(BLOCK);
+                let (offset, used) = ranges.take(len, GRAIN)?;
+                let fresh = Block { buffer, data: data as usize, ranges };
+                *free += BLOCK;
+                let index = match all.iter().position(Option::is_none) {
+                    Some(index) => {
+                        all[index] = Some(fresh);
+                        index
+                    }
+                    None => {
+                        all.push(Some(fresh));
+                        all.len() - 1
+                    }
+                };
+                (index, offset, used)
+            }
+        };
+        *free -= len;
+        let block = all[index].as_ref()?;
+        (
+            block.buffer.clone(),
+            (block.data + offset as usize) as *mut u8,
+            Piece { block: index, offset, len },
+            used,
+        )
+    };
+    if used_before {
+        // SAFETY: the range's own part of the block's mapping, which nothing
+        // else holds.
+        unsafe { std::ptr::write_bytes(data, 0, total as usize) };
+    }
+    Some((buffer, data, piece))
+}
+
+/// A staging buffer of its own, spare or made, and its pool size.
+fn staging_buffer_alone(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let size = total.max(64 << 10).next_power_of_two();
     if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
@@ -414,6 +548,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     );
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::AliasCopies, 1);
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
     unsafe {
@@ -766,7 +902,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress() + staging.base, texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -802,7 +938,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
             pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: staging.base + footprint.Offset,
+                    ..*footprint
+                },
             },
         };
         // SAFETY: an open list; both locations name live resources.
@@ -1815,13 +1954,15 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data, pooled) = staging_buffer(host, total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let (buffer, data, pooled, piece) = staging_buffer(host, total)?;
+    if piece.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -1848,9 +1989,46 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
+        base: piece.as_ref().map_or(0, |p| p.offset),
+        piece,
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod staging_tests {
+    /// A range of a block used before reads as zeros again, as a buffer the
+    /// host made would; two ranges held at once do not overlap.
+    #[test]
+    fn a_range_used_before_is_zeros_again() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let cut = |total| super::cut_from_blocks(host, total).unwrap();
+        let (buffer, data, piece) = cut(10_000);
+        let (_, other, second) = cut(5_000);
+        assert_eq!(piece.offset % super::GRAIN, 0);
+        assert!(piece.block != second.block || piece.offset + piece.len <= second.offset || second.offset + second.len <= piece.offset);
+        // SAFETY: the ranges' own mapped bytes.
+        unsafe {
+            std::ptr::write_bytes(data, 0xee, 10_000);
+            std::ptr::write_bytes(other, 0xdd, 5_000);
+        }
+        let (block, offset) = (piece.block, piece.offset);
+        drop((buffer, piece));
+        // (Other tests may hold ranges too: asked until the same one comes.)
+        let (_, again, third) = cut(10_000);
+        // SAFETY: as above.
+        let bytes = unsafe { std::slice::from_raw_parts(again, 10_000) };
+        assert!(bytes.iter().all(|&b| b == 0), "old bytes in a range cut again");
+        assert_eq!((third.block, third.offset), (block, offset));
+        // The one still held is untouched.
+        // SAFETY: as above.
+        assert!(unsafe { std::slice::from_raw_parts(other, 5_000) }.iter().all(|&b| b == 0xdd));
+        // Too long for a block: the caller makes a buffer of its own.
+        assert!(super::cut_from_blocks(host, super::BLOCK / 4 + 1).is_none());
+    }
 }
 
 #[cfg(test)]

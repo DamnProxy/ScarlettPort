@@ -26,8 +26,18 @@ Also credited: XCL by ivall and contributors (https://github.com/ivall/xcl, GPL-
 
 ## This snapshot
 
-- Source: branch `fx-cand4` at `efcc7b9` of our fork's working repository. Every new switch is off by default in the runtime; `scripts/play-victory.ps1` and the launcher turn on the verified ones (see `docs/RUNTIMES.md`).
-- Merged since the previous snapshot (`fx-cand` at `bce072d`, which this repository took in a934da5):
+- Source: branch `fx-cand4` at `b3882b9` of our fork's working repository, with the pull requests merged in this repository since the previous snapshot kept on top. Every new switch is off by default in the runtime; `scripts/play-victory.ps1` and the launcher turn on the verified ones (see `docs/RUNTIMES.md`).
+- Merged since the previous snapshot (`fx-cand4` at `efcc7b9`, which this repository took in 11be94c):
+  - screen passes with workers of their own, on by default (`VICTORY_SCREEN_WORKERS=0`: off): the lighting passes fix
+  - room kept for card copies capped (`VICTORY_CARD_ROOM_KEPT_MB`, 512 by default): the texture reserve fix
+  - `VICTORY_FRIENDLY` (background pools and priorities that leave processor time to the desktop)
+  - DirectStorage: a load cache (`VICTORY_LOAD_CACHE`), zlib-rs inflate (`VICTORY_FAST_INFLATE`), several handles per file (`VICTORY_DS_HANDLES`); all off by default
+  - shader optimizer passes (`VICTORY_SHADER_OPT` bounds and uniform-index bits) and a cost survey; off by default
+  - native GPU memory work (`VICTORY_NATIVE_GPUMEM`, `VICTORY_NATIVE_BUFFERS`, `VICTORY_NATIVE_PROBE`), off by default
+  - `crates/victory-native`: a patcher that can replace a title function with a native one (absolute jump, trampoline, guard check). This snapshot carries the patcher only: the module of the working repository that named a title function and its entry bytes is left out, so `VICTORY_NATIVE` does nothing here, and one unit test uses synthetic code instead.
+  - indirect-record, bind-cache and card-copy switches ported or adapted from other forks (myokex/victory-amd by uiliannn; fxceless), off by default
+- Authors in `efcc7b9..b3882b9`: Ziggy, fxceless, uiliannn, Diogo Sousa, Exopus, and commits recorded as `local` that adapt work credited in their messages to romainhedouin (Belobug) and ZJOU.
+- Merged in the snapshot before (`fx-cand` at `bce072d` to `efcc7b9`):
   - lazy remaps of title memory (`VICTORY_REMAP_LAZY`, `fx-remap3`) and sub-page refreshes (`VICTORY_MEM_SUBPAGE`): the yard stutter fix
   - copies without the extra memory query (`VICTORY_COPY_NOQUERY`); copies cut from 286 to 84 MB per frame with the Stable settings
   - fast boot fixed (`VICTORY_FAST_BOOT`, still optional)
@@ -55,7 +65,7 @@ Also credited: XCL by ivall and contributors (https://github.com/ivall/xcl, GPL-
   - stable watchdog (`fx-stable`)
   - cachekey opt-in (`fx-cachekey`)
   - f3 view fix (`fx-f3view`, default off)
-- `patches/victory-stack.patch` (repository root) is the diff of this tree against fxceless/victory-fork `main` at `4e17478` (`git diff 4e17478 fx-cand`). The patch is generated from this tree, so it carries the wording edits below.
+- `patches/victory-stack-*.patch` (repository root) is the diff of this tree against fxceless/victory-fork `main` at `4e17478`, split in parts under 2 MB. The patch is generated from this tree, so it carries the wording edits below; it leaves out this file, `README.md` and the ScarlettPort naming changes.
 - The base already took the title's name out of its tree; this snapshot keeps it that way. Two doc comments (`readback.rs`, `descriptor/slot_map.rs`), one line of `VICKY.md` (a former repository name) and one line of `README.md` (a note on how the fork was written) differ from the working repository for that reason.
 
 Build and run: see `docs/BUILDING.md`, `scripts/setup-victory.ps1` and `scripts/play-victory.ps1`.

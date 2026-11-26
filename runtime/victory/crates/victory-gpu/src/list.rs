@@ -1230,6 +1230,9 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        if crate::native::gpumem::copy_on_card(list, to as u64, from as u64, len) {
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -1315,6 +1318,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            if crate::native::gpumem::copy_on_card(list, to as u64, from as u64, a.min(b)) {
+                return;
+            }
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
@@ -1760,6 +1766,9 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && dst != 0
         && src != 0
     {
+        if crate::native::gpumem::copy_on_card(list, dst, src, len) {
+            return;
+        }
         let len = len as usize;
         list.defer_known(dst as usize, src as usize, len, move || {
             if crate::texture::committed(src as *const u8, len)

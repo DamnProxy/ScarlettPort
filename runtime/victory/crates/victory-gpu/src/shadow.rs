@@ -100,6 +100,19 @@ pub(crate) struct Shadow {
     /// copy holds the truth of these bytes, title memory the bytes from
     /// before. Never locked while `pending` is taken.
     owned: Mutex<victory_core::gpuown::Owned>,
+    /// `crate::native`: memory on the card alone (no title bytes behind
+    /// it); shaped as a copy in place so nothing copies either way.
+    native: bool,
+    /// `crate::native::buffers`: promoted (the copy is the truth), the
+    /// copy-backs in a row with no title write, and the write-watch asking
+    /// title writes were last looked for at.
+    promoted: std::sync::atomic::AtomicBool,
+    streak: std::sync::atomic::AtomicU32,
+    seen: AtomicU64,
+    /// `crate::zerocopy`: why this is a copy and not title memory in place
+    /// (a [`crate::zerocopy::Reason`] index, or `NOT_ASKED`), for the
+    /// per-reason counts of what is still copied.
+    zc: AtomicU8,
 }
 
 /// `VICTORY_COPY_BACK_ONLY_READBACK`: the copies with owned bytes (`owning`
@@ -401,9 +414,20 @@ fn card_limits() -> (u64, u64) {
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
             env_mb("VICTORY_CARD_BUFFERS_MB"),
         );
+        // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
+        // least size in KiB, so that it can go under 1 MiB: 64 is every title
+        // buffer. Copies under 1 MiB are nearly all there are and few bytes;
+        // in the PC's memory every load, store and atomic a shader does on
+        // them crosses the bus.
+        let mut min_bytes = min_bytes;
+        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
+            && kib > 0
+        {
+            min_bytes = kib << 10;
+        }
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
-            card_buffers_min_mb = min_bytes >> 20,
+            card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
             "card buffer limits"
         );
@@ -457,11 +481,24 @@ static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
+///
+/// At most `VICTORY_CARD_ROOM_KEPT_MB` (live; 512, the default card-copy
+/// budget; 0: no cap, as before). `CARD_BUFFERS_MB` is a ceiling, not what
+/// the title asks for: with it at 4,096 the queue kept 3,731 MB for copies
+/// that never came (7 copies, 365 MB, made), counted the card full at 4.8 GB
+/// of 11.3 GB, and 2,162 due texture slots waited for 1,588 frames (C4-ZC,
+/// image-quality.md). A copy that finds no room later stays in the PC's
+/// memory, which is slower but the same picture.
 pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    static CAP_MB: victory_core::live::Switch = victory_core::live::Switch::new("CARD_ROOM_KEPT_MB", 512);
+    let kept = card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed));
+    match CAP_MB.get() {
+        0 => kept,
+        mb => kept.min(mb << 20),
+    }
 }
 
 /// The copies in the card's memory.
@@ -1806,6 +1843,9 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
+            if shadow.promoted.load(Ordering::Relaxed) {
+                return (0, 0, 0, 0, 0);
+            }
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
@@ -2235,6 +2275,30 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line, why [`Shadow::merge_under_writes`] still
+/// asked for a settle: memory not write-watched, a range whose shader
+/// writes stay in the copy (`owning`), the journal could not say, no
+/// snapshot, the changed-run cap ran out; and owning ranges put in without
+/// a settle (`VICTORY_PIPE_OWNED_MERGE`).
+static STALE_WHY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`STALE_WHY`], taken.
+pub(crate) fn stale_why_stats() -> [u64; 6] {
+    [0, 1, 2, 3, 4, 5].map(|i| STALE_WHY[i].swap(0, Ordering::Relaxed))
+}
+
+/// `VICTORY_PIPE_OWNED_MERGE=1` (live, off by default): a title write on a
+/// page of a range whose shader writes stay in a copy in the card's memory
+/// (`VICTORY_COPY_BACK_ONLY_READBACK`), under a flight, no longer settles
+/// the flights. What the settle led to is sent instead, behind the flight:
+/// the title's bytes of that range on each page it wrote after the range
+/// was declared (`gpuown::Owned::title_wrote`'s rule: they win there), and
+/// nothing of the range on pages it wrote before (the shader's bytes stay).
+/// The card runs the send after the flight, so the bytes it ends with are
+/// those of settle-then-refresh. In the C4 runs this was ~76 of the ~90 ms
+/// a frame the submitting thread stood waiting for the card.
+pub(crate) static PIPE_OWNED_MERGE: victory_core::live::Switch = victory_core::live::Switch::new("PIPE_OWNED_MERGE", 0);
+
 /// The gap, in bytes, over which the title bytes put into a copy in the
 /// card's memory under flights' shader writes are joined into one run
 /// (`VICTORY_MERGE_GAP`, 0 to 64; 0 by default: only the bytes the title
@@ -2449,6 +2513,14 @@ impl Drop for Shadow {
             if owners.remove(self.id).is_some() {
                 OWNERS_COUNT.store(owners.len(), Ordering::Relaxed);
             }
+        }
+        if self.native {
+            return;
+        }
+        if *self.promoted.get_mut() {
+            let nb = &crate::native::buffers::STATS;
+            nb[crate::native::buffers::LIVE].fetch_sub(1, Ordering::Relaxed);
+            nb[crate::native::buffers::LIVE_BYTES].fetch_sub(self.len, Ordering::Relaxed);
         }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
@@ -2860,7 +2932,135 @@ impl Shadow {
             pre: Mutex::default(),
             owning: Mutex::default(),
             owned: Mutex::new(victory_core::gpuown::Owned::new(PAGE)),
+            native: false,
+            promoted: std::sync::atomic::AtomicBool::new(false),
+            streak: std::sync::atomic::AtomicU32::new(0),
+            seen: AtomicU64::new(0),
+            zc: AtomicU8::new(crate::zerocopy::NOT_ASKED),
         }
+    }
+
+    /// `crate::native::buffers`: a plain host copy of a title buffer that
+    /// is no read-back buffer.
+    fn may_promote(&self) -> bool {
+        self.card.is_none()
+            && self.place.is_none()
+            && self.rebar == 0
+            && !self.window
+            && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+            && !crate::readback::tagged_in(self.start, self.len)
+    }
+
+    /// Whether the title wrote in the copy's memory since last asked.
+    /// Pages are compared with when the copy last took them: our own writes
+    /// into title memory (copy-backs) are taken with them.
+    fn title_wrote(&self) -> Option<Vec<usize>> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (now, written) = crate::watch::writes(start, end, true)?;
+        let seen = self.seen.swap(now, Ordering::Relaxed);
+        let first = start / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = written
+            .into_iter()
+            .filter(|&(page, asked)| asked > seen && copied.get(page - first).is_none_or(|&c| asked > c))
+            .map(|(page, _)| page)
+            .collect();
+        Some(pages)
+    }
+
+    /// At the end of a copy-back of this copy (not promoted): one more in a
+    /// row if the title wrote nothing; promoted at the streak.
+    fn native_count(&self) {
+        use crate::native::buffers as nb;
+        if !nb::on() || !self.may_promote() {
+            return;
+        }
+        match self.title_wrote() {
+            Some(pages) if pages.is_empty() => {}
+            _ => {
+                self.streak.store(0, Ordering::Relaxed);
+                return;
+            }
+        }
+        if self.streak.fetch_add(1, Ordering::Relaxed) + 1 >= nb::streak()
+            && !self.promoted.swap(true, Ordering::Relaxed)
+        {
+            nb::STATS[nb::PROMOTED].fetch_add(1, Ordering::Relaxed);
+            nb::STATS[nb::LIVE].fetch_add(1, Ordering::Relaxed);
+            nb::STATS[nb::LIVE_BYTES].fetch_add(self.len, Ordering::Relaxed);
+            let n = nb::STATS[nb::PROMOTED].load(Ordering::Relaxed);
+            if n <= 20 || n.is_power_of_two() {
+                tracing::warn!(n, start = format_args!("{:#x}", self.start), len = self.len, "native buffers: promoted");
+            }
+        }
+    }
+
+    /// Promoted: whether to go on as such. The title wrote in it: its
+    /// copy's bytes go into title memory for the pages it did not write,
+    /// and it is demoted.
+    fn native_still(&self) -> bool {
+        use crate::native::buffers as nb;
+        if !self.promoted.load(Ordering::Relaxed) {
+            return false;
+        }
+        let pages = match self.title_wrote() {
+            Some(pages) if pages.is_empty() => return true,
+            Some(pages) => pages,
+            None => Vec::new(),
+        };
+        self.promoted.store(false, Ordering::Relaxed);
+        self.streak.store(0, Ordering::Relaxed);
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut put = 0u64;
+        let mut at = start;
+        while at < end {
+            let page = at / PAGE;
+            let next = ((page + 1) * PAGE).min(end);
+            if !pages.contains(&page) {
+                let n = next - at;
+                // SAFETY: the copy's mapping holds the buffer's bytes at
+                // their offsets.
+                let src = unsafe { std::slice::from_raw_parts(self.data.add(at - start), n) };
+                crate::watch::writing(at, n);
+                crate::host::write_run(at as *mut u8, src.as_ptr(), n);
+                put += n as u64;
+            }
+            at = next;
+        }
+        nb::STATS[nb::DEMOTED].fetch_add(1, Ordering::Relaxed);
+        nb::STATS[nb::LIVE].fetch_sub(1, Ordering::Relaxed);
+        nb::STATS[nb::LIVE_BYTES].fetch_sub(self.len, Ordering::Relaxed);
+        nb::STATS[nb::MATERIALIZED].fetch_add(put, Ordering::Relaxed);
+        let n = nb::STATS[nb::DEMOTED].load(Ordering::Relaxed);
+        if n <= 20 || n.is_power_of_two() {
+            tracing::warn!(n, start = format_args!("{:#x}", self.start), len = self.len, title_pages = pages.len(), put, "native buffers: demoted (title CPU write)");
+        }
+        false
+    }
+
+    /// `crate::native`: `buffer` (over `heap`) serves title memory
+    /// `[start, start + len)` on the card alone. As a copy in place:
+    /// nothing refreshed, watched, snapshotted or copied back.
+    pub(crate) fn native(
+        buffer: ID3D12Resource,
+        heap: windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+        gpu: u64,
+        start: u64,
+        len: u64,
+    ) -> Shadow {
+        let mut shadow = Shadow::new(buffer, start as *mut u8, gpu, start, len);
+        LIVE[0].fetch_sub(1, Ordering::Relaxed);
+        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        POOL_LIVE[crate::watch::pool_class(start as usize)].fetch_sub(len, Ordering::Relaxed);
+        *shadow.watched.get_mut() = NOT_WATCHED;
+        shadow.place = Some((heap, 0));
+        shadow.native = true;
+        shadow
+    }
+
+    /// Whether the copy is `crate::native` memory.
+    pub(crate) fn is_native(&self) -> bool {
+        self.native
     }
 
     /// `VICTORY_MEM2_GPU_ONLY_NOSNAP`: whether the ranges shaders write in
@@ -3336,7 +3536,17 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
-            crate::zerocopy::back_saved(len.min(self.left(address)));
+            let len = len.min(self.left(address));
+            crate::zerocopy::back_saved(len);
+            // With `crate::zerocopy` the range is still declared, for its
+            // ordering only: the flights in the air hold it, so that code of
+            // ours reading title memory there (title copies, fills, texture
+            // refreshes) and refreshes of other copies of those bytes wait
+            // for the card, as late wait and the relay need. Its snapshot,
+            // compare and copy-back stay nothing (`writing`, `copy_back`).
+            if crate::zerocopy::on() {
+                list.defer_gpu_write(self, address as usize, len as usize);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -3387,6 +3597,11 @@ impl Shadow {
         }
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
+            return;
+        }
+        // Promoted (`crate::native::buffers`): declared, no snapshot.
+        if self.promoted.load(Ordering::Relaxed) {
+            pending.push(range);
             return;
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
@@ -3516,6 +3731,20 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        if self.promoted.load(Ordering::Relaxed) {
+            use crate::native::buffers as nb;
+            nb::STATS[nb::SKIPPED].fetch_add(1, Ordering::Relaxed);
+            nb::STATS[nb::SKIPPED_BYTES].fetch_add(len as u64, Ordering::Relaxed);
+            crate::zerocopy::promoted_skipped(len as u64);
+            return 0;
+        }
+        let written = self.copy_back_inner(address, len, found);
+        crate::zerocopy::still_copied_back(self.zc.load(Ordering::Relaxed), len as u64, written as u64);
+        self.native_count();
+        written
+    }
+
+    fn copy_back_inner(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.nosnap.load(Ordering::Relaxed) {
             let (from, to) = self.inside(address, len);
             self.compared(from, to);
@@ -3993,16 +4222,28 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            STALE_WHY[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         // A range whose shader writes stay in the copy has no snapshot to
         // take the title's bytes: the flights are settled, and the title's
-        // write is taken after (`Shadow::owned_conflicts`).
-        {
+        // write is taken after (`Shadow::owned_conflicts`). With
+        // `PIPE_OWNED_MERGE` and a copy in the card's memory, what that
+        // would send is sent now, behind the flight.
+        let own_busy: Vec<(usize, usize, u64)> = {
             let owning = self.owning.lock().unwrap_or_else(|e| e.into_inner());
-            if busy.iter().any(|&(a, e)| owning.iter().any(|&(p, q, _, _)| p < e && a < q)) {
+            owning
+                .iter()
+                .filter(|&&(p, q, _, _)| busy.iter().any(|&(a, e)| p < e && a < q))
+                .map(|&(p, q, mark, _)| (p, q, mark))
+                .collect()
+        };
+        if !own_busy.is_empty() {
+            if !(PIPE_OWNED_MERGE.on() && self.card.is_some()) {
+                STALE_WHY[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             }
+            STALE_WHY[5].fetch_add(1, Ordering::Relaxed);
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
@@ -4015,6 +4256,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                STALE_WHY[2].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -4054,7 +4296,37 @@ impl Shadow {
                     } else {
                         find_changed_runs(title, held, merge_gap(), &mut runs);
                     }
+                    if !own_busy.is_empty() {
+                        // Owning ranges on this page: none of the compare's
+                        // runs (the shader's bytes stay where the title
+                        // wrote before the range was declared); all of the
+                        // range where it wrote after (its bytes win).
+                        let wrote = written.iter().find(|w| w.0 == page).map(|w| w.1);
+                        let cut: Vec<(usize, usize)> = own_busy
+                            .iter()
+                            .filter(|&&(p, q, _)| p < hi && lo < q)
+                            .map(|&(p, q, _)| (p.max(lo) - lo, q.min(hi) - lo))
+                            .collect();
+                        if !cut.is_empty() {
+                            let mut kept = Vec::with_capacity(runs.len() + cut.len());
+                            for &(r, m) in &runs {
+                                kept.extend(
+                                    victory_core::gpuown::subtract(r, r + m, cut.iter().copied())
+                                        .into_iter()
+                                        .map(|(x, y)| (x, y - x)),
+                                );
+                            }
+                            for &(p, q, mark) in &own_busy {
+                                if p < hi && lo < q && wrote.is_some_and(|w| w > mark) {
+                                    let (x, y) = (p.max(lo) - lo, q.min(hi) - lo);
+                                    kept.push((x, y - x));
+                                }
+                            }
+                            runs = kept;
+                        }
+                    }
                     if runs.len() > *runs_left {
+                        STALE_WHY[4].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -4065,6 +4337,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        STALE_WHY[3].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
@@ -4113,6 +4386,18 @@ impl Shadow {
             crate::zerocopy::refresh_saved(len.min((self.start + self.len).saturating_sub(address as u64) as usize) as u64);
             return 0;
         }
+        // Promoted (`crate::native::buffers`): the copy is the truth.
+        if self.native_still() {
+            crate::zerocopy::promoted_skipped(len.min((self.start + self.len).saturating_sub(address as u64) as usize) as u64);
+            return 0;
+        }
+        let copied = self.update_copy(address, len);
+        crate::zerocopy::still_refreshed(self.zc.load(Ordering::Relaxed), copied as u64);
+        copied
+    }
+
+    /// [`Shadow::update`] for a plain copy: the bytes copied.
+    fn update_copy(&self, address: usize, len: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4511,6 +4796,22 @@ impl Shadow {
         Some((&card.staging, before, card.size))
     }
 
+    /// The bytes of the copy the card's hashes cover. With
+    /// `VICTORY_CARD_HASH_LEN=1` (off by default here; on upstream): the
+    /// title buffer's own, rounded up to the hash's 16-byte step. The card's
+    /// buffer is the title buffer rounded up to 64 KiB, of which a title
+    /// buffer of 288 bytes can give nothing back but those (after fxceless
+    /// c36971b2). Otherwise the whole card buffer, as before.
+    pub(crate) fn card_hash_size(&self) -> u64 {
+        static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let size = self.card.as_ref().map_or(self.len, |c| c.size);
+        if *OWN.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_LEN").is_some_and(|v| v == "1")) {
+            self.len.next_multiple_of(16).min(size)
+        } else {
+            size
+        }
+    }
+
     /// Shader writes are declared for a copy in the card's memory: makes
     /// its "before" twin with `make` (bytes to buffer) if it has none.
     /// Whether one was made now: the caller fills it, whole, from the
@@ -4791,6 +5092,7 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
+    crate::native::gpumem::released(resource, start);
     buffers().remove(&(start, resource));
 }
 
@@ -4817,7 +5119,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
+            .filter(|(key, shadow)| shadow.place.is_some() && !shadow.native && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
@@ -4826,7 +5128,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some() && !s.native) {
                 gone.extend(entry.shadow.take());
             }
         }
@@ -4882,6 +5184,10 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    // `crate::native` first: memory on the card alone.
+    if let Some(native) = crate::native::gpumem::find(address, len) {
+        return Some(native);
+    }
     // Shared first: the buffer's copy made already, or no buffer there.
     {
         let map = buffers_read();
@@ -4906,6 +5212,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        // `crate::native`: an unordered-access buffer in a GPU-only
+        // reservation with no title bytes: the card's own.
+        if crate::native::gpumem()
+            && let Some(native) = crate::native::gpumem::buffer(key.1, key.0, len, crate::resource::flags_of(key.1))
+        {
+            entry.shadow = Some(native);
+            return entry.shadow.clone();
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
@@ -4918,11 +5232,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        let why = crate::zerocopy::take_reason();
         // With `crate::rebar` (level 2): a small one in the card's memory
         // the CPU maps; never one the title reads on the CPU.
         if !big
             && let Some(shadow) = rebar_copy(crate::rebar::Kind::Buffer, key.0, len, size, false)
         {
+            shadow.zc.store(why, Ordering::Relaxed);
             entry.shadow = Some(shadow);
             return entry.shadow.clone();
         }
@@ -4967,6 +5283,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        *shadow.zc.get_mut() = why;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -5188,14 +5505,41 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
+    // `VICTORY_ZERO_COPY_NARROW`: a narrowed window in place already made
+    // for this ask's pages (the whole window is not one run).
+    let narrowed = if crate::zerocopy::narrow_on() { crate::zerocopy::narrow(address, end, (start, len)) } else { None };
+    if let Some(key) = narrowed
+        && let Some(shadow) = map.get(&key)
+        && shadow.in_place()
+    {
+        note(shadow);
+        return Some(shadow.clone());
+    }
     if let Some(placed) = crate::inplace::place_for(start, len, true, false) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    let mut why = crate::zerocopy::take_reason();
+    // Scattered as a whole: the asked pages alone, if they are one run, in
+    // place (exact: it is the title's memory, as the whole would be).
+    if why == crate::zerocopy::Reason::Scattered.index() as u8
+        && let Some(key) = narrowed
+        && !map.contains_key(&key)
+    {
+        if let Some(placed) = crate::inplace::place_for(key.0, key.1, true, false) {
+            crate::zerocopy::NARROWED.fetch_add(1, Ordering::Relaxed);
+            let shadow = Arc::new(Shadow::placed(placed, key.0, key.1, true));
+            note(&shadow);
+            map.insert(key, shadow.clone());
+            return Some(shadow);
+        }
+        why = crate::zerocopy::take_reason();
+    }
     // With `crate::rebar`: in the card's memory the CPU maps.
     if let Some(shadow) = rebar_copy(crate::rebar::Kind::Window, start, len, len, true) {
+        shadow.zc.store(why, Ordering::Relaxed);
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
@@ -5228,6 +5572,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    *shadow.zc.get_mut() = why;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -5268,6 +5613,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     const LATELY: u64 = 512;
     if len == 0 {
         return None;
+    }
+    if let Some(native) = crate::native::gpumem::find(address, len) {
+        return Some(native);
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());

@@ -69,6 +69,9 @@ pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 /// Pipelines made whose store the library refused (a name already stored
 /// with another description).
 pub(crate) static STORE_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Stores refused because the same description was stored under the name
+/// meanwhile (harmless).
+pub(crate) static DUPLICATE_STORES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -522,7 +525,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
@@ -595,6 +598,12 @@ pub(crate) fn pipeline(
         // above refused it (E_INVALIDARG, as for a name not there) and
         // this one is never kept, so it is made again every run. Said,
         // not left silent: the name misses something of the description.
+        // Another thread made and stored the same description first (two
+        // misses of one name at once, as the precompile's workers have):
+        // the name loads with this description, nothing is lost.
+        Err(_) if load(&library.library, PCWSTR(wide.as_ptr())).is_ok() => {
+            DUPLICATE_STORES.fetch_add(1, Ordering::Relaxed);
+        }
         Err(e) => {
             STORE_REFUSED.fetch_add(1, Ordering::Relaxed);
             let label = LABEL.with(|l| l.borrow().clone());
@@ -686,6 +695,7 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             store_refused = STORE_REFUSED.load(Ordering::Relaxed),
+            duplicate_stores = DUPLICATE_STORES.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),

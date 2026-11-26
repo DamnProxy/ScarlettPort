@@ -133,6 +133,11 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Shader views of placed textures read as the texture the host writes
+    /// there (`crate::resource::read_cast`), and copies made into placed
+    /// views instead (`crate::texture::alias`).
+    AliasCast,
+    AliasCopies,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1291,6 +1296,11 @@ pub(crate) fn log(frames: f64) {
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()
+    );
+    tracing::info!(
+        "  placed views of R9G9B9E5 over textures the host writes, per frame: {:.1} read as that texture (VICTORY_ALIAS_CAST), {:.1} copies into them",
+        c[C::AliasCast as usize],
+        c[C::AliasCopies as usize],
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.

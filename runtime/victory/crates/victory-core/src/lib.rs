@@ -12,6 +12,7 @@ pub mod batch;
 pub mod config;
 pub mod env;
 pub mod fastboot;
+pub mod friendly;
 pub mod gpuown;
 pub mod hints;
 pub mod kbm;

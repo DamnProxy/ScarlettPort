@@ -31,6 +31,7 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
+mod loadcache;
 mod pipeline;
 
 /// The factory interface the title asks for.
@@ -161,9 +162,11 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     static IDS: AtomicU64 = AtomicU64::new(1);
+    let ident = if loadcache::enabled() { loadcache::file_ident(&kept, &file) } else { 0 };
     let file = File {
         file,
         id: IDS.fetch_add(1, Ordering::Relaxed),
+        ident,
         overlapped: OnceLock::new(),
     };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), file);
@@ -293,6 +296,8 @@ struct File {
     file: std::fs::File,
     /// Unique for the process (addresses are reused), for the read cache.
     id: u64,
+    /// Path, size and time hashed, for the load cache's keys (0: none).
+    ident: u64,
     /// A second handle for overlapped reads (the pipeline's), opened on
     /// first use.
     overlapped: OnceLock<Option<pipeline::AsyncHandle>>,
@@ -461,12 +466,17 @@ fn scheduler() -> Option<&'static Scheduler> {
         if pipeline::config().enabled && pipeline::start(scheduler) {
             return;
         }
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // Background work: N-2 at most (was every logical processor),
+        // below normal (`victory_core::friendly`).
+        let workers = victory_core::friendly::background_cap();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        victory_core::friendly::background_thread();
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
@@ -595,10 +605,12 @@ impl Lanes {
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
+                codec_workers = format_args!("{:.2}", CODEC_NS.swap(0, Ordering::Relaxed) as f64 / 1e9 / elapsed.as_secs_f64()),
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
             pipeline::log_summary(elapsed.as_secs_f64());
+            loadcache::log_summary();
             self.done = Default::default();
             self.bcpack = Default::default();
             self.since = None;
@@ -950,34 +962,88 @@ fn execute(request: &Request, prefetched: Option<&[u8]>) -> Result<(), HRESULT> 
         // world's first frame). It is read beside and copied in: our copy
         // faults into the guard like the title's own writes.
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
-        return into_destination(request, size, |out| {
+        // The load cache: raw reads only save the USB read, so not with
+        // VICTORY_LOAD_CACHE_VERIFY (which reads the source anyway).
+        let cached = load_key(request).filter(|(cache, _)| !cache.verify);
+        if let Some((cache, key)) = cached
+            && let Some(bytes) = cache.get(&key, None)
+            && bytes.len() == size
+        {
+            return serve(request, size, &bytes).map_err(|hr| fail(hr, "copying"));
+        }
+        let mut recorded = None;
+        let result = into_destination(request, size, |out| {
+            let started = std::time::Instant::now();
             if !bounce {
-                return read_into(request, out, prefetched).map(|()| size);
+                read_into(request, out, prefetched)?;
+                if cached.is_some() {
+                    recorded = Some(out.to_vec());
+                }
+            } else {
+                let mut data = vec![0; size];
+                read_into(request, &mut data, prefetched)?;
+                out.copy_from_slice(&data);
+                if cached.is_some() {
+                    recorded = Some(data);
+                }
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data, prefetched)?;
-            out.copy_from_slice(&data);
+            CODEC_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             Ok(size)
         })
         .map_err(|hr| fail(hr, "copying"));
+        if let (Ok(()), Some((cache, key)), Some(bytes)) = (&result, cached, recorded) {
+            cache.record(key, loadcache::hash(&bytes), bytes);
+        }
+        return result;
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    // The load cache: a hit is the decoded output, no read and no decode.
+    let cached = load_key(request);
+    if let Some((cache, key)) = cached
+        && !cache.verify
+        && let Some(bytes) = cache.get(&key, None)
+        && bytes.len() <= size
+    {
+        return serve(request, size, &bytes);
+    }
     let source = read_source(request, prefetched).map_err(|hr| fail(hr, "reading the source"))?;
+    if let Some((cache, key)) = cached
+        && cache.verify
+        && let Some(bytes) = cache.get(&key, Some(&source))
+        && bytes.len() <= size
+    {
+        return serve(request, size, &bytes);
+    }
+    let source_hash = cached.map(|_| loadcache::hash(&source));
     // The console's order: zlib first, then BCPack.
+    let inflating = std::time::Instant::now();
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
+        CODEC_NS.fetch_add(inflating.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Cow::Owned(packed)
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    let mut recorded = None;
+    into_destination(request, size, |out| {
+        let started = std::time::Instant::now();
+        let n = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        }?;
+        CODEC_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if cached.is_some() {
+            recorded = Some(out[..n.min(out.len())].to_vec());
+        }
+        Ok(n)
     })?;
+    if let (Some((cache, key)), Some(hash), Some(bytes)) = (cached, source_hash, recorded) {
+        cache.record(key, hash, bytes);
+    }
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -991,11 +1057,72 @@ fn execute(request: &Request, prefetched: Option<&[u8]>) -> Result<(), HRESULT> 
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
+    if fast_inflate() {
+        // Only a stream that ended counts, as with miniz_oxide (zlib-rs'
+        // one-shot `decompress_slice` passes an output too small).
+        let mut inflater = zlib_rs::Inflate::new(true, 15);
+        return match inflater.decompress(source, out, zlib_rs::InflateFlush::Finish) {
+            Ok(zlib_rs::Status::StreamEnd) => Ok(inflater.total_out() as usize),
+            rc => {
+                tracing::debug!(?rc, "dstorage: zlib stream (zlib-rs)");
+                Err(INVALID_DATA)
+            }
+        };
+    }
     miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
         .map_err(|status| {
             tracing::debug!(?status, "dstorage: zlib stream");
             INVALID_DATA
         })
+}
+
+/// `VICTORY_FAST_INFLATE=1`: zlib streams inflate with zlib-rs (SIMD,
+/// zlib-ng's design; Zlib licence) instead of miniz_oxide. The same bytes
+/// for every valid stream; a stream that does not fit `out` fails in both.
+fn fast_inflate() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_FAST_INFLATE").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("dstorage: zlib with zlib-rs (VICTORY_FAST_INFLATE)");
+        }
+        on
+    })
+}
+
+/// Nanoseconds spent inside the codecs (inflate, BCPack) and the source
+/// copies of raw reads, against all of a request's time in a worker: the
+/// rest is reading, destination bookkeeping (views, guards, page tables)
+/// and waits for locks.
+pub(super) static CODEC_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The load cache and a file request's key, when the cache is on.
+fn load_key(request: &Request) -> Option<(&'static loadcache::Cache, loadcache::Key)> {
+    if request.options & MEMORY_SOURCE != 0 || request.source.is_null() {
+        return None;
+    }
+    let cache = loadcache::get()?;
+    // SAFETY: a file object we created; the title keeps it open.
+    let file = unsafe { &*request.source.cast::<Instance<File>>() }.state.ident;
+    (file != 0).then_some((
+        cache,
+        loadcache::Key {
+            file,
+            offset: request.offset,
+            source_size: request.source_size,
+            destination_size: request.destination_size,
+            intermediate_size: request.intermediate_size,
+            codec: (request.options & (ZLIB | BCPACK)) as u32,
+        },
+    ))
+}
+
+/// Writes a load cache hit where the request's decode would have.
+fn serve(request: &Request, len: usize, bytes: &[u8]) -> Result<(), HRESULT> {
+    into_destination(request, len, |out| {
+        out[..bytes.len()].copy_from_slice(bytes);
+        Ok(bytes.len())
+    })
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -1738,6 +1865,39 @@ mod tests {
         assert_eq!(results(), (E_PENDING, E_PENDING));
         l.finish(&jobs[1], Err(INVALID_DATA));
         assert_eq!(results(), (INVALID_DATA, S_OK));
+    }
+
+    /// `VICTORY_FAST_INFLATE`: zlib-rs gives miniz_oxide's bytes, and
+    /// fails where it fails (an output too small, a broken stream).
+    #[test]
+    fn zlib_rs_inflates_byte_identical_to_miniz() {
+        let zlib_rs_inflate = |out: &mut [u8], input: &[u8]| -> Option<usize> {
+            let mut inflater = zlib_rs::Inflate::new(true, 15);
+            match inflater.decompress(input, out, zlib_rs::InflateFlush::Finish) {
+                Ok(zlib_rs::Status::StreamEnd) => Some(inflater.total_out() as usize),
+                _ => None,
+            }
+        };
+        for level in [1, 6, 9] {
+            for len in [0usize, 1, 1000, 65_536, 300_001] {
+                let plain: Vec<u8> = (0..len).map(|i| ((i * i / 7) ^ (i >> 3)) as u8).collect();
+                let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, level);
+                let (mut a, mut b) = (vec![0u8; len + 16], vec![0u8; len + 16]);
+                let n = miniz_oxide::inflate::decompress_slice_iter_to_slice(&mut a, std::iter::once(&packed[..]), true, false)
+                    .unwrap();
+                assert_eq!(zlib_rs_inflate(&mut b, &packed), Some(n));
+                assert_eq!(a, b);
+                if len > 0 {
+                    let mut small = vec![0u8; len - 1];
+                    assert_eq!(zlib_rs_inflate(&mut small, &packed), None);
+                }
+                let mut broken = packed.clone();
+                let mid = broken.len() / 2;
+                broken[mid] ^= 0x55;
+                let miniz = miniz_oxide::inflate::decompress_slice_iter_to_slice(&mut a, std::iter::once(&broken[..]), true, false);
+                assert_eq!(miniz.is_ok(), zlib_rs_inflate(&mut b, &broken).is_some());
+            }
+        }
     }
 
     #[test]

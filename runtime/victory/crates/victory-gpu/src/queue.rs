@@ -1273,6 +1273,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(windows)]
+    crate::native::probe::frame_drew(crate::draw::drawn());
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());

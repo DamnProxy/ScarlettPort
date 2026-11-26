@@ -116,6 +116,14 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// Per title slot, the frame (plus one; 0: never) in which a draw last
+    /// took a buffer or constant view of it from a table
+    /// ([`HostHeap::buffer_slot_tabled`]).
+    tabled_buffers: Vec<std::sync::atomic::AtomicU32>,
+    /// Per host slot, the null-view kind currently stored (1 = buffer SRV,
+    /// 2 = CBV, 3 = buffer UAV, 0 = other/non-null) so `VICTORY_SYNC_NULL_SKIP`
+    /// avoids recreating an identical null view.
+    nulls: Vec<std::sync::atomic::AtomicU8>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -762,6 +770,14 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+/// Whether due texture slots are served in turns, a slot looked at before
+/// and one never looked at ([`TextureQueue::due`]; on unless
+/// `VICTORY_FAIR_DUE=0`; live).
+fn fair_due() -> bool {
+    static ON: victory_core::live::Switch = victory_core::live::Switch::new("FAIR_DUE", 1);
+    ON.on()
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -795,14 +811,20 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it), newest write first: the look is a query, and memory
+    ///   that has arrived since is what the title streamed in last;
+    /// - the others, the newest write first and the oldest next, in turns:
+    ///   slot order served the low slots of a backlog of 25,000-40,000
+    ///   while the textures of the shot on screen waited (run 52: 98% of
+    ///   the drawn pixels had no colour texture in the first 3D frames);
+    /// - the two kinds one after the other, a slot looked at before first
+    ///   (`VICTORY_FAIR_DUE=0`: all those looked at before first, as
+    ///   before). With them all first, a backlog of thousands of slots
+    ///   streaming in a part at a time filled every pass in the opening
+    ///   cutscene, which the pass's time then cut, and slots never looked
+    ///   at waited 300 to 1,500 frames: faces whose textures are picked by
+    ///   index read an empty slot (black) or an older view (red, noise).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
@@ -814,15 +836,32 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && fresh_order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
+        if !fair_due() {
+            let mut order: Vec<(u32, u64)> = again_order.collect();
+            order.extend(fresh_order);
+            order.truncate(max);
+            return order;
+        }
+        let mut fresh_order = fresh_order.into_iter();
+        let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
+        while order.len() < max {
+            let (a, b) = (again_order.next(), fresh_order.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            order.extend(a);
+            order.extend(b);
         }
         order.truncate(max);
         order
@@ -1622,6 +1661,12 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { titled })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            tabled_buffers: (0..if sampler { 0 } else { titled })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
+            nulls: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -2405,6 +2450,31 @@ impl HostHeap {
         self.tabled_in(index, read, crate::frame::current());
     }
 
+    /// Records that a draw took a buffer or constant view from title slot
+    /// `index` via a table (`VICTORY_TABLE_BUFFERS=1`).
+    pub(crate) fn buffer_slot_tabled(&self, index: u32) {
+        if !table_buffers() {
+            return;
+        }
+        if let Some(stamp) = self.tabled_buffers.get(index as usize) {
+            let now = (crate::frame::current() as u32).wrapping_add(1);
+            if stamp.load(std::sync::atomic::Ordering::Relaxed) != now {
+                stamp.store(now, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Whether title slot `index` held a buffer or constant view of a draw's
+    /// table in this frame or the last.
+    fn buffer_tabled_lately(&self, index: u32, frame: u64) -> bool {
+        let Some(stamp) = self.tabled_buffers.get(index as usize) else {
+            return false;
+        };
+        let stamp = stamp.load(std::sync::atomic::Ordering::Relaxed);
+        let now = (frame as u32).wrapping_add(1);
+        stamp != 0 && now.wrapping_sub(stamp) <= 1
+    }
+
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2653,6 +2723,9 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        if let Some(null) = self.nulls.get(index as usize) {
+            null.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
@@ -2830,6 +2903,19 @@ impl HostHeap {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
+        // `VICTORY_TABLE_BUFFERS=1` (VItoriaBr 8c0758dd): a buffer or
+        // constant view a draw took from a table this frame or the last is
+        // left to its draws too (they make and fill it themselves); its
+        // print is not taken, so it is looked at again next time.
+        if table_buffers()
+            && self.buffer_tabled_lately(index, crate::frame::current())
+            && record.len() >= 12
+        {
+            let word = |at: usize| u32::from_le_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]]);
+            if word(0) == VIEW_TAG && view_at(word(4), word(8)).is_some_and(|v| null_kind(&v) != 0) {
+                return false;
+            }
+        }
         let n = record.len();
         // Never 0, which is "never looked at". (A multiply-and-fold over
         // the record's words: BLAKE3 here was most of the 35 to 42 ms a
@@ -2967,9 +3053,23 @@ impl HostHeap {
                 make(&view, self.cpu(host))
             };
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(host));
+                // `VICTORY_SYNC_NULL_SKIP=1` (VItoriaBr 8c0758dd): the same
+                // null view as the slot holds is not made again.
+                let kind = null_kind(&view);
+                let null = self.nulls.get(host as usize);
+                let same = kind != 0
+                    && null_skip()
+                    && null.is_some_and(|n| n.load(std::sync::atomic::Ordering::Relaxed) == kind);
+                if !same {
+                    null_for(&view, self.cpu(host));
+                    self.keep(host, None);
+                    if let Some(null) = null {
+                        null.store(kind, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            } else {
+                self.keep(host, kept.flatten());
             }
-            self.keep(host, kept.flatten());
             if new_key != 0 {
                 self.made_key(host, new_key);
             }
@@ -3278,6 +3378,36 @@ type Kept = Option<ID3D12Resource>;
 fn sync_tables() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
+}
+
+/// Whether the pass over records copied in as bytes also leaves buffer and
+/// constant views to the draws that take them from tables lately
+/// (`VICTORY_TABLE_BUFFERS=1`; off by default; live).
+fn table_buffers() -> bool {
+    static ON: victory_core::live::Switch = victory_core::live::Switch::new("TABLE_BUFFERS", 0);
+    ON.on()
+}
+
+/// Whether an identical null view is skipped (`VICTORY_SYNC_NULL_SKIP=1`;
+/// off by default here, on by default in VItoriaBr; live: the kinds are
+/// tracked either way).
+fn null_skip() -> bool {
+    static ON: victory_core::live::Switch = victory_core::live::Switch::new("SYNC_NULL_SKIP", 0);
+    ON.on()
+}
+
+/// Kind of null view for buffer/constant slots (1 = buffer SRV, 2 = CBV,
+/// 3 = buffer UAV, 0 = other).
+fn null_kind(view: &View) -> u8 {
+    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+    match view {
+        View::Constant(..) => 2,
+        View::Unordered(r, _, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => 3,
+        View::Placed(true, resource, _) if resource[0] == 1 => 3,
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => 1,
+        View::Placed(false, resource, _) if resource[0] == 1 => 1,
+        _ => 0,
+    }
 }
 
 /// Since the last frame line: slots on changed heap pages that
@@ -3967,6 +4097,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            // A view the title placed over a texture the host writes, in a
+            // format a view of that texture can have: the texture itself
+            // (`crate::resource::cast_source`), not a copy of it.
+            if let (Some((_, source)), Some(d)) = (crate::resource::cast_source(resource), desc.as_ref()) {
+                let mut view = srv_desc(d);
+                view.Format = DXGI_FORMAT(67);
+                // SAFETY: a live texture made castable to that format, and a
+                // slot of our heap.
+                unsafe { device.CreateShaderResourceView(&source, Some(&view), at) };
+                return Some(Some(source));
+            }
+            crate::resource::shown_uncast(resource);
             if let Some(texture) = crate::resource::host_resource(resource) {
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
@@ -4953,6 +5095,31 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// Slots looked at before and slots never looked at are served in
+    /// turns, one looked at before first: a pass that can take only some
+    /// of a backlog of slots streaming in a part at a time still reaches
+    /// the slots never looked at.
+    #[test]
+    fn the_texture_queue_serves_looked_at_and_fresh_slots_in_turns() {
+        let mut q = TextureQueue::default();
+        // Slots 100..110 looked at before (their memory not there yet).
+        for i in 0..10u32 {
+            q.written(100 + i, 1, 0, false);
+        }
+        for i in 0..10u32 {
+            let w = q.due(u64::MAX, 100).iter().find(|d| d.0 == 100 + i).unwrap().1;
+            q.later(100 + i, w, 1, 1);
+        }
+        // Slots 1..4 never looked at.
+        for i in 1..4u32 {
+            q.written(i, 2, 0, false);
+        }
+        let order: Vec<u32> = q.due(10, 6).into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 6);
+        assert!(order[0] >= 100, "a slot looked at before comes first: {order:?}");
+        assert_eq!(order.iter().filter(|&&i| i < 100).count(), 3, "every fresh slot is reached: {order:?}");
     }
 
     /// Slots held back for lack of room on the card are not handed out

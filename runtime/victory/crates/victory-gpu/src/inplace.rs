@@ -194,7 +194,6 @@ fn zero_copy_for(start: u64, len: u64, window: bool, big: bool) -> Option<Placed
     };
     let ask = Ask {
         level: crate::zerocopy::level(),
-        late_wait: crate::host::late(),
         big,
         big_in_place: crate::zerocopy::big_in_place(),
         backing,
@@ -207,6 +206,7 @@ fn zero_copy_for(start: u64, len: u64, window: bool, big: bool) -> Option<Placed
         Err(reason) => {
             STATS[if reason == Reason::OverBudget { 6 } else { 4 }].fetch_add(1, Ordering::Relaxed);
             crate::zerocopy::fell_back(start, len, reason);
+            crate::zerocopy::set_reason(Some(reason));
             return None;
         }
     };
@@ -221,6 +221,7 @@ fn zero_copy_for(start: u64, len: u64, window: bool, big: bool) -> Option<Placed
             STATS[i].fetch_add(1, Ordering::Relaxed);
             STATS[i + 1].fetch_add(len, Ordering::Relaxed);
             crate::zerocopy::placed(len, route);
+            crate::zerocopy::set_reason(None);
             Some(placed)
         }
         Err(e) => {
@@ -228,6 +229,7 @@ fn zero_copy_for(start: u64, len: u64, window: bool, big: bool) -> Option<Placed
                 tracing::warn!(start = format_args!("{start:#x}"), len, ?route, error = %e, "zero copy: title memory not opened in place, a copy instead");
             }
             crate::zerocopy::fell_back(start, len, Reason::Refused);
+            crate::zerocopy::set_reason(Some(Reason::Refused));
             None
         }
     }

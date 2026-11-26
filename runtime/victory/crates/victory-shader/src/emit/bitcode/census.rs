@@ -42,6 +42,8 @@ pub const KINDS: [&str; 26] = [
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Census {
     pub counts: [u32; KINDS.len()],
+    /// Heap handles made with the non-uniform flag (a per-lane loop each in the driver's code).
+    pub nonuniform: u32,
 }
 
 thread_local! {
@@ -157,7 +159,14 @@ impl Module {
                     Op::Load(_) => k("lds_load"),
                     Op::Store(..) => k("lds_store"),
                     Op::AtomicRmw(..) | Op::CmpXchg(..) => k("atomic"),
-                    Op::Call(f, _) => call_kind[*f as usize],
+                    Op::Call(f, a) => {
+                        if a.first().and_then(|&o| self.int_value(o)) == Some(218)
+                            && a.get(3).and_then(|&n| self.int_value(n)) == Some(-1)
+                        {
+                            c.nonuniform += 1;
+                        }
+                        call_kind[*f as usize]
+                    }
                 };
                 c.counts[at] += 1;
                 match self.tags.get(&i) {

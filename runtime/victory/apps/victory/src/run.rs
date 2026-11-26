@@ -26,6 +26,10 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     set_phase(BootPhase::Reading);
     let cfg = victory_core::Config::load()?;
+    // Pool caps, CPU sets and the memory line (`VICTORY_FRIENDLY=1`).
+    if execute {
+        victory_core::friendly::start();
+    }
     // `[display]`, `[pace]` and the files the F1 overlay saves to, before the controls.
     for problem in victory_core::overlay::configure(&cfg) {
         eprintln!("VIctory: {problem}");

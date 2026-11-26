@@ -55,6 +55,7 @@ pub(crate) fn noquery() -> bool {
 /// The runtime reserved `[at, at + len)` as a placeholder for physical
 /// pages: holes until it maps views there.
 pub fn title_memory_placeholder(at: usize, len: usize) {
+    crate::native::gpumem::reserved(at as u64, len as u64);
     map().reserve(at, len);
 }
 

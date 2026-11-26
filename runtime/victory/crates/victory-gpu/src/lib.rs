@@ -52,10 +52,13 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+pub mod native;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
+#[cfg(windows)]
+mod ranges;
 #[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -235,6 +235,9 @@ pub(crate) struct Module {
     /// which later branches to it and phis at its top go to.
     heads: HashMap<usize, usize>,
     // rule-region: end
+    /// [Module::uniform]'s answers, by instruction (an instruction's operation does not
+    /// change once made but for a phi's incoming values, and a phi is never proven).
+    uniform_memo: std::cell::RefCell<HashMap<u32, bool>>,
 }
 
 impl Module {
@@ -422,6 +425,68 @@ impl Module {
             _ => full,
         };
         r.min(full)
+    }
+
+    /// Whether `v` is the same in every lane of a host wave that computes it,
+    /// from how it is made: a constant; integer arithmetic, a cast, compare,
+    /// select or extract of such values, or `dx.op` math of them (6-56,
+    /// 130-131); a thread group's number (94); a ballot (116) or first-lane
+    /// read (118); a handle made from such values without
+    /// the non-uniform flag (216-218); a constant buffer or buffer read
+    /// through such a handle at such a place (59, 68, 139: one request, the
+    /// same dwords for every lane); a lane read at such a lane (117). A phi
+    /// (lanes may leave a loop at different trips) or any other read is not
+    /// proven.
+    /// Conservative: `false` says nothing. (`opt::UNIFORM_INDEX`.)
+    pub fn uniform(&self, v: V) -> bool {
+        self.uniform_depth(v, 64)
+    }
+
+    fn uniform_depth(&self, v: V, depth: u32) -> bool {
+        let i = match v {
+            V::Const(_) => return true,
+            V::Inst(i) => i,
+            _ => return false,
+        };
+        if let Some(&k) = self.uniform_memo.borrow().get(&i) {
+            return k;
+        }
+        if depth == 0 {
+            return false;
+        }
+        let u = |x: &V| self.uniform_depth(*x, depth - 1);
+        let r = match &self.insts[i as usize].op {
+            Op::Bin(_, x, y) | Op::Cmp(_, x, y) => u(x) && u(y),
+            Op::Cast(_, x) | Op::Extract(x, _) => u(x),
+            Op::Select(c, x, y) => u(c) && u(x) && u(y),
+            Op::Call(f, args) if self.funcs[*f as usize].name.starts_with("dx.op.") => {
+                match args.first().and_then(|&a| self.int_value(a)) {
+                    // GroupId; WaveActiveBallot, WaveReadLaneFirst (one answer for the
+                    // lanes that run the call)
+                    Some(94) | Some(116) | Some(118) => true,
+                    // math of its operands alone: FAbs..Dot4 (unary, binary, tertiary,
+                    // bit counts, firstbit, bfi, dots), legacy f16 conversions
+                    Some(6..=56) | Some(130) | Some(131) => args[1..].iter().all(u),
+                    // A buffer read (68 bufferLoad, 139 rawBufferLoad) at one place for every
+                    // lane is one request; its lanes get the same dwords.
+                    Some(59) | Some(68) | Some(139) | Some(216) | Some(217) => {
+                        args[1..].iter().all(u)
+                    }
+                    // WaveReadLaneAt at a lane every lane names
+                    Some(117) => args.get(2).is_some_and(u),
+                    // createHandleFromHeap(index, sampler, nonuniform)
+                    Some(218) => {
+                        args.get(3).and_then(|&n| self.int_value(n)) == Some(0)
+                            && args[1..].iter().all(u)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        // (a alse from running out of depth is kept too: conservative)
+        self.uniform_memo.borrow_mut().insert(i, r);
+        r
     }
 
     /// Gives constant `old` the content of `new` (both stay valid).
@@ -1399,6 +1464,84 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// `Module::uniform` (`opt::UNIFORM_INDEX`) on encoded patterns: a heap index read
+    /// from a constant buffer at a constant row, or a first-lane read, plus a constant, is
+    /// uniform; a thread's in-group number, a phi or anything mixed with them is not.
+    #[test]
+    fn uniform_indices_proven_and_not() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let op_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let dxop = m.function("dx.op.unary.i32", op_ty, Some(Attr::ReadNone), false);
+        let cb = m.function("dx.op.cbufferLoadLegacy.i32", op_ty, Some(Attr::ReadOnly), false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let b = m.new_block();
+        let (k59, k93, k118, k94) = (m.i32(59), m.i32(93), m.i32(118), m.i32(94));
+        let row = m.i32(3);
+        let from_cb = m.call(b, cb, vec![k59, row]);
+        let tid = m.call(b, dxop, vec![k93, row]); // ThreadId: per lane
+        let first = m.call(b, dxop, vec![k118, tid]); // WaveReadLaneFirst
+        let group = m.call(b, dxop, vec![k94, row]);
+        let k139 = m.i32(139);
+        let raw_uniform = m.call(b, dxop, vec![k139, from_cb]);
+        let raw_lane = m.call(b, dxop, vec![k139, tid]);
+        // the first-active-lane read as the lowering makes it: WaveReadLaneAt(v,
+        // FirstbitLo(WaveActiveBallot(c)))
+        let op3_ty = m.func_ty(i32t, vec![i32t, i32t, i32t]);
+        let lane_at = m.function("dx.op.waveReadLaneAt.i32", op3_ty, Some(Attr::ReadNone), false);
+        let (k116, k32, k117) = (m.i32(116), m.i32(32), m.i32(117));
+        let ballot = m.call(b, dxop, vec![k116, tid]);
+        let lowest = m.call(b, dxop, vec![k32, ballot]);
+        let first_read = m.call(b, lane_at, vec![k117, tid, lowest]);
+        let own_read = m.call(b, lane_at, vec![k117, from_cb, tid]);
+        let four = m.i32(4);
+        let a = m.bin(b, Bin::Add, from_cb, four);
+        let c = m.bin(b, Bin::Mul, first, group);
+        let mixed = m.bin(b, Bin::Add, a, tid);
+        let cond = m.cmp(b, pred::EQ, a, c);
+        let sel = m.select(b, cond, a, c);
+        let sel_lane = m.select(b, cond, a, tid);
+        let j = m.new_block();
+        m.terminate(b, Term::Br(j));
+        let p = m.phi(j, i32t);
+        m.set_phi(p, vec![(a, b)]);
+        for v in [four, from_cb, first, group, a, c, sel, raw_uniform, ballot, lowest, first_read] {
+            assert!(m.uniform(v), "{v:?}");
+        }
+        for v in [tid, mixed, sel_lane, p, raw_lane, own_read] {
+            assert!(!m.uniform(v), "{v:?}");
+        }
+    }
+
+    /// `Module::bound` as `opt::BOUNDS` uses it: an index masked or shifted into range
+    /// needs no clamp against the heap limit, an unbounded one does.
+    #[test]
+    fn bounded_indices_within_the_heap() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let op_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let cb = m.function("dx.op.cbufferLoadLegacy.i32", op_ty, Some(Attr::ReadOnly), false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let b = m.new_block();
+        let (k59, row) = (m.i32(59), m.i32(0));
+        let x = m.call(b, cb, vec![k59, row]);
+        let mask = m.i32(0xFFFF);
+        let masked = m.bin(b, Bin::And, x, mask);
+        let base = m.i32(1000);
+        let plus = m.bin(b, Bin::Add, masked, base);
+        let twelve = m.i32(12);
+        let shifted = m.bin(b, Bin::LShr, x, twelve);
+        let limit = 999_999u64;
+        assert!(m.bound(plus) <= limit);
+        assert!(m.bound(masked) <= 2047 || m.bound(masked) == 0xFFFF);
+        assert!(m.bound(shifted) > limit); // 2^20 - 1 > 999,999: keeps its clamp
+        assert!(m.bound(x) > limit);
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each

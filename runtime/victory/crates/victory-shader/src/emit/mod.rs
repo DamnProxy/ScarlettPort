@@ -220,7 +220,10 @@ pub fn group_sync() -> u8 {
 ///   single-predecessor blocks, 128 no clamp of a constant view index
 ///   within the heap, 256 24-bit multiplies without masks they do not
 ///   need, 512 no LDS meeting of two host waves where it orders nothing,
-///   1024 no exchange of two host waves for an answer every lane shares.
+///   1024 no exchange of two host waves for an answer every lane shares,
+///   2048 no clamp of a view or sampler index whose every value is within
+///   the heap (`Module::bound`), 4096 no non-uniform flag on a heap handle
+///   whose index every lane shares (`Module::uniform`).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).

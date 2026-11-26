@@ -99,6 +99,14 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             crate::hooks::OWN_UPSCALER_ENV
         );
     }
+    // Native replacements last, over the relocated and hooked image.
+    // SAFETY: just mapped, and no title code has run.
+    let native = unsafe {
+        victory_native::install(loaded.base(), loaded.info.size_of_image as usize, &prepared.original_hash.to_hex())
+    };
+    if native > 0 {
+        tracing::warn!(replaced = native, "native title functions ({})", victory_native::NATIVE_ENV);
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),

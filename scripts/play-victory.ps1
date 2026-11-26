@@ -62,6 +62,8 @@ foreach ($k in 'VICTORY_PRECOMPILED_GRAPHICS','VICTORY_READFIX','VICTORY_COPY_BA
 # fx-cand4: sub-page memory, copies without the extra query, 4 GB card buffers. VICTORY_REMAP_LAZY is left
 # out: a moving A/B showed it now slows the world down.
 $env:VICTORY_MEM_SUBPAGE = '1'; $env:VICTORY_COPY_NOQUERY = '1'; $env:VICTORY_CARD_BUFFERS_MB = '4096'
+# Leaves processor time to the desktop while the title runs.
+$env:VICTORY_FRIENDLY = '1'
 $env:VICTORY_PIPELINE_WAIT_MS = '0'
 if ($FastBoot) { $env:VICTORY_FAST_BOOT = '1' }
 if ($SaveSlot) { $env:VICTORY_SAVE_SLOT = $SaveSlot }

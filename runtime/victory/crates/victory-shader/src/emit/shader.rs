@@ -507,6 +507,9 @@ impl Shader {
         let within = |m: &super::bitcode::Module, bound: u32| {
             super::shader_opt() & super::bitcode::opt::CLAMPS != 0
                 && m.int_value(index).is_some_and(|k| (k as u32) <= bound)
+                // or an index whose every value is within it (`opt::BOUNDS`)
+                || super::shader_opt() & super::bitcode::opt::BOUNDS != 0
+                    && m.bound(index) <= u64::from(bound)
         };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 && within(&self.m, limit) || sampler && within(&self.m, 2047) {
@@ -536,6 +539,10 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        // an index every lane shares needs no per-lane handle (`opt::UNIFORM_INDEX`)
+        let nonuniform = nonuniform
+            && !(super::shader_opt() & super::bitcode::opt::UNIFORM_INDEX != 0
+                && self.m.uniform(index));
         self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(

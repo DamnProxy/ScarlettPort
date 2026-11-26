@@ -56,6 +56,8 @@ pub(super) struct Config {
     gap: u64,
     decode_threads: usize,
     unbuffered: bool,
+    /// Overlapped handles per file (`VICTORY_DS_HANDLES`, 1).
+    handles: usize,
     cache_bytes: u64,
     max_jobs: usize,
     /// Source bytes the pipeline may hold (reads and decode queue).
@@ -85,9 +87,13 @@ pub(super) fn config() -> &'static Config {
             qd_file: env_u64("VICTORY_DS_QD_FILE", 16).max(1) as usize,
             coalesce: env_u64("VICTORY_DS_COALESCE_KB", 2048).min(16 << 10) << 10,
             gap: env_u64("VICTORY_DS_GAP_KB", 256) << 10,
-            decode_threads: env_u64("VICTORY_DS_DECODE_THREADS", cpus.saturating_sub(4).max(2) as u64)
+            decode_threads: env_u64(
+                "VICTORY_DS_DECODE_THREADS",
+                victory_core::friendly::background_threads(cpus.saturating_sub(4).max(2)) as u64,
+            )
                 .clamp(1, 64) as usize,
             unbuffered: env_u64("VICTORY_DS_UNBUFFERED", 1) != 0,
+            handles: env_u64("VICTORY_DS_HANDLES", 1).clamp(1, 32) as usize,
             cache_bytes: env_u64("VICTORY_DS_CACHE_MB", 0) << 20,
             max_jobs: env_u64("VICTORY_DS_MAX_JOBS", 4096).max(1) as usize,
             max_held: 512 << 20,
@@ -102,6 +108,7 @@ pub(super) fn config() -> &'static Config {
             gap_kb = config.gap >> 10,
             decode_threads = config.decode_threads,
             unbuffered = config.unbuffered,
+            handles = config.handles,
             cache_mb = config.cache_bytes >> 20,
             max_jobs = config.max_jobs,
             buffer_mb = config.max_buffers >> 20,
@@ -408,8 +415,11 @@ pub(super) fn wake() {
     }
 }
 
-/// A file's second handle, for overlapped reads through our port.
-pub(super) struct AsyncHandle(HANDLE);
+/// A file's overlapped handles, for reads through our port: one, or
+/// `VICTORY_DS_HANDLES` of them taken in turn (as robocopy /MT reads with
+/// several handles: a USB SSD that reads one stream at 42 MB/s reads at
+/// 400 MB/s with 16).
+pub(super) struct AsyncHandle(Vec<HANDLE>, std::sync::atomic::AtomicUsize);
 
 // SAFETY: a kernel handle.
 unsafe impl Send for AsyncHandle {}
@@ -417,8 +427,10 @@ unsafe impl Sync for AsyncHandle {}
 
 impl Drop for AsyncHandle {
     fn drop(&mut self) {
-        // SAFETY: ours.
-        unsafe { CloseHandle(self.0) };
+        for &h in &self.0 {
+            // SAFETY: ours.
+            unsafe { CloseHandle(h) };
+        }
     }
 }
 
@@ -437,27 +449,33 @@ impl File {
                 if config().unbuffered {
                     flags |= FILE_FLAG_NO_BUFFERING;
                 }
-                // SAFETY: the file's own handle, open while `self` lives.
-                let handle = unsafe {
-                    ReOpenFile(self.file.as_raw_handle() as HANDLE, GENERIC_READ, FILE_SHARE_READ, flags)
-                };
-                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                let mut handles = AsyncHandle(Vec::new(), Default::default());
+                for _ in 0..config().handles {
+                    // SAFETY: the file's own handle, open while `self` lives.
+                    let handle = unsafe {
+                        ReOpenFile(self.file.as_raw_handle() as HANDLE, GENERIC_READ, FILE_SHARE_READ, flags)
+                    };
+                    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                        break;
+                    }
+                    // SAFETY: both handles are ours.
+                    let joined = unsafe { CreateIoCompletionPort(handle, port as HANDLE, 1, 0) };
+                    if joined.is_null() {
+                        // SAFETY: ours.
+                        unsafe { CloseHandle(handle) };
+                        break;
+                    }
+                    handles.0.push(handle);
+                }
+                if handles.0.is_empty() {
                     let error = std::io::Error::last_os_error();
                     tracing::warn!(%error, "dstorage: no overlapped handle; this file reads synchronously");
                     return None;
                 }
-                let handle = AsyncHandle(handle);
-                // SAFETY: both handles are ours.
-                let joined = unsafe { CreateIoCompletionPort(handle.0, port as HANDLE, 1, 0) };
-                if joined.is_null() {
-                    let error = std::io::Error::last_os_error();
-                    tracing::warn!(%error, "dstorage: the completion port refused a file");
-                    return None;
-                }
-                Some(handle)
+                Some(handles)
             })
             .as_ref()
-            .map(|h| h.0)
+            .map(|h| h.0[h.1.fetch_add(1, Ordering::Relaxed) % h.0.len()])
     }
 }
 
@@ -510,7 +528,11 @@ pub(super) fn start(scheduler: &'static Scheduler) -> bool {
         .filter(|i| {
             std::thread::Builder::new()
                 .name(format!("dstorage decode {i}"))
-                .spawn(move || decode_thread(scheduler, decode))
+                .spawn(move || {
+                    // Below the title's threads and the desktop.
+                    victory_core::friendly::background_thread();
+                    decode_thread(scheduler, decode)
+                })
                 .is_ok()
         })
         .count();
@@ -669,6 +691,15 @@ impl Io {
                 direct.push(Work { job, source: Source::Itself });
                 continue;
             };
+            // A load cache hit (`VICTORY_LOAD_CACHE`): no read at all, the
+            // decode thread serves it.
+            if let Some((cache, key)) = super::load_key(request)
+                && !cache.verify
+                && cache.contains(&key)
+            {
+                direct.push(Work { job, source: Source::Itself });
+                continue;
+            }
             if let Some(cache) = &mut self.cache
                 && let Some(source) = cache.lookup(file.id, want(&job))
             {
@@ -741,8 +772,12 @@ impl Io {
                 reads.push((extent.start, extent.len, jobs));
             }
             file.jobs = taken.into_iter().flatten().collect();
-            let handle = file.handle;
+            let first = file.handle;
             for (start, len, jobs) in reads {
+                let handle = jobs
+                    .first()
+                    .and_then(|j| unsafe { &*j.request.source.cast::<Instance<File>>() }.state.overlapped())
+                    .unwrap_or(first);
                 match self.read(id, handle, start, len, jobs) {
                     Ok(()) => {}
                     Err(jobs) => failed.extend(jobs),

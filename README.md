@@ -78,9 +78,9 @@ All captured on an RTX 3060 under Windows 10.
 
 Measured on an RTX 3060 (Series S profile, the title's own upscaler):
 
-- **Speed:** about 5 fps in the cell scene and about 4 fps while moving, with stable frame pacing. Memory copies are cut from 286 to 84 MB per frame. The intro cutscene is very slow unless it is skipped.
+- **Speed:** about 4 fps while walking and turning in the world, with steady pacing (95th-percentile frame about 270 ms). That is far from 30 fps. The GPU profiler (`VICTORY_GPU_PROFILE`) measures about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines, so no single pass is the one to fix. The intro cutscene is very slow unless it is skipped.
 - **Pipeline compile freezes:** on a first run, moving into new areas freezes while pipelines compile. The shader prewarm and the pipeline cache shorten this on later runs.
-- **Lighting and hair look wrong; shadowed areas are too dark.** The title's ray-traced lighting and shadows do not run yet (ray tracing is off); the ray-tracing work so far is described in [`runtime/victory/docs/fork-ray-tracing.md`](runtime/victory/docs/fork-ray-tracing.md).
+- **Hair renders too bright; shadowed areas are too dark.** The screen lighting passes are fixed (their workers are on by default), but the title's ray-traced lighting and shadows do not run yet (ray tracing is off); the ray-tracing work so far is described in [`runtime/victory/docs/fork-ray-tracing.md`](runtime/victory/docs/fork-ray-tracing.md).
 - **Not verified playable:** nobody has played a session end to end.
 
 Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROADMAP.md).
@@ -88,7 +88,20 @@ Questions: [`docs/FAQ.md`](docs/FAQ.md). Problems: [`docs/TROUBLESHOOTING.md`](d
 
 ---
 
-## 🆕 New in v0.4.0
+## 🆕 New in v0.4.2
+
+Measured on an RTX 3060 (Series S profile): about 4 fps while walking and turning in the world, with steady pacing (95th-percentile frame about 270 ms).
+
+- **Lighting passes fixed:** the screen passes have workers of their own, on by default (`VICTORY_SCREEN_WORKERS=0` turns them off).
+- **Texture reserve fix:** the room kept for card copies is capped (`VICTORY_CARD_ROOM_KEPT_MB`, 512 by default), so the reserve no longer takes the memory textures need.
+- **Load time:** running from an internal SSD, the world is reached in about 212 s, against 300 s or more before.
+- **In-session A/B tooling:** switches are compared live within one game session.
+- **GPU profiler** (`VICTORY_GPU_PROFILE`): GPU time is about 93-111 ms per frame, spread over about 1,100 pipelines.
+- **Shader optimizer:** the safe mask removes 51% of instructions offline; the in-game test is pending, so it stays off.
+- **Launcher 0.4.2:** the Stable preset adds `VICTORY_FRIENDLY=1`, which leaves processor time to the desktop while the title runs.
+- **Known issues:** hair renders too bright, ray tracing is off, and the speed is far from 30 fps.
+
+## New in v0.4.0
 
 Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about 4 fps while moving, stable frame pacing.
 
@@ -111,12 +124,12 @@ Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about
 | Missing geometry: view heap | 🧪 in testing | view heap sized so world draws no longer run out of slots on NVIDIA |
 | CPU recording cuts | 🧪 in testing | less per-draw preparing and recording cost on the CPU, with a per-part timing line to measure it |
 | Zero-copy title memory | 🔨 in progress | `VICTORY_ZERO_COPY`: the GPU reads title memory without copies; needs placing to work at scale |
-| Missing-walls bit in shader clean-up | 🔨 in progress | find the `VICTORY_SHADER_OPT` pass that loses walls (479 is safe) |
-| Murky lighting, grey hair | 🔨 in progress | screen workers and ambient; hit-shading passes need `VICTORY_RT_RESOLVE` |
+| Shader optimizer | 🧪 in testing | the safe mask of `VICTORY_SHADER_OPT` removes 51% of instructions offline; the in-game test is pending |
+| Hair too bright | 🔨 in progress | the screen lighting passes are fixed (workers on by default); hair now renders too bright, and the hit-shading passes need `VICTORY_RT_RESOLVE` |
 | Ray-tracing BVH builder | 🔨 in progress | `VICTORY_BVH_BUILDER` still makes stray writes |
-| Save-load time | 📋 planned | ~100 s today; a load cache and a faster decoder |
+| Load time | 🔨 in progress | the world is reached in about 212 s from an internal SSD (300 s or more before); a load cache (`VICTORY_LOAD_CACHE`) and a faster decoder (`VICTORY_FAST_INFLATE`) are in the runtime, off by default, not measured yet |
 | World-entry copy stall | 📋 planned | cut the copies that stall entering the world |
-| PC responsiveness | 📋 planned | `VICTORY_FRIENDLY`: keep the PC usable while it runs |
+| PC responsiveness | 🧪 in testing | `VICTORY_FRIENDLY=1` (set by the Stable preset): background work leaves processor time to the desktop |
 | Textures never uploaded | 📋 planned | 14,830 textures are never uploaded |
 | FSR upscaler | 📋 planned | the title's FidelityFX calls answered by AMD's PC FidelityFX |
 | Frame generation | 📋 planned | only once the base frame rate is high enough for it to make sense |
@@ -226,19 +239,19 @@ Every task is sized for **one person + one AI coding agent**. Pick one, comment 
 - [ ] **#1 Light in shadow.** Ray-traced bounce light and shadows do not run yet, so shadowed areas are too dark. See `runtime/victory/docs/fork-ray-tracing.md`.
 - [ ] **#2 Missing walls and roofs.** Some cards lose the first room's walls and roof with certain switches; find the cause (see `runtime/victory/VICKY.md`).
 - [ ] **#3 Faster wave64 on NVIDIA.** 64-lane programs run as two 32-lane halves. Profile them and cut the overhead.
-- [ ] **#9 Missing-walls bit in `VICTORY_SHADER_OPT`.** Mask 479 is safe; one of the other clean-up passes loses walls in game, and an offline differential found nothing. Find which pass and why. `runtime/victory/crates/victory-shader/src/emit/mod.rs` (`shader_opt`), `emit/bitcode.rs`.
-- [ ] **#10 Murky lighting and grey hair.** Try `VICTORY_SCREEN_WORKERS` and the ambient stand-in for the murky look; grey hair needs the hit-shading passes, which only run with `VICTORY_RT_RESOLVE`. `runtime/victory/crates/victory-gpu/src/pipeline/make.rs`.
+- [ ] **#9 `VICTORY_SHADER_OPT` in game.** The safe mask removes 51% of instructions offline; its in-game test is pending. One of the other clean-up passes loses walls in game, and an offline differential found nothing. Run the safe mask in game, then find which pass loses walls and why. `runtime/victory/crates/victory-shader/src/emit/mod.rs` (`shader_opt`), `emit/bitcode.rs`.
+- [ ] **#10 Hair renders too bright.** The screen lighting passes are fixed (`VICTORY_SCREEN_WORKERS`, on by default). Hair is now too bright; it needs the hit-shading passes, which only run with `VICTORY_RT_RESOLVE`. `runtime/victory/crates/victory-gpu/src/pipeline/make.rs`.
 - [ ] **#11 Ray-tracing BVH builder.** `VICTORY_BVH_BUILDER` makes stray writes; find and fix them (upstream VIctory #2402 and #916 are related). `runtime/victory/crates/victory-gpu/src/pipeline.rs`, `runtime/victory/crates/victory-shader/src/bvh.rs`.
 - [ ] **#12 Textures never uploaded.** 14,830 textures are never uploaded; find out why they are skipped. `runtime/victory/crates/victory-gpu/src/texture.rs`, `descriptor/host.rs`.
 
 ### Performance
 
-- [ ] **#4 Frame time.** About 4-5 fps in the world. Measured split per frame: ~66-100 ms CPU preparing, ~85-140 ms GPU, ~35-50 ms copying back. See `runtime/victory/crates/victory-gpu/src/host.rs`, `draw.rs`.
+- [ ] **#4 Frame time.** About 4 fps while walking and turning in the world (95th-percentile frame about 270 ms). `VICTORY_GPU_PROFILE` measures about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines. See `runtime/victory/crates/victory-gpu/src/host.rs`, `draw.rs`.
 - [ ] **#5 Intro cutscene speed.** The intro is very slow unless skipped; find out why.
 - [ ] **#13 Zero-copy title memory.** `VICTORY_ZERO_COPY` maps title memory for the GPU without copies; it needs placing to work at scale. `runtime/victory/crates/victory-gpu/src/zerocopy.rs`, `runtime/victory/crates/victory-hle/src/modules/xmem.rs`.
-- [ ] **#14 Save-load time.** Loading a save takes about 100 s. Add a load cache and a faster decoder. `runtime/victory/crates/victory-hle/src/modules/xgamesave.rs`.
+- [ ] **#14 Load time.** The world is reached in about 212 s from an internal SSD. A load cache (`VICTORY_LOAD_CACHE`) and a faster decoder (`VICTORY_FAST_INFLATE`) are in the runtime, off by default: measure them. `runtime/victory/crates/victory-hle/src/modules/dstorage/loadcache.rs`.
 - [ ] **#15 World-entry copy stall.** Entering the world stalls on memory copies; find what is copied and cut it. `runtime/victory/crates/victory-gpu/src/memcopy.rs`, `host.rs`.
-- [ ] **#16 PC responsiveness while running.** Add a `VICTORY_FRIENDLY` switch that keeps the rest of the PC usable (thread priorities, worker counts). `runtime/victory/crates/victory-gpu/src/host.rs`.
+- [x] **#16 PC responsiveness while running.** Done: `VICTORY_FRIENDLY=1` keeps the rest of the PC usable (thread priorities, worker counts); the Stable preset sets it. `runtime/victory/crates/victory-core/src/friendly.rs`.
 - [x] **#6 Shader cache warm-up.** Done: `victory precompile-graphics` and the shader prewarm (`runtime/victory/apps/victory/src/translate.rs`, `runtime/victory/crates/victory-gpu/src/pipeline/precompiled.rs`).
 
 ### Tooling & docs
@@ -247,7 +260,7 @@ Every task is sized for **one person + one AI coding agent**. Pick one, comment 
 - [x] **#8 One-click launcher** for the VIctory-based runtime (done: it is the launcher's default engine).
 - [x] **Launcher 0.4.1.** Done: Controller line on the Play page, the Prepare shaders step, the NVMe/SSD note, and the Stable preset matched to the measured best (native PlayStation pads, no lazy remap).
 - [ ] **Controller hot-plug report.** Try the Controller line with wireless (Bluetooth) PlayStation pads and other Xbox-compatible pads, and report what it shows. `launcher/src/controller.rs`.
-- [ ] **Bring `VICTORY_FRIENDLY` to the vendored runtime.** The measured setup uses it; sync it from the fork and add it to the Stable preset. `launcher/src/presets.rs`.
+- [x] **Bring `VICTORY_FRIENDLY` to the vendored runtime.** Done in 0.4.2: the runtime has it and the Stable preset sets it. `launcher/src/presets.rs`.
 
 ---
 

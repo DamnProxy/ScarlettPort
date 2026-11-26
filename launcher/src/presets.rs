@@ -9,7 +9,7 @@ pub const CUSTOM: &str = "custom";
 pub const ALL: [&str; 3] = [STABLE, EXPERIMENTAL, CUSTOM];
 
 /// The runtime build the bundled runtime folder is made from (see the repository's runtime/).
-pub const BUNDLED_BUILD: &str = "fx-cand4 efcc7b9";
+pub const BUNDLED_BUILD: &str = "fx-cand4 b3882b9";
 /// The build the Experimental switches were merged into (fx-cand2); older builds ignore them.
 pub const EXPERIMENTAL_BUILD: &str = "fx-cand2";
 
@@ -26,15 +26,17 @@ pub const C1: [&str; 9] = [
     "VICTORY_PREP_REUSE",
 ];
 
-/// fx-cand4 additions to Stable: sub-page memory, copies without the extra query, and a 4 GB
-/// card-buffer pool, and PlayStation pads read natively over USB (`VICTORY_PAD_PS`). `VICTORY_FRIENDLY`
-/// (play.ps1) is left out: the vendored runtime does not have it yet. Lazy remapping (`VICTORY_REMAP_LAZY`) is left out: a moving A/B showed it
-/// now slows the world down. Fast boot stays optional (not set here).
-pub const CAND4: [(&str, &str); 4] = [
+/// fx-cand4 additions to Stable: sub-page memory, copies without the extra query, a 4 GB
+/// card-buffer pool (the runtime caps the room it keeps with `VICTORY_CARD_ROOM_KEPT_MB`, 512 by
+/// default), PlayStation pads read natively over USB (`VICTORY_PAD_PS`) and `VICTORY_FRIENDLY`,
+/// which leaves processor time to the desktop. Lazy remapping (`VICTORY_REMAP_LAZY`) is left
+/// out: a moving A/B showed it now slows the world down. Fast boot stays optional (not set here).
+pub const CAND4: [(&str, &str); 5] = [
     ("VICTORY_MEM_SUBPAGE", "1"),
     ("VICTORY_COPY_NOQUERY", "1"),
     ("VICTORY_CARD_BUFFERS_MB", "4096"),
     ("VICTORY_PAD_PS", "1"),
+    ("VICTORY_FRIENDLY", "1"),
 ];
 
 /// Variables play.ps1 clears before a plain run (so nothing left in the launcher's own
@@ -135,7 +137,8 @@ mod tests {
     #[test]
     fn stable_matches_play_ps1() {
         let e = stable_env(Path::new("D:/dump"), Path::new("F:/c"));
-        assert_eq!(e.len(), 10 + 9 + 4);
+        assert_eq!(e.len(), 10 + 9 + 5);
+        assert_eq!(get(&e, "VICTORY_FRIENDLY").as_deref(), Some("1"));
         assert!(get(&e, "VICTORY_REMAP_LAZY").is_none());
         for (k, v) in [
             ("VICTORY_SAVE_SLOT", "default"),
