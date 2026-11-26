@@ -13,9 +13,9 @@
 
 </div>
 
-<img src="assets/world-lit.png" width="100%" alt="Lit gameplay view drawn by the ScarlettPort runtime">
+<img src="assets/cell-v050.png" width="100%" alt="Opening cell drawn by the ScarlettPort runtime">
 
-<sub>The title's own final image in gameplay on an RTX 3060: sunlight, textures, a fence and buildings. Shadowed areas are still too dark and some HUD text is cut off.</sub>
+<sub>ScarlettPort v0.5.0 on an RTX 3060 (Series S profile, ray tracing off).</sub>
 
 ## What it is
 
@@ -263,6 +263,16 @@ ScarlettPort/
 <details>
 <summary><b>Screenshots</b></summary>
 
+**Diner cutscene, v0.5.0**
+
+<img src="assets/diner-v050.png" width="100%" alt="Diner cutscene drawn by the ScarlettPort runtime">
+
+<sub>ScarlettPort v0.5.0 on an RTX 3060 (Series S profile, ray tracing off).</sub>
+
+**Gameplay view, lit (earlier build)**
+
+<img src="assets/world-lit.png" width="100%" alt="Lit gameplay view">
+
 **Opening cell on an RTX 3060, default settings**
 
 <img src="assets/cell-rtx3060.png" width="100%" alt="Opening cell on an RTX 3060">
@@ -292,18 +302,6 @@ The screenshots below were captured on an RTX 3060 under Windows 10.
 <img src="assets/tutorial-prompt.png" width="100%" alt="Movement hint prompt">
 
 <sub>The title's own movement hint, drawn over a still-black 3D picture because the lighting shaders did not all translate yet in that build.</sub>
-
-**Street, debug colours (earlier build)**
-
-<img src="assets/world-street-debug.png" width="100%" alt="Street in debug colours">
-
-<sub>One of the title's own geometry buffers shown with a debug colour view, in real time. Lighting and textures are not there. That view is not part of the current runtime source.</sub>
-
-**Interior, debug colours (earlier build)**
-
-<img src="assets/world-sofa-debug.png" width="100%" alt="Interior geometry in debug colours">
-
-<sub>A sofa from an interior scene, drawn in real time with the same debug colour view of an internal buffer. The geometry is there; the lighting pass still output black in that build.</sub>
 
 **First world geometry (earlier build)**
 
