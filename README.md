@@ -1,6 +1,4 @@
 <p align="center"><a href="https://github.com/ZigZagBoi1/ScarlettPort"><img src="https://img.shields.io/github/stars/ZigZagBoi1/ScarlettPort?style=for-the-badge&logo=github&label=Star%20ScarlettPort&color=ffd700" alt="Star ScarlettPort on GitHub"></a></p>
-<p align="center"><a href="https://star-history.com/#ZigZagBoi1/ScarlettPort&Date"><img src="https://api.star-history.com/svg?repos=ZigZagBoi1/ScarlettPort&type=Date" alt="Star History Chart" width="600"></a></p>
-<p align="center">Thank you for more than 500 stars!</p>
 <p align="center"><b>⭐ If ScarlettPort helps you, please star the repo, it helps more people find it.</b></p>
 > **New in 0.4.8:** Prepare shaders works again with the 0.4.6+ engine (`scarlett shaders`, then `scarlett warm`), and the engine no longer refuses the launcher's `scarlett.toml`; `play-scarlett.ps1`/`setup-scarlett.ps1` use the same commands and the launcher's Stable settings; Settings, Features gains a performance overlay and a ray tracing switch; `SCARLETT_CAPTURE_LOG` writes `frames.csv` with the Stable preset too.
 >
@@ -388,3 +386,6 @@ ScarlettPort/
 <sub>Lineage and fork point: [`engine/UPSTREAM.md`](engine/UPSTREAM.md). Credits: [`CREDITS.md`](CREDITS.md).</sub>
 
 </div>
+
+<p align="center">Thank you for more than 500 stars!</p>
+<p align="center"><a href="https://star-history.com/#ZigZagBoi1/ScarlettPort&Date"><img src="https://api.star-history.com/svg?repos=ZigZagBoi1/ScarlettPort&type=Date" alt="Star History Chart" width="600"></a></p>
