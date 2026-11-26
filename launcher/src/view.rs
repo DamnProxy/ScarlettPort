@@ -53,9 +53,10 @@ impl Launcher {
         let Some(b) = &self.build else { return self.status.clone() };
         let count = if b.total > 0 { format!("  ·  {} of {}", b.done, b.total) } else { String::new() };
         let quiet = b.last_output.elapsed().as_secs();
+        let eta = crate::flow::eta_secs(b.started.elapsed().as_secs(), b.overall).map(|s| format!("  ·  about {} left", flow::duration(s))).unwrap_or_default();
         let note = if quiet >= 20 { format!("  ·  no output for {quiet} s (large shaders take minutes; still working)") } else { String::new() };
         format!(
-            "Phase {}/{}: {}{count}  ·  now: {} ({} s)  ·  {} total{note}",
+            "Phase {}/{}: {}{count}  ·  now: {} ({} s)  ·  {} total{eta}{note}",
             b.phase,
             b.phases,
             b.name,
@@ -343,7 +344,9 @@ impl Launcher {
             format!("Game folder incomplete  ·  missing {}", game::missing(&self.game_checks).join(", "))
         } else if stage == Stage::ShadersNotBuilt {
             meta_color = WARNING;
-            if self.shaders_stale() { "Runtime updated  ·  rebuild the shaders before playing".to_string() } else { format!("Step 2: build the shaders once ({})  ·  then press Play", self.build_estimate()) }
+            if self.world_selected() {
+                format!("Play prepares the shaders once first ({})  ·  or Skip this time", self.build_estimate())
+            } else if self.shaders_stale() { "Runtime updated  ·  rebuild the shaders before playing".to_string() } else { format!("Step 2: build the shaders once ({})  ·  then press Play", self.build_estimate()) }
         } else if !self.status.is_empty() {
             self.status.clone()
         } else {
@@ -357,9 +360,14 @@ impl Launcher {
             if button_font(ui, button_rect, "hdr-stop", "Stop", Kind::Secondary, true, Some(Icon::Stop), font(15., "bold"), 0.) {
                 self.stop_run();
             }
+            if self.play_after_build && !self.prep_skip && link(ui, pos2(button_rect.center().x - 44., button_rect.max.y + 12.), Align2::LEFT_CENTER, "hdr-skip", "skip this time") {
+                self.skip_prep();
+            }
         } else {
             let (text, kind_font, tracking) = match stage {
                 Stage::GameNotSet => ("SELECT GAME", font(13., "black"), 1.5),
+                // The World engine prepares on Play by itself (once per engine, driver and preset).
+                Stage::ShadersNotBuilt if self.world_selected() => ("PLAY", font(15., "black"), 2.),
                 Stage::ShadersNotBuilt | Stage::BuildingShaders => ("BUILD SHADERS", font(13., "black"), 1.5),
                 Stage::Ready => ("PLAY", font(15., "black"), 2.),
             };
@@ -371,12 +379,13 @@ impl Launcher {
             if button_font(ui, button_rect, "hdr-play", text, Kind::Primary, enabled, Some(icon), kind_font, tracking) {
                 match stage {
                     Stage::GameNotSet => self.pick_folder(),
+                    Stage::ShadersNotBuilt if self.world_selected() => self.start(RunKind::Play),
                     Stage::ShadersNotBuilt => self.confirm_precompile = true,
                     Stage::Ready => self.start(RunKind::Play),
                     Stage::BuildingShaders => {}
                 }
             }
-            if stage != Stage::Ready && self.game_ok && self.engine_ready() && link(ui, pos2(button_rect.center().x - 28., button_rect.max.y + 12.), Align2::LEFT_CENTER, "hdr-anyway", "play anyway") {
+            if stage != Stage::Ready && !(stage == Stage::ShadersNotBuilt && self.world_selected()) && self.game_ok && self.engine_ready() && link(ui, pos2(button_rect.center().x - 28., button_rect.max.y + 12.), Align2::LEFT_CENTER, "hdr-anyway", "play anyway") {
                 self.start(RunKind::Play);
             }
         }

@@ -19,6 +19,7 @@ mod report;
 mod saves;
 mod update;
 mod controller;
+mod prep;
 mod shaderbuild;
 mod theme;
 mod view;
@@ -309,6 +310,12 @@ pub struct Launcher {
     pub tuning_at_start: Option<tuning::Tuning>,
     pub report_copied: Option<Instant>,
     pub shot_wait: u32,
+    /// The GPU driver version (part of the preparation stamp).
+    pub driver: String,
+    /// Play asked for the one-time preparation first: start the game when it ends.
+    pub play_after_build: bool,
+    /// "Skip this time": the preparation was stopped to play now; the next Play prepares again.
+    pub prep_skip: bool,
 }
 
 pub fn config_path() -> PathBuf {
@@ -360,6 +367,7 @@ impl Launcher {
         let game_ok = !config.game_path.is_empty() && valid_game(std::path::Path::new(&config.game_path));
         let game_checks = if game_ok { game::verify(std::path::Path::new(&config.game_path)) } else { Vec::new() };
         let game_edit = config.game_path.clone();
+        let sys = report::system();
         let l = Launcher {
             page: Page::Play,
             // in the past: the first frame is fully drawn (no fade-in), even if frames are throttled
@@ -376,7 +384,10 @@ impl Launcher {
             presence: discord::Presence::new(),
             presence_last: None,
             run_started: 0,
-            gpu_name: report::system().gpu,
+            gpu_name: sys.gpu.clone(),
+            driver: sys.driver.clone(),
+            play_after_build: false,
+            prep_skip: false,
             update: None,
             update_note: update::staged().map(|v| format!("{v} is downloaded and will be used the next time you start the launcher.")).unwrap_or_default(),
             update_busy: false,
@@ -677,6 +688,12 @@ impl Launcher {
         if kind == RunKind::Precompile {
             return self.start_build(game);
         }
+        if kind == RunKind::Play && self.world_selected() && !std::mem::take(&mut self.prep_skip) && !self.prepared() {
+            // One-time preparation for this engine, driver and preset; the game starts after it.
+            self.log("The shader cache is not prepared for this engine, driver and preset: preparing it once before the game starts.", LogKind::Info);
+            self.play_after_build = true;
+            return self.start_build(game);
+        }
         if kind == RunKind::Play {
             self.save_note = self.backup_saves().unwrap_or_default();
             self.play_since = Some(std::time::SystemTime::now());
@@ -744,6 +761,8 @@ impl Launcher {
     fn start_build(&mut self, game: PathBuf) {
         let world = self.world_selected();
         let hash = if world { self.effective_world_hash().map(str::to_string) } else { self.runtime_hash.clone() }.unwrap_or_default();
+        // Each preset has its own cache folder, so what was built is kept per folder too.
+        let hash = if world { shaderbuild::state_key(&hash, &self.scarlett_cache()) } else { hash };
         let stop = Arc::new(AtomicBool::new(false));
         let env = if world { self.play_env(&game) } else { Vec::new() };
         let job = shaderbuild::Job {
@@ -765,6 +784,28 @@ impl Launcher {
         self.pipelines = None;
         self.status = "Building shaders…".into();
         std::thread::spawn(move || shaderbuild::build(job));
+    }
+
+    /// What the selected preset's cache must have been prepared for.
+    pub fn prep_stamp(&self) -> prep::Stamp {
+        prep::Stamp {
+            engine: self.effective_world_hash().unwrap_or_default().to_string(),
+            driver: self.driver.clone(),
+            cache_key: format!("{}|{}", self.config.preset, self.scarlett_cache().display()),
+        }
+    }
+
+    /// True when the preset's cache was prepared for this engine build, driver and preset.
+    pub fn prepared(&self) -> bool {
+        prep::matches(&self.scarlett_cache(), &self.prep_stamp())
+    }
+
+    /// "Skip this time": stop the preparation Play started and start the game now.
+    pub fn skip_prep(&mut self) {
+        if self.play_after_build {
+            self.prep_skip = true;
+            self.stop_run();
+        }
     }
 
     /// True when the selected engine was found beside the launcher.
@@ -1219,8 +1260,13 @@ impl Launcher {
                 Message::BuildEnded(r) => {
                     self.running = None;
                     self.stop = None;
+                    let then_play = std::mem::take(&mut self.play_after_build);
+                    let ok = r.is_ok();
                     match r {
                         Ok(note) => {
+                            if self.world_selected() {
+                                let _ = prep::write(&self.scarlett_cache(), &self.prep_stamp());
+                            }
                             if self.world_selected() && self.local_selected() {
                                 self.config.local_shaders_hash = self.local_hash.clone().unwrap_or_default();
                             } else if self.world_selected() {
@@ -1237,6 +1283,14 @@ impl Launcher {
                             self.status = e;
                         }
                     }
+                    if then_play && (ok || self.prep_skip) {
+                        if !ok {
+                            self.log("Preparation skipped this time; shaders compile in game. The next Play prepares again.", LogKind::Info);
+                        }
+                        self.prep_skip = !ok;
+                        self.start(RunKind::Play);
+                    }
+                    self.prep_skip = false;
                 }
                 Message::RuntimeReady(r) => match r {
                     Ok(found) => {
