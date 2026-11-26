@@ -1014,7 +1014,9 @@ impl Launcher {
         self.saves_busy = true;
         let (exe, env, tx) = (self.scarlett_path(), self.tool_env(), self.tx.clone());
         std::thread::spawn(move || {
-            let r = cli::run(&exe, &["saves".into(), "list".into()], &env).map(|t| cli::parse_saves(&t));
+            let r = cli::run(&exe, &["saves".into(), "list".into()], &env).map(|t| cli::parse_saves(&t)).map_err(|e| {
+                if cli::unknown_command(&e) { "This runtime build has no `saves` command; the launcher still backs up the save files before every Play.".to_string() } else { e }
+            });
             let _ = tx.send(Message::Saves(r));
         });
     }
