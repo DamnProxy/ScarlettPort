@@ -1,4 +1,6 @@
 <p align="center"><a href="https://github.com/ZigZagBoi1/ScarlettPort"><img src="https://img.shields.io/github/stars/ZigZagBoi1/ScarlettPort?style=for-the-badge&logo=github&label=Star%20ScarlettPort&color=ffd700" alt="Star ScarlettPort on GitHub"></a></p>
+<p align="center"><a href="https://star-history.com/#ZigZagBoi1/ScarlettPort&Date"><img src="https://api.star-history.com/svg?repos=ZigZagBoi1/ScarlettPort&type=Date" alt="Star History Chart" width="600"></a></p>
+<p align="center">Thank you for more than 500 stars!</p>
 <p align="center"><b>⭐ If ScarlettPort helps you, please star the repo, it helps more people find it.</b></p>
 > **New in 0.4.8:** Prepare shaders works again with the 0.4.6+ engine (`scarlett shaders`, then `scarlett warm`), and the engine no longer refuses the launcher's `scarlett.toml`; `play-scarlett.ps1`/`setup-scarlett.ps1` use the same commands and the launcher's Stable settings; Settings, Features gains a performance overlay and a ray tracing switch; `SCARLETT_CAPTURE_LOG` writes `frames.csv` with the Stable preset too.
 >
@@ -19,15 +21,15 @@ ScarlettPort is the **ScarlettPort runtime** (`engine/`, built as `scarlett.exe`
 
 ### Where it stands
 
-Developed and tested so far against one open-world title. It boots, gets through the menus, saves and legal screens, reaches the world and starts gameplay: about 5.4 fps while walking and turning on an RTX 3060 (Series S profile), with stable frame pacing. That is not 30 fps. The yard stutter is fixed and hair and lighting render correctly in the opening cell; ray tracing is off, shadowed areas are too dark and first runs freeze on pipeline compiles while moving, so it is **not yet verified playable**.
+Developed and tested so far against one open-world title. It boots, gets through the menus, saves and legal screens, reaches the world and gives you control in the opening area. Since 0.4.6 the engine renders the full picture (lit rooms, ambient and sky light, complete textures) at about 3 fps on an RTX 3060 (Series S profile); a hardware report measured 7-8 fps on an RTX 5070. The older, darker picture ran at about 5 fps. That is not 30 fps, and first runs still freeze on pipeline compiles while moving, so it is **not yet verified playable**; frame rate is the next focus.
 
-![progress](https://img.shields.io/badge/progress-65%25-ff2d95?style=for-the-badge)
+![progress](https://img.shields.io/badge/progress-70%25-ff2d95?style=for-the-badge)
 
 ```
-█████████████░░░░░░░  65%
+██████████████░░░░░░  70%
 ```
 
-`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `lit world` ✅ → `gameplay starts` ✅ (~5 fps) → `shadowed areas` 🔨 → `playable speed` ⏳
+`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `full picture` ✅ → `gameplay starts` ✅ (~3 fps, RTX 3060) → `playable speed` ⏳
 
 <a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" height="45"/></a>
 <a href="https://ko-fi.com/ziggymar"><img src="https://img.shields.io/badge/BUY%20A%20COFFEE-Ko--fi-ff5f5f?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" height="45"/></a>
@@ -236,13 +238,13 @@ Measured on an RTX 3060 (Series S profile): about 5 fps in the cell scene, about
 | Intro, setup and menus | ✅ | 30 fps, audio plays |
 | Saves and legal screens | ✅ | the title saves a checkpoint and loads it again |
 | Open world loads | ✅ | world data streams in through DirectStorage |
-| Lit world renders | ✅ | about 5.4 fps while walking and turning on an RTX 3060 (Series S profile); hair and lighting correct in the opening cell; shadowed areas too dark while ray tracing is off |
+| Lit world renders | ✅ | since 0.4.6 the full picture (lit rooms, ambient and sky light, complete textures) at about 3 fps on an RTX 3060 (Series S profile), 7-8 fps on an RTX 5070; the older darker picture ran at about 5.4 fps |
 | Gameplay starts | ✅ | the prologue runs; not played end to end |
 | Pipelines prebuilt | ✅ | 25,200 of 25,471 graphics pipelines made ahead of time, and used in play |
 | Shaders translate (ScarlettPort runtime) | ✅ | all 26,084 translate; 26,013 pass DXIL validation on their own, the other 71 (oversized mesh shaders) validate only when linked with their pixel shader. XCL's counts differ ([`docs/STATUS.md`](docs/STATUS.md)) |
 | Keyboard and mouse | ✅ | click to capture, W walks the character |
 | Tile-grid overlay over gameplay | ✅ | fixed (rectangle-list pipelines decode right) |
-| Shadowed areas | 🔨 | too dark |
+| Shadowed areas | ✅ | lit by the 0.4.6 renderer's ambient and sky light |
 | Intro cutscene | 🔨 | very slow unless skipped |
 | Speed work | 🔨 | stable frame pacing, yard stutter fixed, copies cut from 286 to 84 MB per frame; pipeline compile freezes on first runs |
 | Playable | ⏳ | not verified |
@@ -333,7 +335,7 @@ Every task is sized for **one contributor**. Pick one, comment on its issue to c
 
 ### Performance
 
-- [ ] **#4 Frame time.** 5.4 fps while walking and turning in the world (median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms; RTX 3060 12 GB, Ryzen 5 5600X; 3.9-4.5 fps before); 30 fps is not reached. The thread that gates each present spends about 187 ms per frame: about 55 ms preparing, 31 ms in refresh copies, 76 ms waiting on the card after title writes next to shader-written memory, 19 ms waiting for title reads. An infinitely fast card would still leave about 99 ms, so the waits and copies are the work to do. `SCARLETT_GPU_PROFILE` measures about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines. See `engine/crates/scarlett-gpu/src/host.rs`, `draw.rs`.
+- [ ] **#4 Frame time.** The 0.4.6 full picture runs at about 3 fps on the RTX 3060 (7-8 fps on an RTX 5070); the numbers below are from the older, darker picture: 5.4 fps while walking and turning in the world (median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms; RTX 3060 12 GB, Ryzen 5 5600X; 3.9-4.5 fps before); 30 fps is not reached. The thread that gates each present spends about 187 ms per frame: about 55 ms preparing, 31 ms in refresh copies, 76 ms waiting on the card after title writes next to shader-written memory, 19 ms waiting for title reads. An infinitely fast card would still leave about 99 ms, so the waits and copies are the work to do. `SCARLETT_GPU_PROFILE` measures about 93-111 ms of GPU time per frame, spread over about 1,100 pipelines. See `engine/crates/scarlett-gpu/src/host.rs`, `draw.rs`.
 - [ ] **#5 Intro cutscene speed.** The intro is very slow unless skipped; find out why.
 - [ ] **#13 Zero-copy title memory.** `SCARLETT_ZERO_COPY` maps title memory for the GPU without copies; it needs placing to work at scale. `engine/crates/scarlett-gpu/src/zerocopy.rs`, `engine/crates/scarlett-hle/src/modules/xmem.rs`.
 - [ ] **#14 Load time.** The world is reached in about 212 s from an internal SSD. A load cache (`SCARLETT_LOAD_CACHE`) and a faster decoder (`SCARLETT_FAST_INFLATE`) are in the runtime, off by default: measure them. `engine/crates/scarlett-hle/src/modules/dstorage/loadcache.rs`.
