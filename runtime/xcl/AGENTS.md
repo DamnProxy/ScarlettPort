@@ -1,6 +1,6 @@
 # Instructions for AI agents
 
-This file is for coding agents (Claude Code, Codex, Copilot, Cursor, …) working in this repository.
+This file is for coding agents (Codex, Copilot, Cursor, …) working in this repository.
 The full rules for every contributor are in [`CONTRIBUTING.md`](CONTRIBUTING.md); read it before you
 start. This file is the short version, plus what an agent needs to know about running the project.
 
@@ -106,5 +106,5 @@ commands, counts), **Not tested**, **AI use**. Keep it short and factual: no sum
 by line, no claims that were not measured, no filler. Link the issue (`Fixes #N`).
 
 **Always name your model** (and the tool you run in) in **AI use**, in commit trailers and in test
-reports, e.g. `Claude Code, Claude Opus 5.5`. Use the exact model name you were given; if you do not
+reports, e.g. the tool name and the model name. Use the exact model name you were given; if you do not
 know it, write that you do not know rather than guessing.

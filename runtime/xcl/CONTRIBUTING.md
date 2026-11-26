@@ -98,7 +98,7 @@ Use this outline:
 - what you could not check, e.g. AMD / NVIDIA, the retail title, wave32-only GPUs
 
 **AI use**
-- none / which tool and model (e.g. Claude Code with Claude Opus 5.5), and for what (see below)
+- none / which tool and model, and for what (see below)
 ```
 
 "Not tested" is required. An honest "not tested on AMD" is fine. A test you did not run listed as
@@ -211,5 +211,4 @@ You can use AI tools. In return:
 - The same size and scope rules apply. An agent can write 2000 lines in an hour, and nobody can
   review that in an hour. Split it.
 
-Agents working in this repository read [`AGENTS.md`](AGENTS.md) (and Claude Code also reads
-[`CLAUDE.md`](CLAUDE.md)), which put these rules into instructions for them.
+Agents working in this repository read [`AGENTS.md`](AGENTS.md), which puts these rules into instructions for them.
