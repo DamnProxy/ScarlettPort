@@ -751,7 +751,25 @@ fn es_dwords(p: &Program) -> Result<Vec<u32>, ShaderError> {
 /// 2823ba1.
 fn first_half_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INTERP_FIRST_HALF").is_some_and(|v| v == "1"))
+    FIRST_HALVES.get() || *ON.get_or_init(|| std::env::var_os("VICTORY_INTERP_FIRST_HALF").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// Whether [`first_halves_read`] runs for this thread's translation
+    /// ([`with_first_halves`]).
+    static FIRST_HALVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with [`first_halves_read`] on: the second translation of
+/// a program the first one refused for a first half of an interpolation read
+/// as data (cool_fox a26859fc; `VICTORY_SHADER_FIRST_HALF`). Only such programs:
+/// with it on for every program, some 8,500 pixel programs that already
+/// translated come out changed, for the sake of a few that did not.
+pub(crate) fn with_first_halves<R>(translate: impl FnOnce() -> R) -> R {
+    let before = FIRST_HALVES.replace(true);
+    let result = translate();
+    FIRST_HALVES.set(before);
+    result
 }
 
 /// A first half some other instruction reads too (the compiler keeps

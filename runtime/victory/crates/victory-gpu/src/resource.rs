@@ -575,6 +575,11 @@ fn twin_texture(
 
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
+    // A8_UNORM (65) has no typeless family and cannot be cast to R8
+    // (`VICTORY_STATE_FIXES`; before, it was of R8's).
+    if format == 65 && crate::cflook::state_fixes() {
+        return 65;
+    }
     const FAMILIES: [(u32, u32); 22] = [
         (1, 4),
         (5, 8),
@@ -720,10 +725,22 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         u32::from(desc.depth_or_array_size).max(1)
     };
     let (mip, slice) = (index % mips, index / mips);
-    if slice >= slices {
+    // Depth-stencil textures (`VICTORY_STATE_FIXES`): each plane holds all
+    // the levels and slices; depth and stencil copies use formats of their
+    // own and 512-byte rows, as on PC. Before, planes were not told apart.
+    let depth_stencil = crate::cflook::state_fixes() && matches!(desc.format, 19..=22 | 44..=47);
+    let (format, pitch) = if depth_stencil {
+        match slice / slices {
+            0 => (39, 512), // DXGI_FORMAT_R32_TYPELESS
+            1 => (60, 512), // DXGI_FORMAT_R8_TYPELESS
+            _ => return None,
+        }
+    } else if slice >= slices {
         return None;
-    }
-    let (element, block) = element(desc.format)?;
+    } else {
+        (desc.format, PITCH)
+    };
+    let (element, block) = element(format)?;
     let width = (desc.width >> mip).max(1).next_multiple_of(block);
     let height = (u64::from(desc.height) >> mip)
         .max(1)
@@ -736,11 +753,11 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     let row_size = width / block * element;
     let footprint = PlacedFootprint {
         offset: 0,
-        format: desc.format,
+        format,
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         depth,
-        row_pitch: u32::try_from(row_size.next_multiple_of(PITCH)).ok()?,
+        row_pitch: u32::try_from(row_size.next_multiple_of(pitch)).ok()?,
     };
     Some((footprint, u32::try_from(height / block).ok()?, row_size))
 }
@@ -2467,6 +2484,10 @@ fn heaped_texture(
                 {
                     return None;
                 }
+                // Not after a refusal, nor on low commit (`crate::residency`).
+                if !crate::residency::allow_growth() {
+                    return None;
+                }
                 let heap_desc = D3D12_HEAP_DESC {
                     SizeInBytes: size,
                     Properties: D3D12_HEAP_PROPERTIES {
@@ -2479,6 +2500,7 @@ fn heaped_texture(
                 let mut made: Option<ID3D12Heap> = None;
                 // SAFETY: plain creation of a heap; the out pointer is ours.
                 if let Err(e) = unsafe { host.device.CreateHeap(&raw const heap_desc, &raw mut made) } {
+                    crate::residency::allocation_error(&e);
                     tracing::warn!(error = %e, heaps = heaps.len(), "no heap for plain textures");
                     return None;
                 }
@@ -2735,6 +2757,7 @@ fn host_texture_in(
     };
     crate::census::made(if reserved { 5 } else { 4 }, 0);
     if let Err(e) = made {
+        crate::residency::allocation_error(&e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     count(if reserved { 4 } else { 0 });
@@ -2897,6 +2920,7 @@ fn hand_out_resource(
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
+        crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
             TARGETS_AT
                 .lock()
@@ -2918,13 +2942,46 @@ fn hand_out_resource(
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
+/// Width, height and format of texture `this` (`None` for a buffer), for
+/// `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    const TEXTURE_2D: u32 = 3;
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes, for `crate::texback`; `None` for
+/// a buffer or a texture with planes.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+}
+
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
+            textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;

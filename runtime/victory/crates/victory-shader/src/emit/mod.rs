@@ -105,6 +105,8 @@ mod opt_bisect_tests;
 mod opt_tests;
 mod own_bits;
 mod per_program;
+#[cfg(all(test, windows))]
+mod permlane_tests;
 mod rect;
 mod sampler;
 mod shader;
@@ -136,6 +138,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_max_wave, set_host_max_wave};
 // rule-region: begin feature:wave64-lds
 pub use lower::wave64_lds;
+pub use lower::cf_wave32;
 // rule-region: end
 pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
 // rule-region: begin program:activate-rays-cleanup
@@ -238,6 +241,28 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// `VICTORY_SHADER_FIXES=1` (boot; off by default): every picture switch of the
+/// translator taken from cool_fox (codec-d/cool_fox, fx-coolfox) at once, so
+/// one shader cache warm tests them all. Each switch can still be set on its
+/// own (`=1` on, `=0` off, which wins over this one). See [`cf_switch`].
+/// It changes the translation: the switch is named in the shader cache key
+/// (`crate::SWITCHES`).
+pub fn cf_shaders() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_FIXES").is_some_and(|v| v == "1"))
+}
+
+/// One of the translator's picture switches from cool_fox: `name=1` on,
+/// `name=0` (or any other value) off; unset, as [`cf_shaders`]. Callers pass
+/// the switch's name as a literal, so that the build names it among the
+/// translator's switches (the shader cache keys on them).
+pub(crate) fn cf_switch(name: &str) -> bool {
+    match std::env::var_os(name) {
+        Some(v) => v == "1",
+        None => cf_shaders(),
+    }
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
@@ -267,6 +292,9 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.extend_from_slice(b"wave64 lds");
     }
     // rule-region: end
+    if lower::cf_wave32() {
+        out.extend_from_slice(b"cf wave32");
+    }
     out
 }
 
@@ -374,7 +402,18 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    translate_code(container, None)
+    // A program refused for the first half of an interpolation read as data
+    // is translated once more with first halves evaluated on their own, and
+    // only such a program (cool_fox a26859fc, after jaschinski97-ops 15cc76c3;
+    // `VICTORY_SHADER_FIRST_HALF=1`, off; on with `VICTORY_SHADER_FIXES=1`).
+    match translate_code(container, None) {
+        Err(ShaderError::Unsupported { what, .. })
+            if what == lower::FIRST_HALF && crate::emit::cf_switch("VICTORY_SHADER_FIRST_HALF") =>
+        {
+            crate::io::with_first_halves(|| translate_code(container, None))
+        }
+        other => other,
+    }
 }
 
 /// [`translate`] of a compute program for dispatches by thread counts whose last group is
@@ -410,8 +449,11 @@ fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader,
 /// The program of a container that [`translate`] translates: its vertex,
 /// pixel, compute or mesh program.
 fn main_program(c: &Container) -> Result<NativeProgram, ShaderError> {
+    // (`ACCC`: native code of another compiler in its place; cool_fox 66afb2b4,
+    // `VICTORY_SHADER_FORMS2`)
     let dxil = c
         .part(FourCC::DXIL)
+        .or_else(|| lower::forms2().then(|| c.part(FourCC::ACCC)).flatten())
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     crate::native_programs(dxil.data)?
         .into_iter()
@@ -544,6 +586,26 @@ pub fn emit(
         // one lane-branch region ([`lower::wave64_lds`])
         let wide_on = wide_on || lower::wave64_lds() && lower::take_lds_region();
         // rule-region: end
+        // VICTORY_WAVE32_LOWER=1 ([lower::cf_wave32], cool_fox): two scene kernels of one
+        // console wave per group, validated as wave32 pipelines on RTX, are widened unless
+        // VICTORY_WAVE_WIDE says otherwise; and a single guest wave's active-lane loop refused
+        // as a divergent mask exchange is widened at its latch alone ([widen]).
+        let cf = lower::cf_wave32();
+        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        let scene_kernel = cf
+            && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+            && matches!(
+                c.digest,
+                [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                    | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+            );
+        let wide_on = wide_on || wide_option.is_none() && scene_kernel;
+        let driver_loop = cf
+            && wide_option.is_none()
+            && c.part(FourCC::DXIL).is_none()
+            && c.part(FourCC(*b"ACCC")).is_some()
+            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
+                if *what == lower::DIVERGENT_MASK_EXCHANGE);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -570,7 +632,7 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                if wide_on || driver_loop {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -578,7 +640,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, why, driver_loop);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -640,7 +702,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -648,7 +710,18 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    // (VICTORY_WAVE32_LOWER=1) a program still at 64 lanes on a 32-lane host is refused here
+    let supported = |(shader, wave): (HostShader, Option<u32>)| {
+        if lower::cf_wave32() && wave == Some(64) && lower::host_max_wave() == 32 {
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "no wave32 lowering for this wave64 program",
+            })
+        } else {
+            Ok(shader)
+        }
+    };
+    let original = original.and_then(supported);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -663,7 +736,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
 /// The export half of a merged ES-GS stage (`HwStage::Es`, raised as `io`) on the host: the
@@ -723,6 +796,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -774,6 +848,30 @@ fn widen(
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
             return r;
+        }
+        if active_loop_only {
+            // Only a single backward branch on the SCC just set by
+            // s_andn2_wrexec_b64. This instruction restricts EXEC to the
+            // unfinished lanes. The guest repeats the loop if *either*
+            // half still has work, while individual vector writes retain
+            // their EXEC predicates.
+            let [latch] = more.as_slice() else {
+                return r;
+            };
+            let block = &p.blocks[*latch];
+            let [.., update, branch] = block.insts.as_slice() else {
+                return r;
+            };
+            if !wide.is_empty()
+                || update.name() != "s_andn2_wrexec_b64"
+                || branch.name() != "s_cbranch_scc1"
+                || !matches!(
+                    block.exit,
+                    ir::Exit::Branch { taken, not_taken } if taken <= *latch && not_taken > *latch
+                )
+            {
+                return r;
+            }
         }
         wide.extend(more);
     }

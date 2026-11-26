@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+/// cool_fox's one line for every queue, here only for `VICTORY_THIN=1`.
+#[cfg(windows)]
+mod behind;
+
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
@@ -421,6 +425,11 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 /// one.
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
+    if behind::on() {
+        // What queues stand at is looked at by the thread that runs them.
+        behind::wake();
+        return;
+    }
     if !all && behind() {
         // A thread of ours runs what is free to run ([`behind`]).
         wake();
@@ -518,8 +527,55 @@ thread_local! {
 /// submission keeps its place behind them.
 #[cfg(windows)]
 pub(crate) fn before_sync() {
+    if behind::on() {
+        behind::drain();
+        return;
+    }
     if behind() && !RELEASING_HERE.get() {
         release_held_now(false);
+    }
+}
+
+/// Before a wait for flights by a thread of the title's (a fence's event):
+/// with cool_fox's line (`VICTORY_THIN=1`), what the title gave its queues
+/// before goes to the card first. Nothing otherwise.
+#[cfg(windows)]
+pub(crate) fn line_before_sync() {
+    if behind::on() {
+        behind::drain();
+    }
+}
+
+/// Whether submissions go into cool_fox's line (`behind`, `VICTORY_THIN=1`).
+#[cfg(windows)]
+pub(crate) fn line_on() -> bool {
+    behind::on()
+}
+
+/// Lists in the line may have been translated (`crate::list::thin`).
+#[cfg(windows)]
+pub(crate) fn line_moved() {
+    behind::wake();
+}
+
+/// This thread does work the line waits for: it does not wait for the line.
+#[cfg(windows)]
+pub(crate) fn no_drain_here() {
+    behind::no_drain_here();
+}
+
+/// Submissions the title made that the host has not begun (cool_fox's line).
+#[cfg(windows)]
+pub(crate) fn queued() -> u64 {
+    behind::queued()
+}
+
+/// For the frame-rate line.
+#[cfg(windows)]
+pub(crate) fn line_line(frames: f64) {
+    if behind::on() {
+        crate::list::thin::line(frames);
+        behind::line(frames);
     }
 }
 
@@ -913,6 +969,10 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if behind::on() && !this.is_null() {
+            behind::submit(this, lists);
+            return;
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -1009,6 +1069,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     #[cfg(windows)]
+    if behind::on() && !this.is_null() {
+        behind::signal(this, fence, value);
+        return S_OK;
+    }
+    #[cfg(windows)]
     kick_flush();
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
@@ -1049,6 +1114,10 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::op(this as usize, || format!("WAIT queue kind {} for fence {fence:?} value {value} (now {now})", queue(this).kind));
+        if behind::on() && waits() {
+            behind::wait(this, fence, value);
+            return S_OK;
+        }
         let behind = {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
@@ -1194,8 +1263,11 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     crate::gpuprof::frame();
     // With `present_behind`: the frame is shown by our thread, behind what
     // the queue holds, and nothing is run or waited for here.
+    // (With cool_fox's line, `VICTORY_THIN=1`, the present goes into it below.)
     #[cfg(windows)]
-    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
+    let lane = behind::on() && !this.is_null();
+    #[cfg(windows)]
+    let sent_behind = lane || (present_behind() && send_behind(this, planes, plane_parameters));
     #[cfg(not(windows))]
     let _ = this;
     // Submissions sent to the card and not waited for are settled first,
@@ -1238,7 +1310,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         crate::frame::flipped(plane.token);
     }
     #[cfg(windows)]
-    if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
+    if sent_behind && !lane && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
         tracing::info!(
             frame,
             behind = PRESENTS_BEHIND.load(Ordering::Relaxed),
@@ -1279,8 +1351,41 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
+            line_before_sync();
             crate::capture::dump_targets(frame);
         }
+    }
+    // cool_fox's line (`VICTORY_THIN=1`): the present stands in it, in the
+    // state the lists recorded so far leave the texture in (lists not
+    // translated yet: the state they leave it in when its turn comes).
+    #[cfg(windows)]
+    if lane {
+        const COPY_SOURCE: u32 = 0x800;
+        const READABLE: u32 = 0x80;
+        let looked = |resource: This, wanted: u32| {
+            crate::resource::host_copy(resource).map(|copy| {
+                let state = crate::resource::host_transition(resource, wanted).map_or(wanted, |(_, before)| before);
+                crate::resource::host_transition(resource, state);
+                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
+                (copy, state)
+            })
+        };
+        let first = if planes > 0
+            // SAFETY: the title passes `planes` plane descriptions.
+            && let Some(plane) = unsafe { plane_parameters.as_ref() }
+            && plane.count > 0
+            && !plane.resources.is_null()
+        {
+            // SAFETY: the plane lists `count` resources.
+            Some(unsafe { *plane.resources })
+        } else {
+            None
+        };
+        let texture = first.and_then(|r| looked(r, COPY_SOURCE));
+        // SAFETY: the title passes `planes` plane descriptions.
+        let over = first.and_then(|r| unsafe { second_plane(planes, plane_parameters, r) }).and_then(|r| looked(r, READABLE));
+        behind::present(this, texture, Shown { frame, resource: first.map_or(0, |r| r as usize), over });
+        return S_OK;
     }
     #[cfg(windows)]
     if !sent_behind
@@ -1322,6 +1427,33 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// The frame a present in cool_fox's line shows, the title's resource it
+/// shows, and the second plane drawn over it (its host texture and the state
+/// it is in; `u32::MAX`: the one its lists leave it in).
+#[cfg(windows)]
+struct Shown {
+    frame: u64,
+    resource: usize,
+    over: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
+}
+
+/// Shows `texture`, in host state `state`, in our window (cool_fox's line).
+#[cfg(windows)]
+fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let over = what.over.as_ref().map(|(t, was)| {
+        let was = if *was == u32::MAX { t.state.load(Ordering::Relaxed) } else { *was };
+        (&t.texture, was)
+    });
+    let shown = host.present(texture, state, what.frame, over);
+    #[cfg(feature = "diagnostics")]
+    blinks(what.frame, what.resource as This, state, shown);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (shown, what.resource);
+}
+
 /// The bytes from one plane's description to the next in a present.
 const PLANE_STRIDE: usize = 0x48;
 

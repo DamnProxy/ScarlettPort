@@ -134,6 +134,10 @@ fn with_host_settings(base: [u8; 32], facts: &HostFacts) -> [u8; 32] {
     if facts.f3_view_fix {
         bytes.extend_from_slice(b"VICTORY_F3_VIEW_FIX=1");
     }
+    // (`VICTORY_CUBE_LOG2=1` changes the level of cube samples with gradients; named only when on)
+    if facts.cube_log2 {
+        bytes.extend_from_slice(b"VICTORY_CUBE_LOG2=1");
+    }
     *blake3::hash(&bytes).as_bytes()
 }
 
@@ -147,6 +151,7 @@ struct HostFacts {
     /// Copied tables read their own descriptor words (with ray tracing).
     table_snapshots: bool,
     f3_view_fix: bool,
+    cube_log2: bool,
 }
 
 impl HostFacts {
@@ -158,6 +163,7 @@ impl HostFacts {
             view_map: victory_shader::emit::view_heap_map(),
             table_snapshots: victory_shader::emit::table_snapshots(),
             f3_view_fix: victory_shader::emit::words::f3_view_fix(),
+            cube_log2: victory_shader::emit::words::cube_log2(),
         }
     }
 
@@ -662,6 +668,7 @@ mod tests {
             view_map: Some((1 << 17, 1_000_000 - (1 << 18) - 2)),
             table_snapshots: false,
             f3_view_fix: false,
+            cube_log2: false,
         };
         let unprobed = probed.unprobed();
         assert_eq!((unprobed.view_limit, unprobed.view_map, unprobed.max_wave), (0, None, 32));

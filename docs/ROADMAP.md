@@ -36,6 +36,10 @@ Play a session end to end, with saves, and record what breaks.
 
 ## Changelog
 
+### v0.4.4
+
+Runtime: picture fixes (`VICTORY_LOOK`), shader translation fixes (`VICTORY_SHADER_FIXES`), the XMA audio fix (always on), memory options (`VICTORY_OOM_BACKOFF`, `VICTORY_COMMIT_GATE`, `VICTORY_PREFETCH_CAP`), `VICTORY_WAVE32_LOWER`, `VICTORY_MOVIE_PLANE`, `VICTORY_THIN`; all new switches off by default. Launcher 0.4.4: opt-in Look preset. Not yet measured on the RTX 3060; frame rate unchanged at about 5 fps.
+
 ### v0.4.3
 
 Runtime synced to fx-cand4 (8d32f87); launcher 0.4.3 (version only). Measured on an RTX 3060 12 GB with a Ryzen 5 5600X (Series S profile), walking and turning in the world: 5.4 fps, median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms (3.9-4.5 fps before). 30 fps is not reached.

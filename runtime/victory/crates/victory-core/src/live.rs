@@ -51,6 +51,17 @@ pub const LIVE: &[&str] = &[
     "FAIR_DUE",
     "RELOOK_MS",
     "TEX_SPAN_PCT",
+    "AMBIENT_PCT",
+    "AMBIENT_AIR_PCT",
+    "KEEP_SHOWN",
+    "OOM_BACKOFF",
+    "COMMIT_GATE",
+    "PREFETCH_CAP",
+    "COPY_OVER_TITLE",
+    "RECHECK_SOON",
+    "TEXTURE_FILL",
+    "VIEW_RAW_OWN",
+    "MOVIE_PLANE",
 ];
 
 /// Switches known and NOT settable live (see the table in live-ab.md).

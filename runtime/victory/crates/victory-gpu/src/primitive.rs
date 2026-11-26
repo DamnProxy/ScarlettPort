@@ -78,6 +78,8 @@ enum Kind {
     F16,
     Unorm8,
     Unorm16,
+    Snorm8,
+    Snorm16,
 }
 
 /// Component count and kind of the vertex formats rectangles use.
@@ -93,6 +95,18 @@ fn components(format: u32) -> Option<(usize, Kind)> {
         11 => (4, Kind::Unorm16),
         35 => (2, Kind::Unorm16),
         28 | 29 | 87 | 91 => (4, Kind::Unorm8),
+        // Normalized kinds of one and two components, and signed ones
+        // (`VICTORY_STATE_FIXES`; before, such rectangles were left as
+        // they came).
+        56 if crate::cflook::state_fixes() => (1, Kind::Unorm16),
+        49 if crate::cflook::state_fixes() => (2, Kind::Unorm8),
+        61 if crate::cflook::state_fixes() => (1, Kind::Unorm8),
+        13 if crate::cflook::state_fixes() => (4, Kind::Snorm16),
+        37 if crate::cflook::state_fixes() => (2, Kind::Snorm16),
+        58 if crate::cflook::state_fixes() => (1, Kind::Snorm16),
+        31 if crate::cflook::state_fixes() => (4, Kind::Snorm8),
+        51 if crate::cflook::state_fixes() => (2, Kind::Snorm8),
+        63 if crate::cflook::state_fixes() => (1, Kind::Snorm8),
         _ => return None,
     })
 }
@@ -101,8 +115,8 @@ impl Kind {
     fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
-            Kind::F16 | Kind::Unorm16 => 2,
-            Kind::Unorm8 => 1,
+            Kind::F16 | Kind::Unorm16 | Kind::Snorm16 => 2,
+            Kind::Unorm8 | Kind::Snorm8 => 1,
         }
     }
 
@@ -113,6 +127,8 @@ impl Kind {
             Kind::F16 => half_to_f32(u16::from_le_bytes([b[0], b[1]])),
             Kind::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0,
             Kind::Unorm8 => f32::from(b[0]) / 255.0,
+            Kind::Snorm16 => (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0),
+            Kind::Snorm8 => (f32::from(b[0] as i8) / 127.0).max(-1.0),
         }
     }
 
@@ -126,6 +142,10 @@ impl Kind {
                 b.copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes())
             }
             Kind::Unorm8 => b[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8,
+            Kind::Snorm16 => {
+                b.copy_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())
+            }
+            Kind::Snorm8 => b[0] = (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8,
         }
     }
 }

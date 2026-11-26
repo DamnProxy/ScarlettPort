@@ -1,3 +1,6 @@
+<p align="center"><a href="https://github.com/ZigZagBoi1/ScarlettPort/stargazers"><img src="https://img.shields.io/github/stars/ZigZagBoi1/ScarlettPort?style=for-the-badge&logo=github&label=Star%20ScarlettPort&color=ffd700" alt="Star ScarlettPort on GitHub"></a></p>
+<p align="center"><b>⭐ If ScarlettPort helps you, please star the repo — it helps more people find it.</b></p>
+
 <div align="center">
 
 # ScarlettPort
@@ -104,7 +107,19 @@ Questions: [`docs/FAQ.md`](docs/FAQ.md). Problems: [`docs/TROUBLESHOOTING.md`](d
 
 ---
 
-## 🆕 New in v0.4.3
+## 🆕 New in v0.4.4
+
+New options, all **off by default** and **not yet measured on our RTX 3060**. Frame rate is unchanged at about 5 fps; these are about the picture, sound and memory, not speed.
+
+- **`VICTORY_LOOK=1` (picture):** ambient light so dark rooms are not black, texture and colour fixes (no stray bytes or specks over faces, textures that changed being re-checked sooner, partly unmapped textures no longer uploaded as black, misaligned buffer views fixed), sampler and vertex-format fixes, and ocean textures copied back so boats float instead of sinking.
+- **`VICTORY_SHADER_FIXES=1` (shader translation):** a more accurate translation of many shader instructions and forms. It changes the shader cache key, so the first run with it rebuilds shaders. Each part can be switched on its own (`VICTORY_SHADER_*`, see the source).
+- **Audio fix (always on):** XMA audio is decoded until a whole block is ready, so sound no longer cuts out or stops when the title refills a voice.
+- **Memory options:** `VICTORY_OOM_BACKOFF=1` (back off briefly when the card or PC is out of memory), `VICTORY_COMMIT_GATE=1` (pause texture uploads when the PC is low on commit memory), `VICTORY_PREFETCH_CAP=1` (cap texture bytes per frame). Also `VICTORY_WAVE32_LOWER=1` (NVIDIA wave32 lowering fixes), `VICTORY_MOVIE_PLANE=1` (movie frames uploaded from each list's own buffer) and `VICTORY_THIN=1` (draw lists recorded on worker threads).
+- **Launcher 0.4.4:** a new opt-in **Look** preset (Stable plus `VICTORY_LOOK=1` and `VICTORY_SHADER_FIXES=1`); `scripts/play-victory.ps1 -Look` does the same. Stable is unchanged.
+
+Please send hardware reports if you try the Look preset: what looks better or worse, and your fps.
+
+## New in v0.4.3
 
 Measured in the world on an RTX 3060 12 GB with a Ryzen 5 5600X (Series S profile), walking and turning: 5.4 fps, median frame 184 ms, 95th percentile 197 ms, 99th percentile 207 ms (3.9-4.5 fps before). 30 fps is not reached.
 
@@ -285,6 +300,7 @@ Every task is sized for **one person + one AI coding agent**. Pick one, comment 
 ### Tooling & docs
 
 - [ ] **#7 Hardware reports.** Run it on your GPU and post results (GPU, driver, fps, how far it got).
+- [ ] **Look preset A/B.** New in 0.4.4 and not yet measured: run Stable and Look (`VICTORY_LOOK=1`, `VICTORY_SHADER_FIXES=1`) in the same scene and report fps and what the picture gains or loses.
 - [x] **#8 One-click launcher** for the VIctory-based runtime (done: it is the launcher's default engine).
 - [x] **Launcher 0.4.1.** Done: Controller line on the Play page, the Prepare shaders step, the NVMe/SSD note, and the Stable preset matched to the measured best (native PlayStation pads, no lazy remap).
 - [ ] **Controller hot-plug report.** Try the Controller line with wireless (Bluetooth) PlayStation pads and other Xbox-compatible pads, and report what it shows. `launcher/src/controller.rs`.

@@ -27,6 +27,7 @@ Also credited: XCL by ivall and contributors (https://github.com/ivall/xcl, GPL-
 ## This snapshot
 
 - Source: branch `fx-cand4` at `8d32f87` of our fork's working repository, with the pull requests merged in this repository since the previous snapshot kept on top. Every new switch is off by default in the runtime; `scripts/play-victory.ps1` and the launcher turn on the verified ones (see `docs/RUNTIMES.md`).
+- Since `8d32f87`: picture fixes (`VICTORY_LOOK`), shader translation fixes (`VICTORY_SHADER_FIXES` and its `VICTORY_SHADER_*` parts), the XMA audio fix (always on), `VICTORY_WAVE32_LOWER`, `VICTORY_MOVIE_PLANE`, memory options (`VICTORY_OOM_BACKOFF`, `VICTORY_COMMIT_GATE`, `VICTORY_PREFETCH_CAP`) and `VICTORY_THIN`, all off by default. Much of it is adapted from codec-d/cool_fox (GPL-3.0); authors are kept in our working repository's history: Ziggy, codec_d, fxceless, Noname0202, jaschinski97-ops, mgunes1311-lab, and commits recorded as `local` that credit their sources in their messages.
 - Since `b3882b9` (one commit, by Ziggy): the texture upload queue is fair (`VICTORY_FAIR_DUE=2` by default, `VICTORY_TEX_SPAN_PCT`), with a "texture queue" log line every five seconds.
 - Merged in `efcc7b9..b3882b9` (`fx-cand4` at `efcc7b9`, which this repository took in 11be94c):
   - screen passes with workers of their own, on by default (`VICTORY_SCREEN_WORKERS=0`: off): the lighting passes fix

@@ -262,7 +262,9 @@ fn sweep() {
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
+    // (Those the title made and the host has not begun get the next numbers:
+    // cool_fox's line, `VICTORY_THIN=1`; 0 otherwise.)
+    let started = STARTED.load(Ordering::Acquire) + crate::queue::queued();
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
@@ -2369,6 +2371,9 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Reads a CPU-written linear movie plane (title memory `(at, len)`) into the list's own
+    /// upload buffer (`VICTORY_MOVIE_PLANE=1`, [`crate::texture::upload_from`]).
+    Plane((usize, usize), Box<dyn Fn() + Send>),
 }
 
 struct BuilderReport {
@@ -2389,6 +2394,8 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Upload buffers of movie planes, kept through this list's fence.
+    plane_uploads: Vec<(Chunk, u64)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -2417,6 +2424,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -2472,6 +2484,7 @@ impl Deferred {
             self.copies.clear();
         }
         self.uploads.clear();
+        give_chunks(std::mem::take(&mut self.plane_uploads));
         self.kept.clear();
         self.bound.clear();
         if self.refreshed.capacity() > KEEP_STEPS {
@@ -2492,12 +2505,15 @@ impl Deferred {
         }
         self.writes.clear();
         self.backs.clear();
+        self.back_wanted.clear();
+        self.texture_backs.clear();
         self.quarantined = false;
     }
 }
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        give_chunks(std::mem::take(&mut self.plane_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -3849,6 +3865,14 @@ fn blocked_by(
                         return Some(WHY_READ);
                     }
                 }
+                &Step::Plane((at, len), _) => {
+                    if any_written(at, at.saturating_add(len)) {
+                        if count {
+                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
                 Step::Refresh(shadow, address, len) => {
                     let (from, to) = (*address, *address + *len);
                     let copy = std::sync::Arc::as_ptr(shadow) as usize;
@@ -4049,6 +4073,12 @@ fn readfix_decide(runs: &[&HostList]) -> Result<Vec<Redirect>, usize> {
                     if any_written(at, at + len) {
                         let d = readfix_overlaps(&by_copy, &immed, &owners, at, at + len);
                         return wait(17, "a texture", at, at + len, d);
+                    }
+                }
+                &Step::Plane((at, len), _) => {
+                    if any_written(at, at.saturating_add(len)) {
+                        let d = readfix_overlaps(&by_copy, &immed, &owners, at, at.saturating_add(len));
+                        return wait(17, "a movie plane", at, at.saturating_add(len), d);
                     }
                 }
                 &Step::Run(_, Some((dst, src, len))) if crate::memcopy::known_writes() => {
@@ -5870,6 +5900,11 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    // Textures shaders wrote that the title reads on the CPU
+    // ([`crate::texback`]).
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -7984,7 +8019,8 @@ impl Host {
             let backs: Vec<(usize, usize)> = runs
                 .iter()
                 .flat_map(|l| {
-                    l.deferred()
+                    let deferred = l.deferred();
+                    deferred
                         .backs
                         .iter()
                         .filter(|&&(_, _, [row, rows, _])| row > 0 && rows > 0)
@@ -7992,6 +8028,8 @@ impl Host {
                             let span = rows.saturating_sub(1).saturating_mul(pitch).saturating_add(row);
                             (at, at.saturating_add(span))
                         })
+                        // Textures shaders wrote, copied back (`crate::texback`).
+                        .chain(deferred.texture_backs.iter().map(crate::texback::Back::range))
                         .collect::<Vec<_>>()
                 })
                 .collect();
@@ -8489,6 +8527,7 @@ impl HostList {
         self.flush_barriers();
         self.hazard_flush();
         self.twins_to_depth();
+        self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
@@ -8978,6 +9017,37 @@ impl HostList {
     /// `twin_use` and read the depth texture in lists that never name it
     /// (in a captured frame of the title no table names a shadow
     /// map for reading but the pass that fills the next one).
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            let Some(copy) = crate::resource::host_copy(target.owner() as crate::object::This) else {
+                continue;
+            };
+            self.settle(&copy, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
     fn twins_to_depth(&self) {
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
@@ -9253,7 +9323,8 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.texture_backs.is_empty())
             {
                 return false;
             }
@@ -10010,6 +10081,11 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether the list asked about `key` since the reset ([`Self::first_use`]).
+    pub(crate) fn used(&self, key: usize) -> bool {
+        self.deferred().textures.contains(&key)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -10068,6 +10144,24 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
+    /// A copy source this list alone owns until it is reset after its last run, filled from
+    /// title memory `read` by `fill` (given the buffer's mapped address) when the list is
+    /// submitted: another list can prepare its movie plane meanwhile.
+    pub(crate) fn plane_upload(
+        &self,
+        size: u64,
+        read: (usize, usize),
+        fill: impl Fn(usize) + Send + 'static,
+    ) -> Option<ID3D12Resource> {
+        let chunk = take_chunk(host()?, size)?;
+        let source = chunk._buffer.clone();
+        let destination = chunk.data;
+        let mut deferred = self.deferred();
+        deferred.plane_uploads.push((chunk, size));
+        deferred.copies.push(Step::Plane(read, Box::new(move || fill(destination))));
+        Some(source)
+    }
+
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
     }
@@ -10201,6 +10295,13 @@ impl HostList {
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
+                    continue;
+                }
+                Step::Plane((_, len), fill) => {
+                    let started = std::time::Instant::now();
+                    fill();
+                    PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[3].fetch_add(*len as u64, Ordering::Relaxed);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -11198,6 +11299,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -11597,6 +11699,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        crate::queue::line_line(frames);
         re1_line(frames);
         readfix_line(frames);
         barrier_line(frames);

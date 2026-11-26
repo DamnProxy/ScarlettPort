@@ -6,10 +6,16 @@ use std::path::Path;
 pub const STABLE: &str = "stable";
 pub const EXPERIMENTAL: &str = "experimental";
 pub const CUSTOM: &str = "custom";
-pub const ALL: [&str; 3] = [STABLE, EXPERIMENTAL, CUSTOM];
+pub const LOOK: &str = "look";
+pub const ALL: [&str; 4] = [STABLE, LOOK, EXPERIMENTAL, CUSTOM];
+
+/// Look (opt-in, not part of Stable): Stable plus the picture fixes (`VICTORY_LOOK`: ambient light
+/// in dark rooms, texture and colour fixes, faces, boats that float) and the more accurate shader
+/// translation (`VICTORY_SHADER_FIXES`). Not yet measured on the RTX 3060.
+pub const LOOK_ON: [(&str, &str); 2] = [("VICTORY_LOOK", "1"), ("VICTORY_SHADER_FIXES", "1")];
 
 /// The runtime build the bundled runtime folder is made from (see the repository's runtime/).
-pub const BUNDLED_BUILD: &str = "fx-cand4 b3882b9";
+pub const BUNDLED_BUILD: &str = "v0.4.4 runtime";
 /// The build the Experimental switches were merged into (fx-cand2); older builds ignore them.
 pub const EXPERIMENTAL_BUILD: &str = "fx-cand2";
 
@@ -69,6 +75,7 @@ pub const EXPERIMENTAL_OFF: [(&str, &str); 6] = [
 pub fn label(preset: &str) -> &'static str {
     match preset {
         EXPERIMENTAL => "Experimental",
+        LOOK => "Look",
         CUSTOM => "Custom",
         _ => "Stable",
     }
@@ -77,6 +84,7 @@ pub fn label(preset: &str) -> &'static str {
 pub fn blurb(preset: &str) -> &'static str {
     match preset {
         EXPERIMENTAL => "C1 plus the safe fx-cand2 switches (indirect window and keep, tabled skip frames). Own cache.",
+        LOOK => "Stable plus the picture fixes (VICTORY_LOOK) and the shader translation fixes (VICTORY_SHADER_FIXES). Opt-in, not yet measured on the RTX 3060; the first run rebuilds shaders.",
         CUSTOM => "Your World options from Settings (ray tracing, stand-in light, debug view).",
         _ => "The verified fx-cand4 setup: precise syncs, the speed switches, sub-page memory, copy cuts, PlayStation pads.",
     }
@@ -99,6 +107,12 @@ pub fn stable_env(game: &Path, victory_cache: &Path) -> Vec<(&'static str, Strin
     ];
     v.extend(C1.iter().map(|k| (*k, "1".to_string())));
     v.extend(CAND4.iter().map(|(k, x)| (*k, x.to_string())));
+    v
+}
+
+pub fn look_env(game: &Path, victory_cache: &Path) -> Vec<(&'static str, String)> {
+    let mut v = stable_env(game, victory_cache);
+    v.extend(LOOK_ON.iter().map(|(k, x)| (*k, x.to_string())));
     v
 }
 
@@ -159,6 +173,8 @@ mod tests {
             assert_eq!(get(&e, k).as_deref(), Some(v), "{k}");
         }
         assert!(get(&e, "VICTORY_FAST_BOOT").is_none());
+        assert!(get(&e, "VICTORY_LOOK").is_none());
+        assert!(get(&e, "VICTORY_SHADER_FIXES").is_none());
         for k in CLEARED {
             assert!(get(&e, k).is_none());
         }
@@ -173,6 +189,14 @@ mod tests {
         assert!(get(&e, "VICTORY_SHADER_OPT").is_none());
         assert_eq!(cache_for(EXPERIMENTAL, Path::new("F:/S/cache-fast")), PathBuf::from("F:/S/cache-fast-experimental"));
         assert_eq!(cache_for(STABLE, Path::new("F:/S/cache-fast")), PathBuf::from("F:/S/cache-fast"));
+    }
+
+    #[test]
+    fn look_is_stable_plus_look() {
+        let e = look_env(Path::new("D:/dump"), Path::new("F:/c"));
+        assert_eq!(e.len(), stable_env(Path::new("D:/dump"), Path::new("F:/c")).len() + LOOK_ON.len());
+        assert_eq!(get(&e, "VICTORY_LOOK").as_deref(), Some("1"));
+        assert_eq!(get(&e, "VICTORY_SHADER_FIXES").as_deref(), Some("1"));
     }
 
     #[test]

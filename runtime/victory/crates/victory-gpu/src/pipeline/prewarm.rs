@@ -42,6 +42,7 @@ fn shader(stage: &'static str, container: &[u8]) -> Arc<Shader> {
         stage,
         hash: blake3::hash(container).to_hex()[..16].to_owned(),
         container: container.to_vec(),
+        ambient: None,
         translated: OnceLock::new(),
         walks: OnceLock::new(),
         thread_limited: false,

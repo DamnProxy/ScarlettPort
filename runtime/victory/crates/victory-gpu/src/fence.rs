@@ -94,6 +94,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         #[cfg(windows)]
         if crate::host::late() {
             drop(waiters);
+            // (cool_fox's line, `VICTORY_THIN=1`: what the queues were given
+            // before goes to the card first.)
+            crate::queue::line_before_sync();
             // Only until the signal that sets it, if one is in the line.
             let reached = || fence.value.load(Ordering::Acquire) >= value;
             if crate::host::wait_fence_signal(this as usize, value, reached) && reached() {

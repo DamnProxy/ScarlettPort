@@ -481,6 +481,10 @@ pub(crate) struct State {
     /// Whether shader writes so far have been waited for as indirect
     /// arguments in the host list ([`settle_arguments`]).
     args_settled: bool,
+    /// The tables the last bind made afresh for a program the stand-in for
+    /// the indirect light follows (`crate::ambient`): root parameter, bytes
+    /// into the view heap.
+    ambient_tables: Vec<(u8, u32)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -1545,6 +1549,10 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
+            if stage.shader.ambient.is_some() {
+                self.ambient_tables.clear();
+                self.ambient_tables.extend(made.iter().copied());
+            }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             // fx #935: the whole list copies nothing back, not this dispatch
@@ -2329,6 +2337,8 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        // Textures filled with less than was mapped (`VICTORY_TEXTURE_FILL`).
+        host.texture_slots_short(frame);
         host.texture_sweep(heap, frame);
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
@@ -2393,6 +2403,10 @@ impl State {
         } else {
             (budget_per_frame, SPAN)
         };
+        // After the catching up's: on a PC of 32 GB or less, under host
+        // pressure and on low commit, less (`VICTORY_PREFETCH_CAP=1`,
+        // cool_fox 18bdf793/8cc31ab3; `crate::residency`).
+        let per_frame = crate::residency::per_frame(per_frame, crate::texture::staged_bytes());
         let fair = crate::descriptor::host::fair_due() >= 2;
         let began = std::time::Instant::now();
         let handed = due.len();
@@ -2407,6 +2421,13 @@ impl State {
             }
             if began.elapsed() > span {
                 stopped = 1;
+                break;
+            }
+            // After a refused allocation, or on low commit (`crate::residency`,
+            // `VICTORY_OOM_BACKOFF`, `VICTORY_COMMIT_GATE`): the slot stays
+            // due (counted with the full card's).
+            if !crate::residency::admit_texture_pass() {
+                stopped = 3;
                 break;
             }
             looked += 1;
@@ -2429,6 +2450,13 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            // One found changed by such a look is looked at in the next frame
+            // again (`VICTORY_RECHECK_SOON`, live; off, on under
+            // `VICTORY_LOOK=1`): the textures left that change unnoticed
+            // are ones the title paints all the time through another view of
+            // their pages, and each was shown four frames late, over and over.
+            static SOON: crate::cflook::Live = crate::cflook::Live::new("RECHECK_SOON", 1);
+            let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
@@ -2439,6 +2467,9 @@ impl State {
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
+                }
+                if SOON.on() {
+                    again_in = 1;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
@@ -2623,7 +2654,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -2796,6 +2827,76 @@ impl State {
         }
         self.note_writes(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::on()
+            && self.ambient(list, p, role)
+        {
+            // The passes replaced the compute root signature and pipeline.
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            self.host_tables[1].root_set();
+            self.host_args[1].root_set();
+        }
+    }
+
+    /// The stand-in for the indirect light after a dispatch of `p`
+    /// (`crate::ambient`). Whether it recorded anything.
+    fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return false;
+        };
+        let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
+        else {
+            return false;
+        };
+        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            t.used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+                View::Shader(r, _) | View::Unordered(r, ..) => r,
+                _ => return None,
+            };
+            let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+                Some(m) => m.1,
+                None => self.user_value(true, slot, RootType::Table, 0),
+            };
+            let host = crate::resource::host_resource(resource as This)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { host.GetDesc() };
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        };
+        let at = match role {
+            Role::Resolve => LIGHT,
+            Role::Radiance => RADIANCE,
+            Role::Air => AIR,
+        };
+        let image = entry(ResourceType::Uav, at);
+        let depth = match role {
+            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Radiance | Role::Air => image,
+        };
+        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+            once!(?role, "no stand-in for the indirect light: other tables");
+            return false;
+        };
+        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
+        let format = if role == Role::Resolve { 42 } else { 26 };
+        let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+            once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            return false;
+        }
+        crate::ambient::after(list, role, &Views {
+            image,
+            depth,
+            size: [of.Width as u32, of.Height],
+            slices: u32::from(of.DepthOrArraySize),
+        })
     }
 
     /// A dispatch by thread counts (`DispatchX` with the console's
@@ -4389,6 +4490,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Some compute-written textures are also read by the title's
+            // CPU (`crate::texback`, `VICTORY_TEXTURE_BACK`).
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

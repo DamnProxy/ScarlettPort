@@ -251,6 +251,14 @@ fn build() -> &'static [u8; 32] {
         if victory_shader::emit::wave64_lds() {
             host.extend_from_slice(b"wave64 lds");
         }
+        // (`VICTORY_CUBE_LOG2=1` changes the level of cube samples with gradients)
+        if victory_shader::emit::words::cube_log2() {
+            host.extend_from_slice(b"cube log2");
+        }
+        // (`VICTORY_WAVE32_LOWER=1`: cool_fox's wave32 lowering fixes; off, the key is as before)
+        if victory_shader::emit::cf_wave32() {
+            host.extend_from_slice(b"cf wave32");
+        }
         context(
             limit,
             victory_shader::emit::group_sync(),

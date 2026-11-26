@@ -76,6 +76,19 @@ use crate::dxbc::{u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
+/// FSPX compute programs (cool_fox 66afb2b4; `VICTORY_SHADER_FORMS2`).
+const FSPX_VERSION: u32 = 1;
+const FSPX_HEADER: usize = 0x10;
+const FSPX_PACKET: u32 = 0;
+const FSPX_CODE: u32 = 6;
+const FSPX_METADATA: u32 = 7;
+const PACKET_THREADS: usize = 0x0c;
+const PACKET_FLAGS: usize = 0x12;
+const PACKET_WAVE32: u16 = 1 << 4;
+const PACKET_RSRC1: usize = 0x14;
+const PACKET_RSRC2: usize = 0x18;
+const FSPX_RECORDS: usize = 0x18;
+const FSPX_RECORD: usize = 32;
 const KIND_NATIVE: u32 = 0x0d;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
@@ -429,6 +442,11 @@ pub struct UsedResource {
 
 /// The native programs in a `DXIL` part's data; empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+    // A compute program in the FSPX layout (cool_fox 66afb2b4;
+    // `VICTORY_SHADER_FORMS2`; off: none found there, as before).
+    if part.starts_with(b"FSPX") && crate::emit::cf_switch("VICTORY_SHADER_FORMS2") {
+        return Ok(vec![fspx_program(part)?]);
+    }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }
@@ -630,6 +648,21 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     })
 }
 
+fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|e| VsOutput {
+            usage: Usage::from_raw(e[0]),
+            row: e[1],
+            param: e[2],
+            fp16: e[5] & 1 != 0,
+            pack2: e[5] & 2 != 0,
+        })
+        .collect())
+}
+
 fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     let inputs = semantics(data, VS_INPUTS, 5, VS_INPUT_COUNT)?
         .as_chunks::<5>()
@@ -642,24 +675,21 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             vgpr: e[3],
         })
         .collect();
-    let outputs = semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .map(|e| VsOutput {
-            usage: Usage::from_raw(e[0]),
-            row: e[1],
-            param: e[2],
-            fp16: e[5] & 1 != 0,
-            pack2: e[5] & 2 != 0,
-        })
-        .collect();
+    let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
-    let StageIo::Vs { outputs, .. } = vs_io(data)? else {
-        unreachable!()
+    // Mesh stage data has no vertex inputs: their count there is not read
+    // (`VICTORY_SHADER_MESH_IO=1`, on with `VICTORY_SHADER_FIXES=1`; off: read as a
+    // vertex program's, and a mesh program with junk there is refused).
+    let outputs = if crate::emit::cf_switch("VICTORY_SHADER_MESH_IO") {
+        vs_outputs(data)?
+    } else {
+        let StageIo::Vs { outputs, .. } = vs_io(data)? else {
+            unreachable!()
+        };
+        outputs
     };
     let info = data
         .get(MS_INFO..MS_INFO + 8)
@@ -700,6 +730,129 @@ fn le32(entry: &[u8], at: usize) -> u32 {
 fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     let start = usize::try_from(offset).ok()?;
     data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
+}
+
+/// The compute program of an `ACCC` part, which a container carries in place
+/// of `DXIL` when another compiler made the native code (the AMD
+/// FidelityFX upscaler's shaders). Layout as observed (offsets from "FSPX"):
+///
+/// ```text
+/// +0x00 "FSPX" u32 version (1), u32 entry count, u32 size; entries of 16 B
+///       from +0x10: u32 kind, u32 offset, u32 size, u32 0
+/// kind 0  pipeline registers, 0x1c B: +0x0c u16 x3 thread-group size,
+///         +0x12 u16 flags (bit 4 wave32), +0x14 COMPUTE_PGM_RSRC1,
+///         +0x18 COMPUTE_PGM_RSRC2
+/// kind 1  pipeline metadata (a hash); kind 6 the GFX10 code
+/// kind 7  program metadata: u32 0x403, u32 size - 0x14, u32 code dwords,
+///         u64 0, u8 0x40, u8 first user-data dword, u8 count of 0x41
+///         records, u8 0; then 32-byte records from +0x18, each a u32 tag:
+///   0x41  a resource the code reads: u8 resource type (as FSSM's used
+///         entries), u8 root type, u16 0, u32 table offset (dwords), u32
+///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
+///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
+///         u32 -1, u32 0
+///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
+///         u8 resource kind (DXIL's), u8 0, u32 register
+///   0x43  the shader hash (16 B); the last record
+/// ```
+pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
+    if u32_at(part, 4)? != FSPX_VERSION {
+        return Err(Malformed("unknown FSPX version"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return Err(Malformed("implausible FSPX entry count"));
+    }
+    let entry = |kind: u32| -> Result<&[u8], ShaderError> {
+        for i in 0..count {
+            let at = FSPX_HEADER + 16 * i;
+            if u32_at(part, at)? == kind {
+                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
+                return bytes(part, offset.into(), size.into())
+                    .ok_or(Malformed("FSPX entry out of bounds"));
+            }
+        }
+        Err(Malformed("FSPX entry missing"))
+    };
+    let packet = entry(FSPX_PACKET)?;
+    let code = entry(FSPX_CODE)?;
+    let meta = entry(FSPX_METADATA)?;
+    if u32_at(meta, 8)? as usize * 4 != code.len() {
+        return Err(Malformed("FSPX code size disagrees"));
+    }
+    let wave64 = u16_at(packet, PACKET_FLAGS)? & PACKET_WAVE32 == 0;
+    // VGPRs in granules of 4 (wave64) or 8 (wave32).
+    let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
+    let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
+    let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    let mut layout: Vec<RootParam> = Vec::new();
+    let mut used = Vec::new();
+    for e in meta
+        .get(FSPX_RECORDS..)
+        .unwrap_or(&[])
+        .as_chunks::<FSPX_RECORD>()
+        .0
+    {
+        match e[0] {
+            0x41 => {}
+            0x42 => continue,
+            0x43 => break,
+            _ => return Err(Malformed("unknown FSPX metadata record")),
+        }
+        let root = RootType::from_raw(e[5].into());
+        let u = UsedResource {
+            kind: match e[4] {
+                0 => ResourceType::Srv,
+                1 => ResourceType::Sampler,
+                2 => ResourceType::Cbv,
+                3 => ResourceType::Uav,
+                n => ResourceType::Other(n),
+            },
+            root,
+            table_offset_dwords: le32(e, 8),
+            lower_bound: le32(e, 12),
+            stride: 0,
+            dwords: e[20],
+            user_data: e[21],
+            slot: e[22],
+        };
+        let sgprs = match root {
+            RootType::Table => 1,
+            RootType::Descriptor => 2,
+            // The code holds its words; no user data.
+            RootType::ImmediateSampler => 0,
+            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
+        };
+        if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs,
+                base_register: u.lower_bound,
+                user_data: u.user_data,
+                slot: u.slot,
+            });
+        }
+        used.push(u);
+    }
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            threads: [threads(0)?, threads(1)?, threads(2)?],
+        }),
+        code: code.to_vec(),
+    })
+}
+
+fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
+    data.get(at..at + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .ok_or(Malformed("FSPX data out of bounds"))
 }
 
 #[cfg(test)]
@@ -992,6 +1145,19 @@ mod tests {
         blob[e + GS_RING..][..4].copy_from_slice(&0x3du32.to_le_bytes());
         let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
         assert_eq!(p.io, StageIo::None);
+    }
+
+    #[test]
+    fn mesh_stage_io_ignores_unused_vs_input_count() {
+        if !crate::emit::cf_switch("VICTORY_SHADER_MESH_IO") {
+            return;
+        }
+        let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Ms);
+        // Mesh stage data has no vertex inputs; E+0xc4 is unused by MS.
+        blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert!(matches!(p.io, StageIo::Ms(_)));
     }
 
     #[test]

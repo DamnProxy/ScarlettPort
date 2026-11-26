@@ -845,6 +845,7 @@ impl Launcher {
         let cache = self.victory_cache();
         let mut env = match self.config.preset.as_str() {
             presets::EXPERIMENTAL => presets::experimental_env(game, &cache),
+            presets::LOOK => presets::look_env(game, &cache),
             presets::CUSTOM => {
                 let mut e = engine::world_env(&self.config, game, &self.config.cache_dir);
                 presets::set(&mut e, "VICTORY_CACHE_DIR", cache.display().to_string());

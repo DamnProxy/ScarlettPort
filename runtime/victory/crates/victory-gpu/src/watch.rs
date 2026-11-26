@@ -1814,6 +1814,7 @@ pub fn title_memory_remapping_many(ranges: &[(usize, usize)]) -> Remapping {
 pub fn title_memory_remapped_many(ranges: &[(usize, usize)]) {
     for &(at, end) in ranges {
         let len = end - at;
+        crate::texback::remapped(at, len);
         crate::regions::unmapped(at, len);
         crate::translate::remapped(at, len);
         crate::descriptor::host::remapped(at, len);
@@ -1878,6 +1879,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     // The record of what is mapped: nothing there until the runtime tells
     // of the views it maps (`crate::title_memory_view`).
     crate::regions::unmapped(at, len);

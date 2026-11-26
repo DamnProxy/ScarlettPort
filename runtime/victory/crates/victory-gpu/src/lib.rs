@@ -19,6 +19,12 @@
 mod agility;
 #[cfg(windows)]
 mod ab;
+#[cfg(windows)]
+mod ambient;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod cflook;
+#[cfg(windows)]
+mod texback;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -81,6 +87,7 @@ mod readfix;
 mod rebar;
 #[cfg(windows)]
 mod regions;
+mod residency;
 pub mod queue;
 #[cfg(windows)]
 mod queue2;

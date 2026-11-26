@@ -212,3 +212,15 @@ mod tests {
         assert_eq!(buffer_format(75).unwrap().0, &[32, 32, 32, 32][..]);
     }
 }
+
+/// `VICTORY_CUBE_LOG2=1` (boot; off: as before): a cube sampled with
+/// explicit gradients takes its level from DXIL's base-2 logarithm (the
+/// natural one gave levels 1.44 times too high, blurrier reflections) and
+/// keeps the instruction's least level (DexNom/VIctory 921d8d3b, via
+/// cool_fox 9a6c829d). It changes the translation, so the shader cache keys
+/// name it when it is on.
+/// Unset, `VICTORY_SHADER_FIXES=1` turns it on (cool_fox has it on).
+pub fn cube_log2() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::emit::cf_switch("VICTORY_CUBE_LOG2"))
+}

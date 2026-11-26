@@ -27,6 +27,8 @@ param(
     [ValidateSet('series-s', 'series-x')] [string]$Console = 'series-s',
     # Press A on a timer so the title screens advance without a controller.
     [switch]$AutoInput,
+    # Opt-in picture and shader translation fixes (VICTORY_LOOK, VICTORY_SHADER_FIXES); not yet measured on the RTX 3060.
+    [switch]$Look,
     # Do not set VICTORY_OWN_UPSCALER=1.
     [switch]$NoOwnUpscaler,
     # Do not set VICTORY_NO_WATCHDOG=1.
@@ -69,6 +71,7 @@ $env:VICTORY_MEM_SUBPAGE = '1'; $env:VICTORY_COPY_NOQUERY = '1'; $env:VICTORY_CA
 $env:VICTORY_FRIENDLY = '1'
 $env:VICTORY_PIPELINE_WAIT_MS = '0'
 if ($FastBoot) { $env:VICTORY_FAST_BOOT = '1' }
+if ($Look) { $env:VICTORY_LOOK = '1'; $env:VICTORY_SHADER_FIXES = '1' }
 if ($SaveSlot) { $env:VICTORY_SAVE_SLOT = $SaveSlot }
 # Write button names here ("A", "DOWN DOWN A") to press them while the game runs.
 $env:VICTORY_PRESS_FILE = Join-Path $root 'press.txt'

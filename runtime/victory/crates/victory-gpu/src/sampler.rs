@@ -47,6 +47,9 @@ impl Fields {
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
+        if crate::cflook::state_fixes() {
+            return self.bounded(reduction, filter, aniso);
+        }
         D3D12_SAMPLER_DESC {
             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
             AddressU: D3D12_TEXTURE_ADDRESS_MODE(self.address[0] as i32),
@@ -68,6 +71,57 @@ impl Fields {
                 self.max_lod
             },
         }
+    }
+
+    /// [`Self::host`] inside the host's bounds (`VICTORY_STATE_FIXES`):
+    /// LOD bounds without NaN or infinities and never inverted, the bias in
+    /// range, address modes the host knows, a comparison function only on a
+    /// comparison sampler.
+    fn bounded(&self, reduction: u32, filter: u32, aniso: bool) -> D3D12_SAMPLER_DESC {
+        let min_lod = finite_lod(self.min_lod, 0.0);
+        // Without a mip filter the console clamps sampling to `min_lod`.
+        let max_lod = if self.mip == 0 {
+            min_lod
+        } else {
+            finite_lod(self.max_lod, min_lod).max(min_lod)
+        };
+        D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
+            AddressU: address_mode(self.address[0]),
+            AddressV: address_mode(self.address[1]),
+            AddressW: address_mode(self.address[2]),
+            MipLODBias: if self.bias.is_nan() {
+                0.0
+            } else {
+                self.bias.clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
+            },
+            MaxAnisotropy: if aniso { self.anisotropy.clamp(1, 16) } else { 1 },
+            ComparisonFunc: if reduction == 1 {
+                D3D12_COMPARISON_FUNC(self.compare as i32)
+            } else {
+                D3D12_COMPARISON_FUNC_NEVER
+            },
+            BorderColor: self.border,
+            MinLOD: min_lod,
+            MaxLOD: max_lod,
+        }
+    }
+}
+
+/// Maps a console address mode (`1..=5`) to host D3D12, falling back to `CLAMP`.
+fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
+    match mode {
+        1..=5 => D3D12_TEXTURE_ADDRESS_MODE(mode as i32),
+        _ => D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+    }
+}
+
+/// Sanitizes an LOD bound for D3D12, substituting `fallback` for `NaN` and clamping infinities.
+fn finite_lod(value: f32, fallback: f32) -> f32 {
+    if value.is_nan() {
+        fallback
+    } else {
+        value.clamp(-D3D12_FLOAT32_MAX, D3D12_FLOAT32_MAX)
     }
 }
 
