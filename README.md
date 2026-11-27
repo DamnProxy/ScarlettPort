@@ -46,6 +46,7 @@ You supply a dump of your own legally purchased copy. Nothing of any title is in
 - World reached in 178 s instead of 244 s (one boot each; load times vary from boot to boot), and 3.4 fps in the world instead of 1.6. The 95th-percentile frame did not improve (4,464 ms against 4,250 ms).
 - Load work (read-ahead, unpaced loading frames, `scarlett prepare`) is opt-in in the Experimental preset; not measured on its own yet.
 - Launcher 0.5.0: a first-run setup (game folder search, player name, one-time shader preparation).
+- Launcher 0.5.1: a calmer game check (the dump's own file list is advisory), a Setup page with every step's status and a way back into setup, mouse look with sensitivity, the game below normal priority so the PC stays responsive, a shader bar that reaches 100%, scrolling pages, and one-click Update now.
 
 **Known issues:** haze indoors; a crash reported mid-prologue ([#51](https://github.com/ZigZagBoi1/ScarlettPort/issues/51)).
 

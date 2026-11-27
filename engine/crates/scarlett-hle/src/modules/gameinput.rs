@@ -113,6 +113,30 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// The mouse as a right stick (mouse look), `None` when off or unfocused.
+    fn look(&mut self) -> Option<PadState> {
+        None
+    }
+}
+
+/// Mouse look sensitivity: `SCARLETT_MOUSE_LOOK` (0 turns it off; default 1).
+fn mouse_look_sensitivity() -> f32 {
+    static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("SCARLETT_MOUSE_LOOK")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.0, 10.0)
+    })
+}
+
+/// A mouse movement of `dx`, `dy` pixels since the last poll as a right
+/// stick (up positive), eased with the last reading so it does not flicker.
+fn look_stick(dx: i32, dy: i32, sensitivity: f32, last: (f32, f32)) -> (f32, f32) {
+    let to = |d: i32| (d as f32 * sensitivity / 24.0).clamp(-1.0, 1.0);
+    let (x, y) = (to(dx), -to(dy));
+    ((x + last.0) / 2.0, (y + last.1) / 2.0)
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -432,7 +456,12 @@ impl Hub {
     fn poll(&self) {
         let (pads, mut keys) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            if self.one_pad
+                && let Some(look) = source.look()
+            {
+                pads[0] = Some(pads[0].map_or(look, |p| merged(p, look)));
+            }
             (pads, source.keys())
         };
         scripted_input(&mut keys);
@@ -1229,8 +1258,9 @@ mod host {
         XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState,
         XInputSetState,
     };
+    use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
@@ -1275,6 +1305,8 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// The last mouse look stick, for easing.
+        look: (f32, f32),
     }
 
     impl Source for Host {
@@ -1330,6 +1362,27 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn look(&mut self) -> Option<PadState> {
+            let sensitivity = mouse_look_sensitivity();
+            if sensitivity <= 0.0 || !focused() {
+                self.look = (0.0, 0.0);
+                return None;
+            }
+            let mut at = POINT { x: 0, y: 0 };
+            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            // SAFETY: plain queries into locals; the window is ours (focused).
+            let ok = unsafe { GetCursorPos(&mut at) != 0 && GetWindowRect(GetForegroundWindow(), &mut rect) != 0 };
+            if !ok {
+                return None;
+            }
+            let (cx, cy) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+            // The pointer goes back to the window's middle each poll, so it never reaches an edge.
+            // SAFETY: plain call.
+            unsafe { SetCursorPos(cx, cy) };
+            self.look = look_stick(at.x - cx, at.y - cy, sensitivity, self.look);
+            Some(PadState { right_x: self.look.0, right_y: self.look.1, ..Default::default() })
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1642,6 +1695,15 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn mouse_look_turns_into_a_right_stick() {
+        let (x, y) = look_stick(48, -12, 1.0, (0.0, 0.0));
+        assert!((x - 0.5).abs() < 1e-6 && (y - 0.25).abs() < 1e-6, "{x} {y}");
+        let (x, _) = look_stick(0, 0, 1.0, (1.0, 0.0));
+        assert!((x - 0.5).abs() < 1e-6);
+        assert_eq!(look_stick(1000, 0, 2.0, (0.0, 0.0)).0, 0.5);
     }
 
     #[test]

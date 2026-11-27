@@ -448,6 +448,7 @@ fn world_split(job: &Job) -> Result<String, String> {
             Outcome::Stopped | Outcome::Idle => return Err("Stopped. Press Build shaders again to resume.".into()),
         }
     }
+    let shader_total = p.total;
     p.phase = 2;
     p.name = "Preparing pipelines";
     p.done = 0;
@@ -475,11 +476,38 @@ fn world_split(job: &Job) -> Result<String, String> {
         Outcome::Stopped | Outcome::Idle => return Err("Stopped. Press Build shaders again to resume.".into()),
     }
     let took = flow::duration(p.started.elapsed().as_secs());
-    Ok(if untranslated == 0 {
-        format!("Shaders built in {took}.")
-    } else {
-        format!("Shaders built in {took}; {untranslated} do not translate yet (see Logs).")
-    })
+    // finished: the bar at 100% and the phase reading Done
+    p.phase = p.phases;
+    p.name = "Done";
+    p.overall = 1.;
+    if p.total == 0 {
+        p.total = shader_total;
+    }
+    p.done = p.total;
+    p.current = "everything is prepared".into();
+    send(job, &p);
+    Ok(done_note(&took, untranslated, shader_total))
+}
+
+/// The line shown when a build finishes; untranslated shaders are put in proportion.
+pub fn done_note(took: &str, untranslated: u64, total: u64) -> String {
+    if untranslated == 0 {
+        return format!("Shaders built in {took}.");
+    }
+    let of = if total > untranslated { format!(" of ~{}", thousands(total)) } else { String::new() };
+    format!("Shaders built in {took}. {untranslated}{of} shaders can't be translated yet. The game still runs; those effects may be missing. Details in Logs.")
+}
+
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A hint when the D3D12 Agility folder is missing beside the engine (D3D12 then fails to start,
@@ -608,6 +636,13 @@ fn classic(job: &Job) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn done_note_in_proportion() {
+        assert_eq!(super::done_note("6 min", 0, 26000), "Shaders built in 6 min.");
+        let n = super::done_note("6 min", 229, 26503);
+        assert!(n.contains("229 of ~26,503 shaders can't be translated yet. The game still runs"), "{n}");
+    }
+
     use super::*;
 
     #[test]

@@ -150,6 +150,10 @@ pub struct Config {
     /// The name shown as the console player (empty: the engine's default).
     #[serde(default)]
     pub player_name: String,
+    /// The first-run step last shown, so reopening mid-setup returns to it (None: a settings
+    /// file from before the wizard remembered its step).
+    #[serde(default)]
+    pub wizard_step: Option<usize>,
 }
 
 fn default_preset() -> String {
@@ -200,8 +204,16 @@ impl Default for Config {
             tuning: tuning::Tuning::default(),
             wizard_done: false,
             player_name: String::new(),
+            wizard_step: None,
         }
     }
+}
+
+/// The first-run step to reopen at: the saved one, but never past the game folder while none
+/// is set.
+pub fn resume_step(saved: Option<usize>, game_ok: bool) -> usize {
+    let s = saved.unwrap_or(0).min(4);
+    if game_ok { s } else { s.min(1) }
 }
 
 pub enum Message {
@@ -239,6 +251,8 @@ pub enum Message {
 pub struct Launcher {
     pub page: Page,
     pub page_at: Instant,
+    /// The lowest point the page drew this frame (pages taller than the window scroll).
+    pub page_bottom: f32,
     pub started: Instant,
     pub config: Config,
     pub runtime_dir: Option<PathBuf>,
@@ -258,6 +272,8 @@ pub struct Launcher {
     pub update: Option<update::Release>,
     pub update_note: String,
     pub update_busy: bool,
+    /// Restart into the update as soon as it is downloaded ("Update now").
+    pub restart_after_update: bool,
     pub report_note: String,
     /// Scroll offset of the Settings, Game tab and the height of its content.
     pub game_scroll: f32,
@@ -430,6 +446,7 @@ impl Launcher {
             update: None,
             update_note: update::staged().map(|v| format!("{v} is downloaded and will be used the next time you start the launcher.")).unwrap_or_default(),
             update_busy: false,
+            restart_after_update: false,
             report_note: String::new(),
             game_scroll: 0.,
             game_content: 0.,
@@ -481,6 +498,7 @@ impl Launcher {
             run_tod: None,
             perf: perf::last_log().map(|p| perf::parse(perf::tail(&p, 20_000).iter().map(String::as_str), None)).filter(|p| p.line().is_some()),
             wizard_step: 0,
+            page_bottom: 0.,
             tuning_at_start: None,
             report_copied: None,
             shot_wait: 0,
@@ -511,13 +529,16 @@ impl Launcher {
         if let Some(t) = std::env::args().find_map(|a| a.strip_prefix("--tab=").map(str::to_string)) {
             l.settings_tab = ["game", "display", "options", "about", "runtime", "features"].iter().position(|n| *n == t).unwrap_or(l.settings_tab);
         }
-        // An existing setup skips the first-run wizard.
-        if !l.config.wizard_done && l.game_ok {
+        // A setup from before the wizard skips it; one left mid-way resumes where it was.
+        if !l.config.wizard_done && l.game_ok && l.config.wizard_step.is_none() {
             l.config.wizard_done = true;
             l.save();
         }
-        if !l.config.wizard_done && !std::env::args().any(|a| a.starts_with("--page=")) {
-            l.page = Page::Welcome;
+        if !l.config.wizard_done {
+            l.wizard_step = resume_step(l.config.wizard_step, l.game_ok);
+            if !std::env::args().any(|a| a.starts_with("--page=")) {
+                l.page = Page::Welcome;
+            }
         }
         // `--page=<name>` opens a page (screenshots, support); `--wizard=N` a wizard step.
         if let Some(p) = std::env::args().find_map(|a| a.strip_prefix("--page=").map(str::to_string)) {
@@ -569,6 +590,31 @@ impl Launcher {
             });
             let _ = tx.send(Message::UpdateDone(r.map(|_| rel.version.clone())));
         });
+    }
+
+    /// "Update now": downloads the update if needed, then restarts into it.
+    pub fn update_now(&mut self, ctx: &egui::Context) {
+        if update::staged().is_some() {
+            self.restart_into_update(ctx);
+        } else {
+            self.restart_after_update = true;
+            self.download_update();
+        }
+    }
+
+    /// Starts a new launcher that waits for this one to close, swaps the staged update in
+    /// (keeping this version for a rollback) and opens; then closes this one. Not while the
+    /// game or a build runs.
+    pub fn restart_into_update(&mut self, ctx: &egui::Context) {
+        if self.running.is_some() {
+            self.update_note = "The update installs when the game or the build has ended (or the next time you start the launcher).".into();
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        match Command::new(exe).arg(format!("--after={}", std::process::id())).spawn() {
+            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => self.update_note = format!("Could not restart: {e}. The update is used the next time you start the launcher."),
+        }
     }
 
     /// What Discord shows now: building, playing, or nothing.
@@ -1209,7 +1255,7 @@ impl Launcher {
         {
             use std::os::windows::process::CommandExt;
             // CREATE_NO_WINDOW (output goes to the Logs page), plus BELOW_NORMAL_PRIORITY_CLASS for builds
-            let low = if kind == RunKind::Play { 0 } else { 0x0000_4000 };
+            let low = if kind == RunKind::Play && !self.config.tuning.friendly { 0 } else { 0x0000_4000 };
             cmd.creation_flags(0x0800_0000 | low);
         }
         let mut child = match cmd.spawn() {
@@ -1477,11 +1523,15 @@ impl Launcher {
                 }
                 Message::UpdateDone(r) => {
                     self.update_busy = false;
+                    let restart = std::mem::take(&mut self.restart_after_update) && r.is_ok();
                     self.update_note = match r {
                         Ok(v) => format!("{v} downloaded and verified. It is used the next time you start the launcher (this version is kept for a rollback)."),
                         Err(e) => format!("Update failed: {e}"),
                     };
                     self.log(self.update_note.clone(), LogKind::Info);
+                    if restart {
+                        self.restart_into_update(ctx);
+                    }
                 }
                 Message::Picked(p) => {
                     self.folder_busy = false;
@@ -1639,11 +1689,36 @@ fn icon() -> egui::IconData {
     }
 }
 
+/// Waits (up to 15 s) for the launcher that started this one to close ("Update now").
+fn wait_for_previous() {
+    let Some(pid) = std::env::args().find_map(|a| a.strip_prefix("--after=").and_then(|n| n.parse::<u32>().ok())) else { return };
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+            fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+        // SAFETY: SYNCHRONIZE access to a process id; the handle is closed.
+        unsafe {
+            let h = OpenProcess(0x0010_0000, 0, pid);
+            if h != 0 {
+                WaitForSingleObject(h, 15_000);
+                CloseHandle(h);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = pid;
+}
+
 fn main() -> eframe::Result {
+    wait_for_previous();
     runtime::migrate_legacy_data();
     // A staged update (or a rollback) is swapped in at start; the new launcher then starts instead.
     if let Some(exe) = update::apply_pending() {
-        if Command::new(&exe).args(std::env::args().skip(1)).spawn().is_ok() {
+        if Command::new(&exe).args(std::env::args().skip(1).filter(|a| !a.starts_with("--after="))).spawn().is_ok() {
             return Ok(());
         }
     }
@@ -1686,6 +1761,16 @@ mod tests {
         std::fs::write(&p, b"{}").unwrap();
         assert!(load_config(&p).fallback_light, "missing fields take their defaults");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn wizard_resumes_at_its_step() {
+        assert_eq!(super::resume_step(None, false), 0);
+        assert_eq!(super::resume_step(Some(3), true), 3);
+        assert_eq!(super::resume_step(Some(3), false), 1);
+        assert_eq!(super::resume_step(Some(9), true), 4);
+        let c: super::Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.wizard_step, None);
     }
 
     fn parse(s: &str) -> Vec<String> {
