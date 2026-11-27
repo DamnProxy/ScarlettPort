@@ -394,6 +394,7 @@ dependencies = [
  "scarlett-loader",
  "scarlett-pe",
  "scarlett-shader",
+ "tempfile",
  "walkdir",
 ]
 
