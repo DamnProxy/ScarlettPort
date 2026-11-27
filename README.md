@@ -369,7 +369,7 @@ cd ScarlettPort
 
 - While the game runs, write button names into `press.txt` (e.g. `DOWN DOWN A`) to press them.
 - Logs go to `logs\`. Attach one when you open an issue.
-- Controls: Xbox controllers and PlayStation pads (DualSense, DualShock 4, over USB or Bluetooth) both work. With no pad connected, the keyboard is a pad: Enter = A, Backspace = B, WASD = left stick, IJKL = right stick.
+- Controls: Xbox controllers and PlayStation pads (DualSense, DualShock 4, over USB or Bluetooth) both work. With no pad connected, the keyboard is a pad: Enter = A, Backspace = B, WASD = left stick, IJKL = right stick. Opt-in `SCARLETT_KBM=1` switches to a PC-style keyboard and mouse layout: `F2` or `` ` `` toggles mouse look (cursor hidden while locked; `Esc`, `P` or losing focus frees it), left/right mouse = RT/LT, middle mouse or `C` = R3, `Shift` = A, `Space` = X, `R` = B, `F` = Y, `Tab` = LB, `Q` = RB, `Ctrl` = L3, `E` = D-pad right, `V` = View; tune with `SCARLETT_MOUSE_SENS` (default `1.0`) and `SCARLETT_MOUSE_INVERT_Y=1`.
 
 **Shader build times** (12-thread CPU)
 
