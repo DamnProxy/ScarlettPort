@@ -1,7 +1,7 @@
 //! "Verify game files": checks a dump folder for completeness without changing anything.
-//! Every expected top-level archive, a complete `pack\` (the title's nine packs, and the
-//! entries the dump's `dump-manifest.log` lists under it), symbolic links that resolve, and no
-//! empty files. A `pack\` that is missing or split across drives is called out on its own: the
+//! Every expected top-level archive, a complete `pack\` (the title's nine packs), symbolic links
+//! that resolve, and no empty files. The dump's `dump-manifest.log` is compared for information
+//! only: it often does not describe the files exactly. A `pack\` that is missing or split across drives is called out on its own: the
 //! title crashes at boot without it. Reads metadata only; never moves, writes or deletes.
 use std::path::{Path, PathBuf};
 
@@ -61,6 +61,16 @@ pub struct Report {
     pub pack_problem: bool,
     pub files: u64,
     pub bytes: u64,
+    /// The dump's own file list, compared for information only: dump tools often write a
+    /// manifest that does not describe the files exactly, and that never decides the result.
+    pub manifest_note: Option<ManifestNote>,
+}
+
+/// A calm, collapsed note about `dump-manifest.log`; `details` sit behind an expander.
+#[derive(Clone, Debug)]
+pub struct ManifestNote {
+    pub summary: String,
+    pub details: Vec<String>,
 }
 
 impl Report {
@@ -263,53 +273,48 @@ pub fn run(dir: &Path) -> Report {
         let list: Vec<String> = broken.iter().take(6).map(|(p, _)| rel(dir, p)).collect();
         push(&mut rep, Level::Bad, format!("{} link(s) do not resolve", broken.len()), list.join(", "), broken.first().map(|(p, _)| p.clone()));
     }
-    if empty.is_empty() {
-        let d = format!("{} files, {}", rep.files, crate::game::human(rep.bytes));
-        push(&mut rep, Level::Ok, "No empty files".into(), d, None);
+    // An empty archive or library is truncated; other empty files (logs, markers) are normal.
+    let needed = |p: &PathBuf| p.extension().is_some_and(|e| ["rpf", "dll", "exe", "bin"].iter().any(|x| e.eq_ignore_ascii_case(x)));
+    let (bad_empty, other_empty): (Vec<PathBuf>, Vec<PathBuf>) = empty.into_iter().partition(needed);
+    if bad_empty.is_empty() {
+        let mut d = format!("{} files, {}", rep.files, crate::game::human(rep.bytes));
+        if !other_empty.is_empty() {
+            d += &format!(" ({} empty non-archive file(s), which is normal)", other_empty.len());
+        }
+        push(&mut rep, Level::Ok, "No truncated archives".into(), d, None);
     } else {
-        let list: Vec<String> = empty.iter().take(6).map(|p| rel(dir, p)).collect();
-        push(&mut rep, Level::Warn, format!("{} empty file(s)", empty.len()), list.join(", "), empty.first().cloned());
+        let list: Vec<String> = bad_empty.iter().take(6).map(|p| rel(dir, p)).collect();
+        push(&mut rep, Level::Warn, format!("{} empty archive(s)", bad_empty.len()), format!("{} (0 bytes: re-copy from the console dump)", list.join(", ")), bad_empty.first().cloned());
     }
 
-    // ---- the dump's manifest
+    // ---- the dump's manifest: advisory only. The checks above decide the result.
     let mp = dir.join(MANIFEST);
-    match std::fs::read_to_string(&mp) {
-        Err(_) => push(&mut rep, Level::Warn, "No dump-manifest.log".into(), "The dump has no manifest to compare against; the checks above still apply.".into(), Some(dir.to_path_buf())),
-        Ok(text) => {
-            let (entries, total) = parse_manifest(&text);
-            let mut gone = Vec::new();
-            let mut sized = Vec::new();
-            for e in &entries {
-                match resolved_len(&dir.join(&e.path)) {
-                    Err(_) => gone.push(e.path.clone()),
-                    Ok(l) if l != e.size => sized.push(format!("{} ({} here, {} listed)", e.path, crate::game::human(l), crate::game::human(e.size))),
-                    Ok(_) => {}
-                }
+    if let Ok(text) = std::fs::read_to_string(&mp) {
+        let (entries, total) = parse_manifest(&text);
+        let mut gone = Vec::new();
+        let mut sized = Vec::new();
+        for e in &entries {
+            match resolved_len(&dir.join(&e.path)) {
+                Err(_) => gone.push(e.path.clone()),
+                Ok(l) if l != e.size => sized.push(format!("{} ({} here, {} listed)", e.path, crate::game::human(l), crate::game::human(e.size))),
+                Ok(_) => {}
             }
-            let pack_listed = entries.iter().filter(|e| e.path.to_lowercase().starts_with("pack\\")).count();
-            let partial = total.is_some_and(|t| t > entries.len() as u64);
-            let scope = match total {
-                Some(t) if partial => format!("lists {} of its {t} entries in this file", entries.len()),
-                _ => format!("{} entries", entries.len()),
-            };
-            if gone.is_empty() && sized.is_empty() {
-                push(&mut rep, Level::Ok, "Matches dump-manifest.log".into(), format!("The manifest {scope}; all of them match. {pack_listed} are under pack\\."), Some(mp.clone()));
-            } else {
-                let mut d = format!("The manifest {scope}. ");
-                if !gone.is_empty() {
-                    d += &format!("Not in the folder: {}. ", gone.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
-                }
-                if !sized.is_empty() {
-                    d += &format!("Different size: {}.", sized.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
-                }
-                if gone.iter().any(|g| g.to_lowercase().starts_with("pack\\")) {
-                    rep.pack_problem = true;
-                }
-                push(&mut rep, Level::Warn, format!("{} manifest entries do not match", gone.len() + sized.len()), d, Some(mp.clone()));
+        }
+        if !gone.is_empty() || !sized.is_empty() {
+            let mut details = Vec::new();
+            if total.is_some_and(|t| t > entries.len() as u64) {
+                details.push(format!("{} lists {} of its {} entries in this file.", MANIFEST, entries.len(), total.unwrap_or(0)));
             }
-            if pack_listed == 0 && !entries.is_empty() {
-                push(&mut rep, Level::Warn, "The manifest lists nothing under pack\\".into(), "pack\\ could only be checked against the title's known nine packs.".into(), Some(mp));
+            if !gone.is_empty() {
+                details.push(format!("Listed but not in the folder ({}): {}", gone.len(), gone.join(", ")));
             }
+            if !sized.is_empty() {
+                details.push(format!("Listed with another size ({}): {}", sized.len(), sized.join(", ")));
+            }
+            rep.manifest_note = Some(ManifestNote {
+                summary: "Your dump's file list doesn't match these files exactly. That's common and doesn't affect the game.".into(),
+                details,
+            });
         }
     }
     rep
@@ -366,14 +371,84 @@ mod tests {
         std::fs::remove_dir_all(d.join("pack").join("story000")).unwrap();
         std::fs::remove_file(d.join("levels.rpf")).unwrap();
         std::fs::write(d.join("empty.bin"), b"").unwrap();
+        std::fs::write(d.join("note.txt"), b"").unwrap();
         let r = run(&d);
         assert!(r.pack_problem);
         assert_eq!(r.worst(), Level::Bad);
         assert!(r.findings.iter().any(|f| f.title.contains("pack\\ incomplete") && f.detail.contains("story000")));
         assert!(r.findings.iter().any(|f| f.title.contains("top-level") && f.detail.contains("levels.rpf")));
-        assert!(r.findings.iter().any(|f| f.title.contains("empty file")));
+        assert!(r.findings.iter().any(|f| f.title.contains("1 empty archive")));
         std::fs::remove_dir_all(d.join("pack")).unwrap();
         assert!(run(&d).findings.iter().any(|f| f.title == "pack\\ is missing"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Shaped like a real dump tool's manifest: partial, listing files that are not there and
+    /// sizes that differ, nothing under pack\. All synthetic.
+    const LOOSE_MANIFEST: &str = r"# Dump Manifest
+# Total entries: 1,200  |  Total size: 9 bytes
+#
+# Format: SHA-256 | SIZE_BYTES | MODIFIED_UTC | REL_PATH
+aa | 288000000 | 2026-01-01T00:00:00Z | game_scarlett_master.exe
+bb | 12441 | 2026-01-01T00:00:00Z | appxmanifest.xml
+cc | 8206 | 2026-01-01T00:00:00Z | MicrosoftGame.config
+dd | 8589934592 | 2026-01-01T00:00:00Z | data\levels\world_main.rpf
+ee | 4194304 | 2026-01-01T00:00:00Z | era\runtime\runtime_bridge.dll
+ff | 83886080 | 2026-01-01T00:00:00Z | saves\profile_player.sav
+# ... 1,194 additional entries omitted
+";
+
+    #[test]
+    fn loose_manifest_is_only_a_note() {
+        let d = tmp("loose");
+        full_dump(&d);
+        std::fs::write(d.join("appxmanifest.xml"), b"<x/>").unwrap();
+        std::fs::write(d.join(MANIFEST), LOOSE_MANIFEST).unwrap();
+        let r = run(&d);
+        assert_eq!(r.worst(), Level::Ok, "{:?}", r.findings);
+        assert_eq!(r.problems(), 0);
+        assert!(!r.pack_problem);
+        assert!(!r.findings.iter().any(|f| f.title.contains("manifest")));
+        let n = r.manifest_note.expect("a calm note");
+        assert!(n.summary.contains("doesn't affect the game"));
+        let all = n.details.join(" ");
+        assert!(all.contains("world_main.rpf") && all.contains("profile_player.sav"));
+        assert!(all.contains("Listed but not in the folder (3)") && all.contains("another size (3)"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn loose_manifest_still_flags_a_truncated_archive() {
+        let d = tmp("trunc");
+        full_dump(&d);
+        std::fs::write(d.join("levels.rpf"), b"").unwrap();
+        std::fs::write(d.join(MANIFEST), LOOSE_MANIFEST).unwrap();
+        let r = run(&d);
+        assert_eq!(r.worst(), Level::Bad);
+        assert!(r.findings.iter().any(|f| f.title.contains("levels.rpf") && f.title.contains("0 bytes")));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Runs on a real dump when `SP_VERIFY_DIR` names one (not part of CI).
+    #[test]
+    #[ignore]
+    fn real_dump() {
+        let Some(d) = std::env::var_os("SP_VERIFY_DIR") else { return };
+        let r = run(Path::new(&d));
+        for f in &r.findings {
+            eprintln!("{:?} {} :: {}", f.level, f.title, f.detail);
+        }
+        eprintln!("note: {:?}", r.manifest_note);
+        assert_eq!(r.worst(), Level::Ok);
+    }
+
+    #[test]
+    fn no_manifest_is_fine() {
+        let d = tmp("nomani");
+        full_dump(&d);
+        let r = run(&d);
+        assert_eq!(r.worst(), Level::Ok, "{:?}", r.findings);
+        assert!(r.manifest_note.is_none());
         let _ = std::fs::remove_dir_all(d);
     }
 

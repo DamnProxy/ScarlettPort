@@ -32,6 +32,12 @@ pub struct Tuning {
     /// fps, frame time and the longest frame on the picture (SCARLETT_PANEL=1; F3
     /// shows and hides it in game).
     pub overlay: bool,
+    /// The mouse turns the camera (the right stick) while the game window has focus
+    /// (SCARLETT_MOUSE_LOOK: 0 is off, else the sensitivity; the engine's default is 1).
+    pub mouse_look: bool,
+    pub mouse_sensitivity: f32,
+    /// The game runs below normal priority so the desktop stays responsive while it plays.
+    pub friendly: bool,
 }
 
 impl Default for Tuning {
@@ -51,6 +57,9 @@ impl Default for Tuning {
             perf_log: false,
             ray_tracing: false,
             overlay: false,
+            mouse_look: true,
+            mouse_sensitivity: 1.0,
+            friendly: true,
         }
     }
 }
@@ -129,6 +138,11 @@ impl Tuning {
         }
         if self.overlay {
             v.push(("SCARLETT_PANEL", "1".to_string()));
+        }
+        if !self.mouse_look {
+            v.push(("SCARLETT_MOUSE_LOOK", "0".to_string()));
+        } else if (self.mouse_sensitivity - d.mouse_sensitivity).abs() > 0.001 {
+            v.push(("SCARLETT_MOUSE_LOOK", num(self.mouse_sensitivity)));
         }
         v
     }

@@ -99,8 +99,29 @@ impl Launcher {
             self.sidebar(ui, r);
             self.top_bar(ui, r);
             let area = Rect::from_min_max(pos2(SIDEBAR + MARGIN, 0.), pos2(r.max.x - MARGIN, r.max.y - MARGIN));
-            let mut page = ui.new_child(egui::UiBuilder::new().max_rect(area.translate(vec2(0., 6. * (1. - fade_in)))));
+            // Pages laid out at fixed places scroll as a whole when taller than the window: the
+            // page is drawn on a layer of its own, moved by the scroll offset (input follows).
+            let view = Rect::from_min_max(pos2(area.min.x, 48.), area.max);
+            let key = egui::Id::new(("page-scroll", self.page as u8));
+            let max_off = (self.page_bottom - view.max.y + 12.).max(0.);
+            let mut off: f32 = ctx.data(|d| d.get_temp(key).unwrap_or(0.));
+            if max_off > 0. && ui.rect_contains_pointer(view) && !self.confirm_precompile {
+                off -= ui.input(|i| i.smooth_scroll_delta.y);
+            }
+            off = off.clamp(0., max_off);
+            ctx.data_mut(|d| d.insert_temp(key, off));
+            self.page_bottom = 0.;
+            let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new("page-layer"));
+            ctx.set_transform_layer(layer, egui::emath::TSTransform::from_translation(vec2(0., -off)));
+            let mut page = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(area.translate(vec2(0., 6. * (1. - fade_in)))));
+            page.set_clip_rect(view.translate(vec2(0., off)));
             page.set_opacity(fade_in);
+            if max_off > 0. {
+                let track = Rect::from_min_max(pos2(view.max.x + 4., view.min.y + 8.), pos2(view.max.x + 8., view.max.y - 8.));
+                let h = (track.height() * view.height() / (view.height() + max_off)).max(30.);
+                let y = track.min.y + (track.height() - h) * off / max_off;
+                p.rect_filled(Rect::from_min_size(pos2(track.min.x, y), vec2(4., h)), 2, TEXT_FAINT);
+            }
             match self.page {
                 Page::Play => self.play_page(&mut page, area, time),
                 Page::News => self.news_page(&mut page, area),
@@ -139,7 +160,7 @@ impl Launcher {
             (368., Page::Links, Icon::Friends, "Links"),
         ];
         for (y, page, icon, tip) in entries {
-            if nav_item(ui, item(y), ("nav", y as i32), icon, tip, self.page == page, false) {
+            if nav_item(ui, item(y), ("nav", y as i32), icon, tip, self.page == page || (page == Page::Setup && self.page == Page::Welcome), false) {
                 self.go(page);
             }
         }
@@ -179,9 +200,17 @@ impl Launcher {
             Page::Welcome => "Welcome to ScarlettPort",
         };
         p.text(pos2(SIDEBAR + MARGIN, 30.), Align2::LEFT_CENTER, title, font(20., "bold"), TEXT);
-        if let Some(u) = self.update.clone() {
-            if !update_staged_label(&self.update_note) && self.fps.is_none() {
-                let label = format!("Update available {}", u.version);
+        let staged = if update_staged_label(&self.update_note) { crate::update::staged() } else { None };
+        if (self.update.is_some() || staged.is_some()) && self.fps.is_none() {
+            {
+                let version = self.update.as_ref().map(|u| u.version.clone()).or(staged.clone()).unwrap_or_default();
+                let label = if self.update_busy {
+                    self.update_note.clone()
+                } else if staged.is_some() {
+                    format!("Restart to update to {version}")
+                } else {
+                    format!("Update now: {version}")
+                };
                 let w = text_width(ui, &label, font(13., "semibold")) + 36.;
                 let pill = Rect::from_min_size(pos2(r.max.x - 88. - w, 12.), vec2(w, 32.));
                 let hit = ui.interact(pill, ui.id().with("upd-pill"), Sense::click());
@@ -190,9 +219,8 @@ impl Launcher {
                 dot(&p, pos2(pill.min.x + 15., pill.center().y), ACCENT);
                 p.text(pos2(pill.min.x + 28., pill.center().y), Align2::LEFT_CENTER, label, font(13., "semibold"), TEXT);
                 hand(ui, &hit);
-                if hit.clicked() {
-                    self.settings_tab = 2;
-                    self.go(Page::Settings);
+                if hit.clicked() && !self.update_busy {
+                    self.update_now(ui.ctx());
                 }
             }
         }
@@ -294,6 +322,7 @@ impl Launcher {
         if section_row(ui, row(52.), "row-fps", Icon::History, "Performance", &meta, Status { text: &status, color }, true) {
             self.go(Page::Logs);
         }
+        self.page_bottom = y;
     }
 
     fn play_header(&mut self, ui: &mut Ui, rect: Rect, time: f32) {
@@ -467,9 +496,69 @@ impl Launcher {
 
     // ------------------------------------------------------------------ setup
 
-    fn setup_page(&mut self, ui: &mut Ui, area: Rect, time: f32) {
+    /// Setup's step list: each first-run step's state, with a button to continue or redo it.
+    fn setup_steps(&mut self, ui: &mut Ui, area: Rect) -> f32 {
         let p = ui.painter().clone();
         let top = 72.;
+        let building = self.running == Some(RunKind::Precompile);
+        let prepared = self.prepared();
+        let name = if self.config.player_name.is_empty() { "default name".to_string() } else { self.config.player_name.clone() };
+        let game = if self.game_ok { self.config.game_path.clone() } else { "not set".into() };
+        let rt_ok = self.engine_ready() && self.setup_notes.iter().all(|(o, _)| *o);
+        let shaders = if building && self.paused() {
+            "paused".to_string()
+        } else if building {
+            "preparing now".into()
+        } else if prepared {
+            "up to date".into()
+        } else {
+            "not prepared yet (resumes where it stopped)".into()
+        };
+        let rows: [(&str, String, bool, &str, usize); 4] = [
+            ("Player name", name, true, "Change", 0),
+            ("Game folder", game, self.game_ok, if self.game_ok { "Change" } else { "Pick folder" }, 1),
+            ("Runtime setup", if rt_ok { "in place".into() } else { self.runtime_note.clone() }, rt_ok, "Redo", 2),
+            ("Shaders prepared", shaders, prepared && !building, if building && self.paused() { "Resume" } else if prepared { "Redo" } else { "Continue" }, 3),
+        ];
+        let done = rows.iter().filter(|r| r.2).count();
+        caption(&p, pos2(area.min.x, top), Align2::LEFT_TOP, &format!("Setup steps  ·  {done} of 4 done"));
+        let first_open = rows.iter().find(|r| !r.2).map_or(4, |r| r.4);
+        let guide = if self.config.wizard_done { "Open the setup guide" } else { "Continue setup" };
+        if button(ui, Rect::from_min_size(pos2(area.max.x - 200., top - 6.), vec2(200., 32.)), "st-guide", guide, Kind::Primary, self.running.is_none() || building, Some(Icon::Chevron)) {
+            self.wizard_step = if self.game_ok { first_open } else { first_open.min(1) };
+            self.go(Page::Welcome);
+        }
+        let mut y = top + 34.;
+        for (i, (k, v, ok, act, step)) in rows.iter().enumerate() {
+            let r = Rect::from_min_size(pos2(area.min.x, y), vec2(area.width(), 40.));
+            p.rect_filled(r, RADIUS_MD, BG_100);
+            p.rect_stroke(r, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
+            icon(&p, if *ok { Icon::Check } else { Icon::Warning }, pos2(r.min.x + 20., r.center().y), 15., if *ok { SUCCESS } else { WARNING });
+            p.text(pos2(r.min.x + 40., r.center().y), Align2::LEFT_CENTER, *k, font(13., "semibold"), TEXT);
+            p.text(pos2(r.min.x + 190., r.center().y), Align2::LEFT_CENTER, fit(ui, v, font(12.5, "regular"), r.width() - 330.), font(12.5, "regular"), TEXT_MUTED);
+            let b = Rect::from_min_size(pos2(r.max.x - 120., r.min.y + 6.), vec2(112., 28.));
+            let enabled = (*step < 2 || self.game_ok) && (self.running.is_none() || (*step == 3 && building));
+            if button(ui, b, ("st-step", i), act, Kind::Secondary, enabled, None) {
+                if *step == 3 && building {
+                    if self.paused() {
+                        self.toggle_pause();
+                    }
+                } else {
+                    if *step == 2 {
+                        self.run_setup();
+                    }
+                    self.wizard_step = *step;
+                    self.go(Page::Welcome);
+                }
+            }
+            y += 46.;
+        }
+        y + 14.
+    }
+
+    fn setup_page(&mut self, ui: &mut Ui, area: Rect, time: f32) {
+        let top = self.setup_steps(ui, area);
+        let p = ui.painter().clone();
         caption(&p, pos2(area.min.x, top), Align2::LEFT_TOP, "Shader build");
         let text = if self.world_selected() {
             "Translates every shader of your game into the cache once (World engine: about 3 minutes on 12 threads), so play sessions do not stop to translate. It resumes where it stopped if you close it. A runtime update that changes the shader translator translates everything again."
@@ -520,6 +609,7 @@ impl Launcher {
         if button(ui, Rect::from_min_size(pos2(area.min.x + 232., by), vec2(120., CONTROL)), "setup-logs", "View log", Kind::Ghost, true, None) {
             self.go(Page::Logs);
         }
+        self.page_bottom = by + CONTROL;
     }
 
     fn precompile_modal(&mut self, ctx: &egui::Context) {
@@ -990,9 +1080,12 @@ impl Launcher {
         let br = Rect::from_min_size(pos2(r.max.x - 84. - 120., r.center().y - 14.), vec2(116., 28.));
         if let Some(u) = self.update.clone() {
             if update_staged_label(&self.update_note) {
-                // staged: nothing to click
-            } else if button(ui, br, "upd-get", &format!("Get {}", u.version), Kind::Primary, !self.update_busy, Some(Icon::Download)) {
-                self.download_update();
+                if button(ui, br, "upd-restart", "Restart now", Kind::Primary, self.running.is_none(), Some(Icon::Refresh)) {
+                    self.restart_into_update(ui.ctx());
+                }
+            } else if button(ui, br, "upd-get", "Update now", Kind::Primary, !self.update_busy, Some(Icon::Download)) {
+                let _ = &u;
+                self.update_now(ui.ctx());
             }
         } else if button(ui, br, "upd-check", "Check now", Kind::Secondary, !self.update_busy, Some(Icon::Refresh)) {
             self.check_update();
