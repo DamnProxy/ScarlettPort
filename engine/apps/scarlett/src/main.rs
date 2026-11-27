@@ -28,6 +28,7 @@ mod translate;
 #[cfg(windows)]
 mod warm;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -101,7 +102,7 @@ enum Command {
         #[arg(long)]
         list: bool,
         /// Worker threads (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
@@ -117,22 +118,27 @@ enum Command {
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `SCARLETT_PIPELINE_BOOK=1` write them down), so that the
     /// driver's cache on disk has them before a run needs one: once per change
     /// of the translator or the driver. Goes on where it was stopped.
+    ///
+    /// Pipelines that crash or hang the compiler are listed in `warm-bad.txt`
+    /// with the current fingerprint and retried automatically after a driver
+    /// or translator change. Set `SCARLETT_WARM_BAD=0` to ignore `warm-bad.txt`
+    /// for this invocation.
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
-        /// Those made before too.
+        /// Retry pipelines already made or listed in `warm-bad.txt` too.
         #[arg(long)]
         again: bool,
         /// Only the pipelines earlier runs drew with.
@@ -197,6 +203,13 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+fn parse_jobs(value: &str) -> Result<usize, &'static str> {
+    value
+        .parse::<NonZeroUsize>()
+        .map(NonZeroUsize::get)
+        .map_err(|_| "expected a worker count of 1 or more")
 }
 
 fn main() -> Result<()> {
