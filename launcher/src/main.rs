@@ -1088,8 +1088,10 @@ impl Launcher {
         for (k, v) in t.env(fsr) {
             presets::set(&mut env, k, v);
         }
-        if t.perf_log {
-            let level = env.iter().find(|(k, _)| *k == "SCARLETT_LOG").map(|(_, v)| v.clone()).unwrap_or_else(|| "info".into());
+        // Every run logs the GPU host at info, so a report has enough to diagnose a black or slow
+        // picture; the rest stays at the preset's level.
+        let level = env.iter().find(|(k, _)| *k == "SCARLETT_LOG").map(|(_, v)| v.clone()).unwrap_or_else(|| "warn".into());
+        if !level.contains("scarlett_gpu::host") {
             presets::set(&mut env, "SCARLETT_LOG", format!("{level},scarlett_gpu::host=info"));
         }
         let name = firstrun::clean_name(&self.config.player_name);
@@ -1266,6 +1268,9 @@ impl Launcher {
                 return;
             }
         };
+        if kind == RunKind::Play && self.config.tuning.free_cores && firstrun::leave_cores(&child, shaderbuild::cores()) {
+            self.log("The game runs on every core but the first two, so the desktop stays quick (Settings turns this off).", LogKind::Info);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         self.stop = Some(stop.clone());
         self.running = Some(kind);
@@ -1463,6 +1468,13 @@ impl Launcher {
                     let ok = r.is_ok();
                     match r {
                         Ok(note) => {
+                            // Whatever the engine printed last, a finished build reads Done at 100%.
+                            if let Some(b) = &mut self.build {
+                                b.phase = b.phases;
+                                b.name = "Done";
+                                b.overall = 1.;
+                                b.done = b.total;
+                            }
                             if self.world_selected() {
                                 let _ = prep::write(&self.scarlett_cache(), &self.prep_stamp());
                             }
